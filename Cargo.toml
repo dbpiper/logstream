@@ -1,0 +1,36 @@
+[package]
+name = "logstream"
+version = "0.1.0"
+edition = "2021"
+authors = ["David Piper <david@dbpiper.com>"]
+description = "CloudWatch Logs tailer shipping NDJSON batches to Elasticsearch with almost-sure reconciliation"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/dbpiper/logstream"
+keywords = ["logging", "elasticsearch", "cloudwatch", "aws", "observability"]
+categories = ["command-line-utilities", "web-programming"]
+
+[dependencies]
+anyhow = "1"
+aws-config = "1"
+aws-sdk-cloudwatchlogs = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+directories = "5"
+dotenvy = "0.15"
+futures = "0.3"
+reqwest = { version = "0.11", features = ["json", "gzip", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
