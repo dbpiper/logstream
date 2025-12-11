@@ -61,11 +61,7 @@ fn try_parse_and_normalize(s: &str) -> Result<Option<Value>> {
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return Ok(None);
     }
-    let val: Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(e) => return Err(e.into()),
-    };
-    let mut val = val;
+    let mut val: Value = serde_json::from_str(trimmed)?;
     normalize_value(&mut val, 0);
     Ok(Some(val))
 }
