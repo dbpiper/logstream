@@ -1,0 +1,20 @@
+# CI Dockerfile - uses pre-built binaries for fast multi-arch builds
+FROM debian:12-slim
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the pre-built binary for the target architecture
+COPY binaries/${TARGETARCH}/logstream /usr/local/bin/logstream
+RUN chmod +x /usr/local/bin/logstream
+
+COPY config.toml /app/config.toml
+
+RUN mkdir -p /state && chown -R 1000:1000 /state
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/local/bin/logstream", "/app/config.toml"]
