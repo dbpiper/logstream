@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::es_recovery;
 use crate::types::EnrichedEvent;
 
 #[derive(Clone, Debug)]
@@ -112,9 +113,9 @@ async fn send_bulk(
     if batch.is_empty() {
         return Ok(());
     }
+
     let mut body = String::with_capacity(batch.len() * 256);
     for ev in batch {
-        // Deterministic id for idempotency
         let id = ev.event.id.clone();
         let idx = resolve_index(ev, index_prefix);
         body.push_str("{\"index\":{\"_index\":\"");
@@ -122,13 +123,14 @@ async fn send_bulk(
         body.push_str("\",\"_id\":\"");
         body.push_str(&id);
         body.push_str("\"}}\n");
-        // Serialize event
         body.push_str(&serde_json::to_string(&ev)?);
         body.push('\n');
     }
 
     let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
     let mut attempt = 0u64;
+    let mut recovery_attempts = 0u64;
+
     loop {
         attempt += 1;
         let send_result = client
@@ -141,26 +143,69 @@ async fn send_bulk(
 
         match send_result {
             Ok(resp) if resp.status().is_success() => {
-                // Check for item-level errors in bulk response
-                if let Ok(body) = resp.text().await {
-                    if body.contains("\"errors\":true") {
-                        warn!(
-                            "es bulk has item errors, sample: {}",
-                            &body[..body.len().min(500)]
-                        );
+                let resp_body = resp.text().await.unwrap_or_default();
+
+                if resp_body.contains("\"errors\":true") {
+                    // Some items failed - check cluster health and fix any issues
+                    if recovery_attempts < 3 {
+                        let recovered = es_recovery::check_and_recover(
+                            client,
+                            base_url,
+                            user,
+                            pass,
+                            index_prefix,
+                        )
+                        .await;
+
+                        if recovered {
+                            recovery_attempts += 1;
+                            info!(
+                                "es bulk: cluster issue fixed, retrying (attempt {})",
+                                recovery_attempts
+                            );
+                            continue;
+                        }
                     }
+
+                    // Log remaining errors but continue (may be version conflicts, etc)
+                    warn!(
+                        "es bulk has item errors, sample: {}",
+                        &resp_body[..resp_body.len().min(500)]
+                    );
                 }
+
                 info!("es bulk sent batch={} status=200 OK", batch.len());
                 return Ok(());
             }
+
             Ok(resp) => {
+                let status = resp.status();
+                let resp_body = resp.text().await.unwrap_or_default();
+
+                // Non-2xx response - check cluster health and fix any issues
+                if recovery_attempts < 3 {
+                    let recovered =
+                        es_recovery::check_and_recover(client, base_url, user, pass, index_prefix)
+                            .await;
+
+                    if recovered {
+                        recovery_attempts += 1;
+                        info!(
+                            "es bulk status={}: cluster issue fixed, retrying (attempt {})",
+                            status, recovery_attempts
+                        );
+                        continue;
+                    }
+                }
+
                 warn!(
-                    "es bulk status={} attempt={} body_sample={:?}",
-                    resp.status(),
+                    "es bulk status={} attempt={} body_sample={}",
+                    status,
                     attempt,
-                    resp.text().await.ok()
+                    &resp_body[..resp_body.len().min(500)]
                 );
             }
+
             Err(err) => {
                 warn!("es bulk connection error attempt={}: {err}", attempt);
             }
@@ -169,6 +214,7 @@ async fn send_bulk(
         if attempt >= 20 {
             anyhow::bail!("es bulk failed after 20 retries");
         }
+
         let backoff = Duration::from_millis(500 * attempt.min(10));
         sleep(backoff).await;
     }
@@ -183,4 +229,112 @@ fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
         return format!("{}-{}", index_prefix, date);
     }
     format!("{}-default", index_prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::EventMeta;
+
+    fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent {
+        EnrichedEvent {
+            timestamp: timestamp.to_string(),
+            event: EventMeta {
+                id: "test-id".to_string(),
+            },
+            message: serde_json::Value::String("test".to_string()),
+            parsed: None,
+            target_index,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn test_resolve_index_with_target() {
+        let ev = sample_event("2025-12-11T12:00:00Z", Some("custom-index".to_string()));
+        let idx = resolve_index(&ev, "logs");
+        assert_eq!(idx, "custom-index");
+    }
+
+    #[test]
+    fn test_resolve_index_from_timestamp() {
+        let ev = sample_event("2025-12-11T12:00:00+00:00", None);
+        let idx = resolve_index(&ev, "logs");
+        assert_eq!(idx, "logs-2025.12.11");
+    }
+
+    #[test]
+    fn test_resolve_index_different_prefix() {
+        let ev = sample_event("2024-01-15T08:30:00Z", None);
+        let idx = resolve_index(&ev, "myapp");
+        assert_eq!(idx, "myapp-2024.01.15");
+    }
+
+    #[test]
+    fn test_resolve_index_invalid_timestamp() {
+        let ev = sample_event("not-a-timestamp", None);
+        let idx = resolve_index(&ev, "logs");
+        assert_eq!(idx, "logs-default");
+    }
+
+    #[test]
+    fn test_resolve_index_empty_timestamp() {
+        let ev = sample_event("", None);
+        let idx = resolve_index(&ev, "logs");
+        assert_eq!(idx, "logs-default");
+    }
+
+    #[test]
+    fn test_es_bulk_config_clone() {
+        let cfg = EsBulkConfig {
+            url: "http://localhost:9200".to_string(),
+            user: "elastic".to_string(),
+            pass: "password".to_string(),
+            batch_size: 100,
+            max_batch_size: 1000,
+            max_in_flight: 4,
+            timeout: Duration::from_secs(30),
+            gzip: true,
+            index_prefix: "logs".to_string(),
+        };
+
+        let cloned = cfg.clone();
+        assert_eq!(cloned.url, cfg.url);
+        assert_eq!(cloned.batch_size, cfg.batch_size);
+        assert_eq!(cloned.gzip, cfg.gzip);
+    }
+
+    #[test]
+    fn test_es_bulk_sink_new() {
+        let cfg = EsBulkConfig {
+            url: "http://localhost:9200".to_string(),
+            user: "elastic".to_string(),
+            pass: "password".to_string(),
+            batch_size: 100,
+            max_batch_size: 1000,
+            max_in_flight: 4,
+            timeout: Duration::from_secs(30),
+            gzip: true,
+            index_prefix: "logs".to_string(),
+        };
+
+        let sink = EsBulkSink::new(cfg);
+        assert!(sink.is_ok());
+    }
+
+    #[test]
+    fn test_resolve_index_with_timezone_offset() {
+        let ev = sample_event("2025-06-15T10:30:00-05:00", None);
+        let idx = resolve_index(&ev, "logs");
+        // Should be UTC: 15:30 UTC on 2025-06-15
+        assert_eq!(idx, "logs-2025.06.15");
+    }
+
+    #[test]
+    fn test_resolve_index_target_takes_precedence() {
+        // Even with a valid timestamp, target_index should take precedence
+        let ev = sample_event("2025-12-11T12:00:00Z", Some("override-index".to_string()));
+        let idx = resolve_index(&ev, "logs");
+        assert_eq!(idx, "override-index");
+    }
 }

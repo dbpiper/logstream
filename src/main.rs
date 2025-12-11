@@ -5,6 +5,7 @@ mod enrich;
 mod es_bulk_sink;
 mod es_conflicts;
 mod es_counts;
+mod es_recovery;
 mod es_schema_heal;
 mod reconcile;
 mod state;
@@ -211,6 +212,20 @@ async fn main() -> Result<()> {
         Ok(fixed) if fixed > 0 => info!("schema_heal: fixed {} indices with mapping drift", fixed),
         Ok(_) => info!("schema_heal: all indices have correct mappings"),
         Err(err) => tracing::warn!("schema_heal: failed: {err:?}"),
+    }
+
+    // Proactive recovery checks on startup (runtime enforcement happens in bulk sink)
+    match es_recovery::check_on_startup(
+        &es_url,
+        &es_user,
+        &es_pass,
+        cfg.http_timeout(),
+        &index_prefix,
+    )
+    .await
+    {
+        Ok(()) => info!("es_recovery: startup checks passed"),
+        Err(err) => tracing::warn!("es_recovery: startup check failed: {err:?}"),
     }
 
     let groups = cfg.effective_log_groups();
