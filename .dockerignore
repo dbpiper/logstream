@@ -1,6 +1,5 @@
 target
 .git
 .gitignore
-Cargo.lock
 *.plan.md
 node_modules

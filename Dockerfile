@@ -1,7 +1,7 @@
 ARG CARGO_REGISTRY_DIR=/usr/local/cargo/registry
 ARG CARGO_GIT_DIR=/usr/local/cargo/git
 
-FROM rust:1.88-slim as chef
+FROM rust:1.88-slim AS chef
 WORKDIR /app
 # Build deps (cached)
 RUN apt-get update \
@@ -14,7 +14,7 @@ COPY src ./src
 COPY config.toml ./config.toml
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM rust:1.88-slim as builder
+FROM rust:1.88-slim AS builder
 ARG CARGO_REGISTRY_DIR
 ARG CARGO_GIT_DIR
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
