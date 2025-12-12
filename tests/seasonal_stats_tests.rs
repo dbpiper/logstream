@@ -596,7 +596,7 @@ mod data_integrity_tests {
     fn test_fourier_uniform_across_day() {
         let base = 1700000000000i64;
         let hour_ms = 3_600_000i64;
-        let timestamps: Vec<i64> = (0..24).map(|h| base + h * hour_ms + 1800_000).collect();
+        let timestamps: Vec<i64> = (0..24).map(|h| base + h * hour_ms + 1_800_000).collect();
 
         let result = validate_event_integrity(&timestamps, base, base + 24 * hour_ms);
         assert!(result.is_usable());
