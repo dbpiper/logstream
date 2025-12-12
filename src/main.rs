@@ -15,7 +15,6 @@ use logstream::checkpoint::checkpoint_path_for;
 use logstream::config::Config;
 use logstream::cw_counts::CwCounter;
 use logstream::cw_tail::{CloudWatchTailer, TailConfig};
-use logstream::stress::{StressConfig, StressTracker};
 use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
 use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
@@ -33,6 +32,7 @@ use logstream::runner::{
     ReconcileExecContext,
 };
 use logstream::state::CheckpointState;
+use logstream::stress::{StressConfig, StressTracker};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
     let es_cfg = EsConfig::from_env();
     let sink = create_bulk_sink(&cfg, &es_cfg, &index_prefix)?;
     let es_stress_tracker = sink.stress_tracker();
-    let cw_stress_tracker = std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
+    let cw_stress_tracker =
+        std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
     let adaptive_controller = adaptive::create_controller();
     info!(
         "adaptive controller: initial batch={} in_flight={}",

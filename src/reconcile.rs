@@ -233,18 +233,27 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     let events = match collector.await {
         Ok(events) => events,
         Err(err) => {
-            warn!("reconcile collector failed: {err:?} for {}-{}", start_ms, end_ms);
+            warn!(
+                "reconcile collector failed: {err:?} for {}-{}",
+                start_ms, end_ms
+            );
             return;
         }
     };
 
     if let Err(err) = fetch_result {
-        warn!("reconcile CW fetch failed: {err:?} for {}-{}", start_ms, end_ms);
+        warn!(
+            "reconcile CW fetch failed: {err:?} for {}-{}",
+            start_ms, end_ms
+        );
         return;
     }
 
     if let Err(err) = ctx.es_counter.delete_range(start_ms, end_ms).await {
-        warn!("reconcile ES delete failed: {err:?} for {}-{}", start_ms, end_ms);
+        warn!(
+            "reconcile ES delete failed: {err:?} for {}-{}",
+            start_ms, end_ms
+        );
     }
 
     let event_count = events.len();
@@ -257,7 +266,10 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
         }
     }
 
-    info!("reconcile complete: {} events for {}-{}", event_count, start_ms, end_ms);
+    info!(
+        "reconcile complete: {} events for {}-{}",
+        event_count, start_ms, end_ms
+    );
 }
 
 async fn process_day(

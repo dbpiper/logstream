@@ -67,11 +67,7 @@ async fn test_fetch_success_enables_delete_and_insert() {
     let delete_called = Arc::new(AtomicBool::new(false));
     let insert_count = Arc::new(AtomicUsize::new(0));
 
-    let events = vec![
-        make_event("a", 1),
-        make_event("b", 2),
-        make_event("c", 3),
-    ];
+    let events = vec![make_event("a", 1), make_event("b", 2), make_event("c", 3)];
 
     let result: Result<Vec<LogEvent>, &str> = Ok(events);
 
@@ -223,7 +219,10 @@ async fn test_concurrent_senders_all_collected() {
         handles.push(tokio::spawn(async move {
             for i in 0..100 {
                 tx_clone
-                    .send(make_event(&format!("{}-{}", batch, i), (batch * 100 + i) as i64))
+                    .send(make_event(
+                        &format!("{}-{}", batch, i),
+                        (batch * 100 + i) as i64,
+                    ))
                     .await
                     .unwrap();
             }

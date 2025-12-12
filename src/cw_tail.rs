@@ -109,7 +109,9 @@ impl CloudWatchTailer {
                 req = req.next_token(token);
             }
 
-                let resp = send_with_backoff(req, &self.stress_tracker).await.context("filter_log_events")?;
+            let resp = send_with_backoff(req, &self.stress_tracker)
+                .await
+                .context("filter_log_events")?;
 
             if let Some(events) = resp.events {
                 for e in events {

@@ -282,10 +282,7 @@ async fn send_bulk_tracked(
                         );
                     } else {
                         // Version conflicts/updates are normal during backfill - just debug log
-                        tracing::debug!(
-                            "es bulk has updates (not errors): {} items",
-                            batch.len()
-                        );
+                        tracing::debug!("es bulk has updates (not errors): {} items", batch.len());
                     }
                 }
 
