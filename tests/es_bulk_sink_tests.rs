@@ -259,6 +259,7 @@ mod failure_kind_behavior_tests {
     #[test]
     fn test_failure_kind_clone() {
         let kind = FailureKind::Retryable;
+        #[allow(clippy::clone_on_copy)]
         let cloned = kind.clone();
         assert_eq!(kind, cloned);
     }
