@@ -209,6 +209,99 @@ async fn test_fetch_then_replace_pattern_complete() {
     assert!(!es_preserved.load(Ordering::SeqCst));
 }
 
+fn is_feasible(cw_count: u64, es_count: u64, neighbor_total: u64) -> bool {
+    const FEASIBILITY_THRESHOLD_PCT: u64 = 10;
+
+    if cw_count > 0 && es_count == 0 {
+        return true;
+    }
+    if cw_count == 0 && es_count == 0 {
+        return true;
+    }
+    if cw_count == 0 && es_count > 0 {
+        return false;
+    }
+    if neighbor_total == 0 {
+        return cw_count > 0 || es_count == 0;
+    }
+
+    let expected = neighbor_total / 2;
+    let threshold = (expected * FEASIBILITY_THRESHOLD_PCT) / 100;
+    let min_expected = threshold.max(1);
+
+    if cw_count < min_expected && es_count > cw_count * 2 {
+        return false;
+    }
+    true
+}
+
+#[test]
+fn test_feasibility_cw_has_data_es_empty() {
+    assert!(is_feasible(100, 0, 200));
+}
+
+#[test]
+fn test_feasibility_both_empty() {
+    assert!(is_feasible(0, 0, 0));
+    assert!(is_feasible(0, 0, 100));
+}
+
+#[test]
+fn test_feasibility_cw_empty_es_has_data() {
+    assert!(!is_feasible(0, 100, 200));
+    assert!(!is_feasible(0, 1000, 2000));
+}
+
+#[test]
+fn test_feasibility_cw_much_less_than_expected() {
+    assert!(!is_feasible(5, 1000, 2000));
+    assert!(!is_feasible(1, 500, 1000));
+}
+
+#[test]
+fn test_feasibility_cw_reasonable_compared_to_neighbors() {
+    assert!(is_feasible(100, 150, 200));
+    assert!(is_feasible(50, 60, 100));
+    assert!(is_feasible(1000, 1100, 2000));
+}
+
+#[test]
+fn test_feasibility_cw_slightly_less_than_es_ok() {
+    assert!(is_feasible(90, 100, 200));
+    assert!(is_feasible(80, 100, 200));
+}
+
+#[test]
+fn test_feasibility_no_neighbors_cw_has_data() {
+    assert!(is_feasible(100, 100, 0));
+    assert!(is_feasible(50, 100, 0));
+}
+
+#[test]
+fn test_feasibility_no_neighbors_cw_empty() {
+    assert!(!is_feasible(0, 100, 0));
+}
+
+#[test]
+fn test_feasibility_cw_more_than_es() {
+    assert!(is_feasible(200, 100, 200));
+    assert!(is_feasible(1000, 500, 800));
+}
+
+#[test]
+fn test_feasibility_edge_case_small_counts() {
+    assert!(is_feasible(1, 1, 2));
+    assert!(is_feasible(2, 3, 4));
+    assert!(!is_feasible(0, 5, 10));
+}
+
+#[test]
+fn test_feasibility_threshold_boundary() {
+    assert!(is_feasible(10, 100, 200));
+    assert!(is_feasible(11, 100, 200));
+    assert!(!is_feasible(4, 100, 200));
+}
+
 #[tokio::test]
 async fn test_channel_preserves_event_order() {
     let (tx, mut rx) = mpsc::channel::<LogEvent>(100);

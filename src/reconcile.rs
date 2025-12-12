@@ -14,6 +14,7 @@ const FULL_RESYNC_THRESHOLD_PCT: u64 = 5;
 const ES_STARTUP_WAIT_SECS: u64 = 30;
 const ES_STARTUP_MAX_ATTEMPTS: u32 = 20;
 const MAX_PARALLEL_DAYS: usize = 2;
+const FEASIBILITY_THRESHOLD_PCT: u64 = 10;
 
 #[derive(Clone)]
 pub struct ReconcileContext {
@@ -217,6 +218,12 @@ async fn almost_sure_sync(
 async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, buffer_cap: usize) {
     info!("reconcile safe_replace start={} end={}", start_ms, end_ms);
 
+    let es_count = ctx
+        .es_counter
+        .count_range(start_ms, end_ms)
+        .await
+        .unwrap_or(0);
+
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<LogEvent>(buffer_cap);
 
     let collector = tokio::spawn(async move {
@@ -249,12 +256,12 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
         return;
     }
 
-    let event_count = events.len();
+    let cw_count = events.len() as u64;
 
-    if event_count == 0 {
+    if !is_cw_response_feasible(ctx, start_ms, end_ms, es_count, cw_count).await {
         info!(
-            "reconcile CW returned empty for {}-{}, preserving ES data",
-            start_ms, end_ms
+            "reconcile CW response not feasible (cw={}, es={}), preserving ES for {}-{}",
+            cw_count, es_count, start_ms, end_ms
         );
         return;
     }
@@ -277,8 +284,65 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
 
     info!(
         "reconcile complete: {} events for {}-{}",
-        event_count, start_ms, end_ms
+        cw_count, start_ms, end_ms
     );
+}
+
+async fn is_cw_response_feasible(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    es_count: u64,
+    cw_count: u64,
+) -> bool {
+    if cw_count > 0 && es_count == 0 {
+        return true;
+    }
+
+    if cw_count == 0 && es_count == 0 {
+        return true;
+    }
+
+    if cw_count == 0 && es_count > 0 {
+        return false;
+    }
+
+    let range_ms = end_ms - start_ms;
+    let neighbor_range = range_ms;
+
+    let before_start = start_ms - neighbor_range;
+    let after_end = end_ms + neighbor_range;
+
+    let before_count = ctx
+        .cw_counter
+        .count_range(before_start, start_ms)
+        .await
+        .unwrap_or(0);
+    let after_count = ctx
+        .cw_counter
+        .count_range(end_ms, after_end)
+        .await
+        .unwrap_or(0);
+
+    let neighbor_total = before_count + after_count;
+
+    if neighbor_total == 0 {
+        return cw_count > 0 || es_count == 0;
+    }
+
+    let expected = neighbor_total / 2;
+    let threshold = (expected * FEASIBILITY_THRESHOLD_PCT) / 100;
+    let min_expected = threshold.max(1);
+
+    if cw_count < min_expected && es_count > cw_count * 2 {
+        warn!(
+            "reconcile feasibility check failed: cw={} < min_expected={} (neighbors={}, es={})",
+            cw_count, min_expected, neighbor_total, es_count
+        );
+        return false;
+    }
+
+    true
 }
 
 async fn process_day(
