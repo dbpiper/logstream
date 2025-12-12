@@ -65,7 +65,20 @@ async fn main() -> Result<()> {
     let es_stress_tracker = sink.stress_tracker();
     let cw_stress_tracker =
         std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
-    let seasonal_stats = std::sync::Arc::new(SeasonalStats::new());
+    let seasonal_stats_path = cfg.checkpoint_path.with_file_name("seasonal_stats.json");
+    let seasonal_stats = std::sync::Arc::new(SeasonalStats::load_or_new(&seasonal_stats_path));
+
+    let stats_for_save = seasonal_stats.clone();
+    let save_path = seasonal_stats_path.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            if let Err(e) = stats_for_save.save(&save_path) {
+                tracing::warn!("failed to save seasonal_stats: {e}");
+            }
+        }
+    });
     let adaptive_controller = adaptive::create_controller();
     info!(
         "adaptive controller: initial batch={} in_flight={}",
@@ -337,7 +350,7 @@ async fn run_group(
         None
     };
 
-    let counts = group_scheduler.process_counts().await;
+    let counts = group_scheduler.process_counts();
     info!(
         log_group = %cfg.log_group,
         daemons = 1 + reconcile_pid.is_some() as usize + full_history_pid.is_some() as usize + conflict_pid.is_some() as usize,
@@ -466,7 +479,7 @@ async fn run_group(
     }
 
     group_scheduler.shutdown_daemons().await;
-    let final_counts = group_scheduler.process_counts().await;
+    let final_counts = group_scheduler.process_counts();
     info!(
         log_group = %log_group_for_exit,
         terminated = final_counts.terminated,

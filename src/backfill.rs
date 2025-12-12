@@ -179,7 +179,7 @@ pub async fn run_backfill_days(
         }
     }
 
-    let counts = group_scheduler.process_counts().await;
+    let counts = group_scheduler.process_counts();
     tracing::info!(
         "backfill complete: {} events in {:?} ({:.2} eps), {} processes terminated",
         stats.total_events,

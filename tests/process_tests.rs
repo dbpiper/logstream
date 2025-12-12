@@ -237,7 +237,7 @@ async fn test_scheduler_spawn_creates_process() {
         .spawn("test-process".into(), 5, Priority::NORMAL)
         .await;
 
-    let info = scheduler.get_process(pid).await;
+    let info = scheduler.get_process(pid);
     assert!(info.is_some());
 
     let info = info.unwrap();
@@ -295,12 +295,12 @@ async fn test_scheduler_running_state() {
     let pid = scheduler.spawn("test".into(), 0, Priority::NORMAL).await;
 
     // Before scheduling: Ready
-    let info = scheduler.get_process(pid).await.unwrap();
+    let info = scheduler.get_process(pid).unwrap();
     assert_eq!(info.state, ProcessState::Ready);
 
     // After scheduling: Running
     scheduler.schedule().await;
-    let info = scheduler.get_process(pid).await.unwrap();
+    let info = scheduler.get_process(pid).unwrap();
     assert_eq!(info.state, ProcessState::Running);
 }
 
@@ -311,11 +311,9 @@ async fn test_scheduler_terminate_records_stats() {
     let pid = scheduler.spawn("test".into(), 0, Priority::NORMAL).await;
     scheduler.schedule().await;
 
-    scheduler
-        .terminate(pid, 5000, Duration::from_secs(10))
-        .await;
+    scheduler.terminate(pid, 5000, Duration::from_secs(10));
 
-    let info = scheduler.get_process(pid).await.unwrap();
+    let info = scheduler.get_process(pid).unwrap();
     assert_eq!(info.state, ProcessState::Terminated);
     assert_eq!(info.events_processed, 5000);
     assert_eq!(info.cpu_time, Duration::from_secs(10));
@@ -329,16 +327,16 @@ async fn test_scheduler_block_unblock_cycle() {
     scheduler.schedule().await;
 
     // Block
-    scheduler.block(pid).await;
+    scheduler.block(pid);
     assert_eq!(
-        scheduler.get_process(pid).await.unwrap().state,
+        scheduler.get_process(pid).unwrap().state,
         ProcessState::Blocked
     );
 
     // Unblock
     scheduler.unblock(pid).await;
     assert_eq!(
-        scheduler.get_process(pid).await.unwrap().state,
+        scheduler.get_process(pid).unwrap().state,
         ProcessState::Ready
     );
 
@@ -355,7 +353,7 @@ async fn test_scheduler_list_processes() {
     scheduler.spawn("p2".into(), 1, Priority::HIGH).await;
     scheduler.spawn("p3".into(), 2, Priority::NORMAL).await;
 
-    let processes = scheduler.list_processes().await;
+    let processes = scheduler.list_processes();
     assert_eq!(processes.len(), 3);
 
     let names: Vec<_> = processes.iter().map(|p| p.name.as_str()).collect();
@@ -373,19 +371,19 @@ async fn test_scheduler_process_counts() {
     scheduler.spawn("p3".into(), 2, Priority::NORMAL).await;
 
     // All ready
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 3);
     assert_eq!(counts.running, 0);
 
     // Schedule one
     let pid = scheduler.schedule().await.unwrap();
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 2);
     assert_eq!(counts.running, 1);
 
     // Terminate it
-    scheduler.terminate(pid, 0, Duration::ZERO).await;
-    let counts = scheduler.process_counts().await;
+    scheduler.terminate(pid, 0, Duration::ZERO);
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 2);
     assert_eq!(counts.running, 0);
     assert_eq!(counts.terminated, 1);
@@ -411,21 +409,19 @@ async fn test_full_process_lifecycle() {
         scheduler.spawn(format!("day-{}", day), day, priority).await;
     }
 
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 10);
 
     // Process them
     let mut completed = 0;
     while let Some(pid) = scheduler.schedule().await {
-        let info = scheduler.get_process(pid).await.unwrap();
+        let info = scheduler.get_process(pid).unwrap();
         assert_eq!(info.state, ProcessState::Running);
 
         // Simulate work
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        scheduler
-            .terminate(pid, 100, Duration::from_millis(1))
-            .await;
+        scheduler.terminate(pid, 100, Duration::from_millis(1));
         completed += 1;
 
         if completed >= 10 {
@@ -433,7 +429,7 @@ async fn test_full_process_lifecycle() {
         }
     }
 
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.terminated, 10);
 }
 
@@ -466,7 +462,7 @@ async fn test_concurrent_workers() {
                 if let Some(pid) = pid {
                     // Simulate work
                     tokio::time::sleep(Duration::from_millis(5)).await;
-                    sched.terminate(pid, 100, Duration::from_millis(5)).await;
+                    sched.terminate(pid, 100, Duration::from_millis(5));
                     completed_clone.fetch_add(1, Ordering::SeqCst);
                 } else {
                     break;
@@ -500,9 +496,9 @@ async fn test_priority_respected_under_load() {
     let mut scheduled_days = Vec::new();
     for _ in 0..4 {
         let pid = scheduler.schedule().await.unwrap();
-        let info = scheduler.get_process(pid).await.unwrap();
+        let info = scheduler.get_process(pid).unwrap();
         scheduled_days.push(info.day_offset);
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     }
 
     // Day 0 (CRITICAL) should be first
@@ -562,13 +558,11 @@ async fn test_optimal_no_starvation_with_aging() {
     // Process some HIGH priority tasks
     for _ in 0..5 {
         let pid = scheduler.schedule().await.unwrap();
-        scheduler
-            .terminate(pid, 100, Duration::from_millis(10))
-            .await;
+        scheduler.terminate(pid, 100, Duration::from_millis(10));
     }
 
     // Check that IDLE process has accumulated wait time
-    let idle_info = scheduler.get_process(idle_pid).await.unwrap();
+    let idle_info = scheduler.get_process(idle_pid).unwrap();
     assert!(
         idle_info.wait_time > Duration::ZERO,
         "IDLE process should have wait time for aging"
@@ -580,35 +574,31 @@ async fn test_optimal_no_starvation_with_aging() {
 
 #[tokio::test]
 async fn test_optimal_throughput_scales_with_workers() {
-    // More workers should process more tasks in parallel
-    let num_processes = 100;
+    let num_processes: usize = 40;
+    let work_duration = Duration::from_millis(5);
 
-    // Test with 1 worker
     let single_worker_time = {
         let scheduler = ProcessScheduler::new(Resources::default(), 1, 100);
         for i in 0..num_processes {
             scheduler
-                .spawn(format!("task-{}", i), i, Priority::NORMAL)
+                .spawn(format!("task-{}", i), i as u32, Priority::NORMAL)
                 .await;
         }
 
         let start = std::time::Instant::now();
         for _ in 0..num_processes {
             let pid = scheduler.schedule().await.unwrap();
-            tokio::time::sleep(Duration::from_micros(100)).await;
-            scheduler
-                .terminate(pid, 1, Duration::from_micros(100))
-                .await;
+            tokio::time::sleep(work_duration).await;
+            scheduler.terminate(pid, 1, work_duration);
         }
         start.elapsed()
     };
 
-    // Test with 4 workers
     let multi_worker_time = {
         let scheduler = Arc::new(ProcessScheduler::new(Resources::default(), 4, 100));
         for i in 0..num_processes {
             scheduler
-                .spawn(format!("task-{}", i), i, Priority::NORMAL)
+                .spawn(format!("multi-{}", i), i as u32, Priority::NORMAL)
                 .await;
         }
 
@@ -620,16 +610,9 @@ async fn test_optimal_throughput_scales_with_workers() {
             let sched = scheduler.clone();
             let comp = completed.clone();
             handles.push(tokio::spawn(async move {
-                loop {
-                    let pid =
-                        match tokio::time::timeout(Duration::from_millis(50), sched.schedule())
-                            .await
-                        {
-                            Ok(Some(pid)) => pid,
-                            _ => break,
-                        };
-                    tokio::time::sleep(Duration::from_micros(100)).await;
-                    sched.terminate(pid, 1, Duration::from_micros(100)).await;
+                while let Some(pid) = sched.try_schedule() {
+                    tokio::time::sleep(work_duration).await;
+                    sched.terminate(pid, 1, work_duration);
                     comp.fetch_add(1, Ordering::SeqCst);
                 }
             }));
@@ -638,16 +621,22 @@ async fn test_optimal_throughput_scales_with_workers() {
         for h in handles {
             let _ = h.await;
         }
+
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            num_processes,
+            "all tasks should complete"
+        );
         start.elapsed()
     };
 
-    // Multi-worker should be faster (at least 2x for 4 workers)
-    // Allow some overhead, so check for at least 1.5x improvement
+    let speedup = single_worker_time.as_millis() as f64 / multi_worker_time.as_millis().max(1) as f64;
     assert!(
         multi_worker_time < single_worker_time,
-        "4 workers should be faster than 1: {:?} vs {:?}",
+        "4 workers ({:?}) should be faster than 1 ({:?}), speedup={:.2}x",
         multi_worker_time,
-        single_worker_time
+        single_worker_time,
+        speedup
     );
 }
 
@@ -692,9 +681,9 @@ async fn test_optimal_priority_inversions_minimized() {
                     _ => break,
                 };
 
-                let info = sched.get_process(pid).await.unwrap();
+                let info = sched.get_process(pid).unwrap();
                 tokio::time::sleep(Duration::from_micros(100)).await;
-                sched.terminate(pid, 1, Duration::from_micros(100)).await;
+                sched.terminate(pid, 1, Duration::from_micros(100));
 
                 let elapsed = start_time.elapsed();
                 if info.priority == Priority::HIGH {
@@ -770,7 +759,7 @@ async fn test_optimal_resource_utilization() {
                     };
                 activity[worker_id].fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_micros(50)).await;
-                sched.terminate(pid, 1, Duration::from_micros(50)).await;
+                sched.terminate(pid, 1, Duration::from_micros(50));
             }
         }));
     }
@@ -825,7 +814,7 @@ async fn test_optimal_all_same_priority_scheduled() {
     for _ in 0..10 {
         let pid = scheduler.schedule().await.unwrap();
         scheduled.insert(pid);
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     }
 
     // All tasks should be scheduled exactly once
@@ -859,10 +848,10 @@ async fn test_optimal_preemption_responsiveness() {
                 Ok(Some(pid)) => pid,
                 _ => break,
             };
-            let info = sched.get_process(pid).await.unwrap();
+            let info = sched.get_process(pid).unwrap();
             priorities_clone.lock().await.push(info.priority);
             tokio::time::sleep(Duration::from_millis(5)).await;
-            sched.terminate(pid, 0, Duration::ZERO).await;
+            sched.terminate(pid, 0, Duration::ZERO);
         }
     });
 
@@ -938,7 +927,7 @@ async fn test_group_scheduler_creation() {
     let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     assert_eq!(group_sched.log_group(), "test-log-group");
-    let counts = group_sched.process_counts().await;
+    let counts = group_sched.process_counts();
     assert_eq!(counts.ready, 0);
     assert_eq!(counts.terminated, 0);
 }
@@ -950,7 +939,7 @@ async fn test_group_scheduler_spawn_realtime_tail() {
     let pid = group_sched.spawn_realtime_tail().await;
     assert!(pid > 0);
 
-    let info = group_sched.scheduler().get_process(pid).await.unwrap();
+    let info = group_sched.scheduler().get_process(pid).unwrap();
     assert_eq!(info.kind, ProcessKind::Daemon);
     assert_eq!(info.task_type, TaskType::RealtimeTail);
     assert_eq!(info.priority, Priority::CRITICAL);
@@ -962,7 +951,7 @@ async fn test_group_scheduler_spawn_reconcile() {
 
     let pid = group_sched.spawn_reconcile().await;
 
-    let info = group_sched.scheduler().get_process(pid).await.unwrap();
+    let info = group_sched.scheduler().get_process(pid).unwrap();
     assert_eq!(info.kind, ProcessKind::Daemon);
     assert_eq!(info.task_type, TaskType::Reconcile);
     assert_eq!(info.priority, Priority::HIGH);
@@ -974,7 +963,7 @@ async fn test_group_scheduler_spawn_full_history_reconcile() {
 
     let pid = group_sched.spawn_full_history_reconcile().await;
 
-    let info = group_sched.scheduler().get_process(pid).await.unwrap();
+    let info = group_sched.scheduler().get_process(pid).unwrap();
     assert_eq!(info.kind, ProcessKind::Daemon);
     assert_eq!(info.task_type, TaskType::FullHistoryReconcile);
     assert_eq!(info.priority, Priority::NORMAL);
@@ -986,7 +975,7 @@ async fn test_group_scheduler_spawn_conflict_reindex() {
 
     let pid = group_sched.spawn_conflict_reindex().await;
 
-    let info = group_sched.scheduler().get_process(pid).await.unwrap();
+    let info = group_sched.scheduler().get_process(pid).unwrap();
     assert_eq!(info.kind, ProcessKind::Daemon);
     assert_eq!(info.task_type, TaskType::ConflictReindex);
     assert_eq!(info.priority, Priority::LOW);
@@ -998,7 +987,7 @@ async fn test_group_scheduler_spawn_heal_day() {
 
     let pid = group_sched.spawn_heal_day(5).await;
 
-    let info = group_sched.scheduler().get_process(pid).await.unwrap();
+    let info = group_sched.scheduler().get_process(pid).unwrap();
     assert_eq!(info.kind, ProcessKind::Batch);
     assert_eq!(info.task_type, TaskType::SchemaHeal);
     assert_eq!(info.priority, Priority::IDLE);
@@ -1011,19 +1000,19 @@ async fn test_group_scheduler_spawn_backfill_day() {
 
     // Day 0 should have REALTIME priority
     let pid0 = group_sched.spawn_backfill_day(0).await;
-    let info0 = group_sched.scheduler().get_process(pid0).await.unwrap();
+    let info0 = group_sched.scheduler().get_process(pid0).unwrap();
     assert_eq!(info0.kind, ProcessKind::Batch);
     assert_eq!(info0.task_type, TaskType::Backfill);
     assert_eq!(info0.priority, Priority::CRITICAL);
 
     // Day 7 should have NORMAL priority
     let pid7 = group_sched.spawn_backfill_day(7).await;
-    let info7 = group_sched.scheduler().get_process(pid7).await.unwrap();
+    let info7 = group_sched.scheduler().get_process(pid7).unwrap();
     assert_eq!(info7.priority, Priority::NORMAL);
 
     // Day 100 should have IDLE priority
     let pid100 = group_sched.spawn_backfill_day(100).await;
-    let info100 = group_sched.scheduler().get_process(pid100).await.unwrap();
+    let info100 = group_sched.scheduler().get_process(pid100).unwrap();
     assert_eq!(info100.priority, Priority::IDLE);
 }
 
@@ -1042,7 +1031,7 @@ async fn test_group_scheduler_create_backfill_queue() {
     let initial_pids = queue.start().await;
     assert_eq!(initial_pids.len(), 8);
 
-    let counts = group_sched.process_counts().await;
+    let counts = group_sched.process_counts();
     assert_eq!(counts.ready, 8);
     assert_eq!(queue.pending_count().await, 92);
 }
@@ -1061,7 +1050,7 @@ async fn test_group_scheduler_create_heal_queue() {
 
     // All heal processes should be IDLE priority
     for pid in initial_pids {
-        let info = group_sched.scheduler().get_process(pid).await.unwrap();
+        let info = group_sched.scheduler().get_process(pid).unwrap();
         assert_eq!(info.priority, Priority::IDLE);
         assert_eq!(info.task_type, TaskType::SchemaHeal);
     }
@@ -1080,7 +1069,7 @@ async fn test_group_scheduler_list_daemons() {
     group_sched.spawn_backfill_day(0).await;
     group_sched.spawn_backfill_day(1).await;
 
-    let daemons = group_sched.list_daemons().await;
+    let daemons = group_sched.list_daemons();
     assert_eq!(daemons.len(), 3);
 
     for d in daemons {
@@ -1100,7 +1089,7 @@ async fn test_group_scheduler_list_batches() {
     group_sched.spawn_backfill_day(1).await;
     group_sched.spawn_heal_day(0).await;
 
-    let batches = group_sched.list_batches().await;
+    let batches = group_sched.list_batches();
     assert_eq!(batches.len(), 3);
 
     for b in batches {
@@ -1120,7 +1109,7 @@ async fn test_group_scheduler_shutdown_daemons() {
     let backfill_pid = group_sched.spawn_backfill_day(0).await;
 
     // Verify initial state
-    let counts_before = group_sched.process_counts().await;
+    let counts_before = group_sched.process_counts();
     assert_eq!(counts_before.ready, 3);
     assert_eq!(counts_before.terminated, 0);
 
@@ -1128,13 +1117,12 @@ async fn test_group_scheduler_shutdown_daemons() {
     group_sched.shutdown_daemons().await;
 
     // Verify daemons are terminated
-    let tail_info = group_sched.scheduler().get_process(tail_pid).await.unwrap();
+    let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.state, ProcessState::Terminated);
 
     let reconcile_info = group_sched
         .scheduler()
         .get_process(reconcile_pid)
-        .await
         .unwrap();
     assert_eq!(reconcile_info.state, ProcessState::Terminated);
 
@@ -1142,7 +1130,6 @@ async fn test_group_scheduler_shutdown_daemons() {
     let backfill_info = group_sched
         .scheduler()
         .get_process(backfill_pid)
-        .await
         .unwrap();
     assert_eq!(backfill_info.state, ProcessState::Ready);
 }
@@ -1167,37 +1154,34 @@ async fn test_group_scheduler_mixed_workload() {
 
     // Total: 4 daemons + 7 backfill + 3 heal = 14 processes
     // All fit in max_ready (16) so all should be spawned
-    let all_processes = group_sched.list_processes().await;
+    let all_processes = group_sched.list_processes();
     assert_eq!(all_processes.len(), 14);
 
-    let daemons = group_sched.list_daemons().await;
+    let daemons = group_sched.list_daemons();
     assert_eq!(daemons.len(), 4);
 
-    let batches = group_sched.list_batches().await;
+    let batches = group_sched.list_batches();
     assert_eq!(batches.len(), 10);
 
     // Verify daemon priorities are correct
-    let tail_info = group_sched.scheduler().get_process(tail_pid).await.unwrap();
+    let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.priority, Priority::CRITICAL);
 
     let reconcile_info = group_sched
         .scheduler()
         .get_process(reconcile_pid)
-        .await
         .unwrap();
     assert_eq!(reconcile_info.priority, Priority::HIGH);
 
     let full_history_info = group_sched
         .scheduler()
         .get_process(full_history_pid)
-        .await
         .unwrap();
     assert_eq!(full_history_info.priority, Priority::NORMAL);
 
     let conflict_info = group_sched
         .scheduler()
         .get_process(conflict_pid)
-        .await
         .unwrap();
     assert_eq!(conflict_info.priority, Priority::LOW);
 
@@ -1217,24 +1201,22 @@ async fn test_group_scheduler_process_naming() {
     let backfill_pid = group_sched.spawn_backfill_day(5).await;
     let heal_pid = group_sched.spawn_heal_day(3).await;
 
-    let tail_info = group_sched.scheduler().get_process(tail_pid).await.unwrap();
+    let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.name, "my-app-logs/tail");
 
     let reconcile_info = group_sched
         .scheduler()
         .get_process(reconcile_pid)
-        .await
         .unwrap();
     assert_eq!(reconcile_info.name, "my-app-logs/reconcile");
 
     let backfill_info = group_sched
         .scheduler()
         .get_process(backfill_pid)
-        .await
         .unwrap();
     assert_eq!(backfill_info.name, "my-app-logs/backfill-day-5");
 
-    let heal_info = group_sched.scheduler().get_process(heal_pid).await.unwrap();
+    let heal_info = group_sched.scheduler().get_process(heal_pid).unwrap();
     assert_eq!(heal_info.name, "my-app-logs/heal-day-3");
 }
 
@@ -1269,7 +1251,7 @@ async fn test_spawn_never_blocks_with_many_processes() {
         elapsed
     );
 
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 10000);
 }
 
@@ -1336,7 +1318,7 @@ async fn test_multiple_spawns_coalesce_wakeups() {
     // Now consume them - all should be in ready queue
     let mut count = 0;
     while let Some(pid) = scheduler.schedule().await {
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
         count += 1;
         if count >= 1000 {
             break;
@@ -1360,7 +1342,7 @@ async fn test_unblock_wakes_scheduler() {
 
     // Schedule it to make it running, then block it
     scheduler.schedule().await;
-    scheduler.block(pid).await;
+    scheduler.block(pid);
 
     let scheduler_clone = scheduler.clone();
     let woken = Arc::new(AtomicBool::new(false));
@@ -1428,7 +1410,7 @@ async fn test_concurrent_spawn_never_blocks() {
         elapsed
     );
 
-    let counts = scheduler.process_counts().await;
+    let counts = scheduler.process_counts();
     assert_eq!(counts.ready, 10000);
 }
 
@@ -1572,7 +1554,7 @@ async fn test_batch_queue_prioritizes_work() {
     let scheduler = group_sched.scheduler();
     let mut day_offsets: Vec<u32> = Vec::new();
     for pid in initial_pids {
-        if let Some(info) = scheduler.get_process(pid).await {
+        if let Some(info) = scheduler.get_process(pid) {
             day_offsets.push(info.day_offset);
         }
     }

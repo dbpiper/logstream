@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 // ============================================================================
@@ -412,18 +414,11 @@ impl Eq for SchedulerEntry {}
 /// - `schedule()` waits efficiently on a Notify - like sleeping on a wait queue
 /// - Multiple wakeups are coalesced - like the need_resched flag
 pub struct ProcessScheduler {
-    /// Next PID to assign.
     next_pid: AtomicU64,
-    /// All processes (keyed by PID).
-    processes: RwLock<std::collections::HashMap<u64, ProcessControlBlock>>,
-    /// Ready queue (priority queue).
-    ready_queue: Mutex<BinaryHeap<SchedulerEntry>>,
-    /// Resource pool.
+    processes: DashMap<u64, ProcessControlBlock>,
+    ready_queue: StdMutex<BinaryHeap<SchedulerEntry>>,
     resources: Arc<ResourcePool>,
-    /// Time quantum for round-robin (ms).
     time_quantum_ms: u64,
-    /// Wakeup signal for scheduler (like Linux's TIF_NEED_RESCHED).
-    /// Never blocks on signal, multiple signals coalesce.
     wakeup: Notify,
 }
 
@@ -431,8 +426,8 @@ impl ProcessScheduler {
     pub fn new(resources: Resources, max_concurrency: usize, time_quantum_ms: u64) -> Arc<Self> {
         Arc::new(Self {
             next_pid: AtomicU64::new(1),
-            processes: RwLock::new(std::collections::HashMap::new()),
-            ready_queue: Mutex::new(BinaryHeap::new()),
+            processes: DashMap::new(),
+            ready_queue: StdMutex::new(BinaryHeap::new()),
             resources: Arc::new(ResourcePool::new(resources, max_concurrency)),
             time_quantum_ms,
             wakeup: Notify::new(),
@@ -452,22 +447,16 @@ impl ProcessScheduler {
         pcb.make_ready();
 
         let effective_priority = pcb.effective_priority();
+        self.processes.insert(pid, pcb);
 
         {
-            let mut processes = self.processes.write().await;
-            processes.insert(pid, pcb);
-        }
-
-        {
-            let mut queue = self.ready_queue.lock().await;
+            let mut queue = self.ready_queue.lock().unwrap();
             queue.push(SchedulerEntry {
                 effective_priority,
                 pid,
             });
         }
 
-        // Linux-style wakeup: notify_one() never blocks, just sets the
-        // "need_resched" equivalent. Multiple calls coalesce into one wakeup.
         self.wakeup.notify_one();
         pid
     }
@@ -485,61 +474,55 @@ impl ProcessScheduler {
         pcb.make_ready();
 
         let effective_priority = pcb.effective_priority();
+        self.processes.insert(pid, pcb);
 
         {
-            let mut processes = self.processes.write().await;
-            processes.insert(pid, pcb);
-        }
-
-        {
-            let mut queue = self.ready_queue.lock().await;
+            let mut queue = self.ready_queue.lock().unwrap();
             queue.push(SchedulerEntry {
                 effective_priority,
                 pid,
             });
         }
 
-        // Linux-style wakeup: notify_one() never blocks, just sets the
-        // "need_resched" equivalent. Multiple calls coalesce into one wakeup.
         self.wakeup.notify_one();
         pid
     }
 
     /// Get the next process to run (blocks until one is available).
-    ///
-    /// Uses Linux-style wait queue semantics:
-    /// - First checks if work is available (like checking TIF_NEED_RESCHED)
-    /// - If not, sleeps on the wakeup signal (like sleeping on a wait queue)
-    /// - Wakes up when any process is spawned or unblocked
     pub async fn schedule(&self) -> Option<u64> {
         loop {
-            // Try to get from ready queue (like checking need_resched)
-            {
-                let mut queue = self.ready_queue.lock().await;
-                if let Some(entry) = queue.pop() {
-                    // Update process state
-                    let mut processes = self.processes.write().await;
-                    if let Some(pcb) = processes.get_mut(&entry.pid) {
+            if let Some(pid) = self.try_schedule() {
+                return Some(pid);
+            }
+            self.wakeup.notified().await;
+        }
+    }
+
+    /// Try to get the next process without blocking.
+    pub fn try_schedule(&self) -> Option<u64> {
+        loop {
+            let candidate = {
+                let mut queue = self.ready_queue.lock().unwrap();
+                queue.pop()
+            };
+
+            match candidate {
+                Some(entry) => {
+                    if let Some(mut pcb) = self.processes.get_mut(&entry.pid) {
                         if pcb.state == ProcessState::Ready {
                             pcb.make_running();
                             return Some(entry.pid);
                         }
                     }
-                    // Process was terminated or in wrong state, try next
-                    continue;
                 }
+                None => return None,
             }
-
-            // Sleep on wait queue until woken by spawn/unblock
-            // Like Linux's schedule() sleeping when no runnable tasks
-            self.wakeup.notified().await;
         }
     }
 
     /// Mark a process as completed.
-    pub async fn terminate(&self, pid: u64, events_processed: usize, cpu_time: Duration) {
-        let mut processes = self.processes.write().await;
-        if let Some(pcb) = processes.get_mut(&pid) {
+    pub fn terminate(&self, pid: u64, events_processed: usize, cpu_time: Duration) {
+        if let Some(mut pcb) = self.processes.get_mut(&pid) {
             pcb.events_processed = events_processed;
             pcb.cpu_time = cpu_time;
             pcb.make_terminated();
@@ -547,45 +530,37 @@ impl ProcessScheduler {
     }
 
     /// Mark a process as blocked (waiting for I/O).
-    pub async fn block(&self, pid: u64) {
-        let mut processes = self.processes.write().await;
-        if let Some(pcb) = processes.get_mut(&pid) {
+    pub fn block(&self, pid: u64) {
+        if let Some(mut pcb) = self.processes.get_mut(&pid) {
             pcb.make_blocked();
         }
     }
 
     /// Unblock a process and return to ready queue.
-    ///
-    /// Like Linux's `wake_up_process()` - moves process to runnable state
-    /// and signals the scheduler.
     pub async fn unblock(&self, pid: u64) {
-        let effective_priority;
-        {
-            let mut processes = self.processes.write().await;
-            if let Some(pcb) = processes.get_mut(&pid) {
+        let effective_priority = {
+            if let Some(mut pcb) = self.processes.get_mut(&pid) {
                 pcb.make_ready();
-                effective_priority = pcb.effective_priority();
+                pcb.effective_priority()
             } else {
                 return;
             }
-        }
+        };
 
         {
-            let mut queue = self.ready_queue.lock().await;
+            let mut queue = self.ready_queue.lock().unwrap();
             queue.push(SchedulerEntry {
                 effective_priority,
                 pid,
             });
         }
 
-        // Linux-style wakeup
         self.wakeup.notify_one();
     }
 
     /// Get process info.
-    pub async fn get_process(&self, pid: u64) -> Option<ProcessInfo> {
-        let processes = self.processes.read().await;
-        processes.get(&pid).map(|pcb| ProcessInfo {
+    pub fn get_process(&self, pid: u64) -> Option<ProcessInfo> {
+        self.processes.get(&pid).map(|pcb| ProcessInfo {
             pid: pcb.pid,
             name: pcb.name.clone(),
             state: pcb.state,
@@ -600,21 +575,23 @@ impl ProcessScheduler {
     }
 
     /// Get all processes.
-    pub async fn list_processes(&self) -> Vec<ProcessInfo> {
-        let processes = self.processes.read().await;
-        processes
-            .values()
-            .map(|pcb| ProcessInfo {
-                pid: pcb.pid,
-                name: pcb.name.clone(),
-                state: pcb.state,
-                priority: pcb.priority,
-                kind: pcb.kind,
-                task_type: pcb.task_type,
-                day_offset: pcb.day_offset,
-                wait_time: pcb.wait_time(),
-                cpu_time: pcb.cpu_time,
-                events_processed: pcb.events_processed,
+    pub fn list_processes(&self) -> Vec<ProcessInfo> {
+        self.processes
+            .iter()
+            .map(|entry| {
+                let pcb = entry.value();
+                ProcessInfo {
+                    pid: pcb.pid,
+                    name: pcb.name.clone(),
+                    state: pcb.state,
+                    priority: pcb.priority,
+                    kind: pcb.kind,
+                    task_type: pcb.task_type,
+                    day_offset: pcb.day_offset,
+                    wait_time: pcb.wait_time(),
+                    cpu_time: pcb.cpu_time,
+                    events_processed: pcb.events_processed,
+                }
             })
             .collect()
     }
@@ -635,11 +612,10 @@ impl ProcessScheduler {
     }
 
     /// Count processes by state.
-    pub async fn process_counts(&self) -> ProcessCounts {
-        let processes = self.processes.read().await;
+    pub fn process_counts(&self) -> ProcessCounts {
         let mut counts = ProcessCounts::default();
-        for pcb in processes.values() {
-            match pcb.state {
+        for entry in self.processes.iter() {
+            match entry.value().state {
                 ProcessState::New => counts.new += 1,
                 ProcessState::Ready => counts.ready += 1,
                 ProcessState::Running => counts.running += 1,
@@ -832,7 +808,7 @@ impl WorkerPool {
                         }
                     };
 
-                    let info = match sched.get_process(pid).await {
+                    let info = match sched.get_process(pid) {
                         Some(info) => info,
                         None => continue,
                     };
@@ -860,7 +836,7 @@ impl WorkerPool {
                     let cpu_time = started.elapsed();
 
                     // Record completion in scheduler
-                    sched.terminate(pid, events, cpu_time).await;
+                    sched.terminate(pid, events, cpu_time);
 
                     // Demand-driven: complete() spawns next pending work
                     // This is the key Linux-style behavior - completing a process
@@ -953,7 +929,7 @@ impl ProcessRegistry {
         let mut stats = AggregateStats::default();
 
         for (name, sched) in scheds.iter() {
-            let counts = sched.process_counts().await;
+            let counts = sched.process_counts();
             stats.total_processes +=
                 counts.new + counts.ready + counts.running + counts.blocked + counts.terminated;
             stats.running += counts.running;
@@ -1134,27 +1110,29 @@ impl GroupScheduler {
     }
 
     /// Get process counts.
-    pub async fn process_counts(&self) -> ProcessCounts {
-        self.scheduler.process_counts().await
+    pub fn process_counts(&self) -> ProcessCounts {
+        self.scheduler.process_counts()
     }
 
     /// List all processes.
-    pub async fn list_processes(&self) -> Vec<ProcessInfo> {
-        self.scheduler.list_processes().await
+    pub fn list_processes(&self) -> Vec<ProcessInfo> {
+        self.scheduler.list_processes()
     }
 
     /// List daemon processes.
-    pub async fn list_daemons(&self) -> Vec<ProcessInfo> {
-        let all = self.scheduler.list_processes().await;
-        all.into_iter()
+    pub fn list_daemons(&self) -> Vec<ProcessInfo> {
+        self.scheduler
+            .list_processes()
+            .into_iter()
             .filter(|p| p.kind == ProcessKind::Daemon)
             .collect()
     }
 
     /// List batch processes.
-    pub async fn list_batches(&self) -> Vec<ProcessInfo> {
-        let all = self.scheduler.list_processes().await;
-        all.into_iter()
+    pub fn list_batches(&self) -> Vec<ProcessInfo> {
+        self.scheduler
+            .list_processes()
+            .into_iter()
             .filter(|p| p.kind == ProcessKind::Batch)
             .collect()
     }
@@ -1163,7 +1141,7 @@ impl GroupScheduler {
     pub async fn shutdown_daemons(&self) {
         let pids = self.daemon_pids.read().await.clone();
         for pid in pids {
-            self.scheduler.terminate(pid, 0, Duration::ZERO).await;
+            self.scheduler.terminate(pid, 0, Duration::ZERO);
         }
     }
 }

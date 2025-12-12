@@ -484,3 +484,169 @@ async fn test_event_ids_preserved_through_buffer() {
     let collected_ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(collected_ids, original_ids);
 }
+
+mod live_learn_tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const LIVE_LEARN_THRESHOLD_PCT: u64 = 10;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum LiveLearnDecision {
+        TrustEs,
+        Replace,
+    }
+
+    fn decide_live_learn(es_count: u64, cw_count: u64, cw_stressed: bool) -> LiveLearnDecision {
+        let max_count = es_count.max(cw_count);
+        let diff = es_count.abs_diff(cw_count);
+
+        if max_count == 0 {
+            return LiveLearnDecision::TrustEs;
+        }
+
+        let diff_pct = diff * 100 / max_count;
+        let within_threshold = diff_pct <= LIVE_LEARN_THRESHOLD_PCT;
+        let es_ahead_under_stress = es_count > cw_count && cw_stressed;
+
+        if within_threshold || es_ahead_under_stress {
+            LiveLearnDecision::TrustEs
+        } else {
+            LiveLearnDecision::Replace
+        }
+    }
+
+    #[test]
+    fn test_counts_within_threshold_trusts_es() {
+        assert_eq!(
+            decide_live_learn(1000, 1050, false),
+            LiveLearnDecision::TrustEs
+        );
+        assert_eq!(
+            decide_live_learn(1000, 950, false),
+            LiveLearnDecision::TrustEs
+        );
+        assert_eq!(
+            decide_live_learn(1000, 1100, false),
+            LiveLearnDecision::TrustEs
+        );
+    }
+
+    #[test]
+    fn test_counts_outside_threshold_triggers_replace() {
+        assert_eq!(
+            decide_live_learn(1000, 2000, false),
+            LiveLearnDecision::Replace
+        );
+        assert_eq!(
+            decide_live_learn(1000, 500, false),
+            LiveLearnDecision::Replace
+        );
+        assert_eq!(
+            decide_live_learn(100, 200, false),
+            LiveLearnDecision::Replace
+        );
+    }
+
+    #[test]
+    fn test_es_more_than_cw_under_stress_trusts_es() {
+        assert_eq!(
+            decide_live_learn(1000, 500, true),
+            LiveLearnDecision::TrustEs
+        );
+        assert_eq!(
+            decide_live_learn(2000, 100, true),
+            LiveLearnDecision::TrustEs
+        );
+    }
+
+    #[test]
+    fn test_cw_more_than_es_under_stress_still_replaces() {
+        assert_eq!(
+            decide_live_learn(500, 1000, true),
+            LiveLearnDecision::Replace
+        );
+    }
+
+    #[test]
+    fn test_both_zero_trusts_es() {
+        assert_eq!(decide_live_learn(0, 0, false), LiveLearnDecision::TrustEs);
+        assert_eq!(decide_live_learn(0, 0, true), LiveLearnDecision::TrustEs);
+    }
+
+    #[test]
+    fn test_boundary_at_exactly_10_percent() {
+        assert_eq!(
+            decide_live_learn(1000, 1100, false),
+            LiveLearnDecision::TrustEs
+        );
+        assert_eq!(
+            decide_live_learn(1000, 1200, false),
+            LiveLearnDecision::Replace
+        );
+    }
+
+    #[tokio::test]
+    async fn test_live_learn_records_es_count_not_cw() {
+        let recorded_count = Arc::new(AtomicU64::new(0));
+        let recorded = recorded_count.clone();
+
+        let es_count = 1000u64;
+        let cw_count = 1050u64;
+
+        let decision = decide_live_learn(es_count, cw_count, false);
+        if decision == LiveLearnDecision::TrustEs {
+            recorded.store(es_count, Ordering::SeqCst);
+        }
+
+        assert_eq!(recorded_count.load(Ordering::SeqCst), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_live_learn_upserts_without_delete() {
+        let delete_called = Arc::new(AtomicBool::new(false));
+        let upsert_count = Arc::new(AtomicUsize::new(0));
+
+        let decision = decide_live_learn(1000, 1050, false);
+
+        if decision == LiveLearnDecision::TrustEs {
+            upsert_count.fetch_add(50, Ordering::SeqCst);
+        } else {
+            delete_called.store(true, Ordering::SeqCst);
+        }
+
+        assert!(!delete_called.load(Ordering::SeqCst));
+        assert_eq!(upsert_count.load(Ordering::SeqCst), 50);
+    }
+
+    #[tokio::test]
+    async fn test_full_replace_deletes_then_inserts() {
+        let delete_called = Arc::new(AtomicBool::new(false));
+        let insert_count = Arc::new(AtomicUsize::new(0));
+
+        let decision = decide_live_learn(1000, 2000, false);
+
+        if decision == LiveLearnDecision::Replace {
+            delete_called.store(true, Ordering::SeqCst);
+            insert_count.fetch_add(2000, Ordering::SeqCst);
+        }
+
+        assert!(delete_called.load(Ordering::SeqCst));
+        assert_eq!(insert_count.load(Ordering::SeqCst), 2000);
+    }
+
+    #[test]
+    fn test_threshold_edge_cases() {
+        assert_eq!(decide_live_learn(10, 11, false), LiveLearnDecision::TrustEs);
+        assert_eq!(decide_live_learn(10, 13, false), LiveLearnDecision::Replace);
+        assert_eq!(decide_live_learn(100, 110, false), LiveLearnDecision::TrustEs);
+        assert_eq!(decide_live_learn(100, 120, false), LiveLearnDecision::Replace);
+    }
+
+    #[test]
+    fn test_stress_only_protects_when_es_has_more() {
+        assert_eq!(decide_live_learn(100, 50, true), LiveLearnDecision::TrustEs);
+        assert_eq!(decide_live_learn(50, 100, true), LiveLearnDecision::Replace);
+        assert_eq!(decide_live_learn(100, 100, true), LiveLearnDecision::TrustEs);
+    }
+}

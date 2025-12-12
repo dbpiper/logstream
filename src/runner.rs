@@ -194,7 +194,7 @@ pub fn execute_conflict_daemon(
         if let Err(err) = es_conflicts.run_conflict_reindex().await {
             tracing::warn!("conflict reindex failed: {err:?}");
         }
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     })
 }
 
@@ -225,7 +225,7 @@ pub fn execute_tail_daemon(
         if let Err(err) = tailer.run(raw_tx).await {
             tracing::error!("tailer failed: {err:?}");
         }
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     })
 }
 
@@ -265,7 +265,7 @@ pub async fn execute_reconcile_daemon(
 
     Ok(tokio::spawn(async move {
         reconcile::run_reconcile_loop(reconcile_ctx, params).await;
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     }))
 }
 
@@ -293,7 +293,7 @@ pub async fn execute_full_history_daemon(
 
     Ok(tokio::spawn(async move {
         reconcile::run_full_history(reconcile_ctx, params, backfill_days).await;
-        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        scheduler.terminate(pid, 0, Duration::ZERO);
     }))
 }
 
@@ -411,7 +411,7 @@ pub async fn run_heal_days(
         let _ = handle.await;
     }
 
-    let counts = group_scheduler.process_counts().await;
+    let counts = group_scheduler.process_counts();
     tracing::info!(
         "heal complete: {} processes terminated for {}",
         counts.terminated,

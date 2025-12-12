@@ -620,3 +620,267 @@ mod data_integrity_tests {
         assert!(result.is_usable());
     }
 }
+
+mod persistence_tests {
+    use logstream::seasonal_stats::SeasonalStats;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_save_and_load_preserves_samples() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seasonal_stats.json");
+
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+        for i in 0..20 {
+            stats.record_verified(base + i * 3_600_000, 100 + i as u64);
+        }
+
+        let original_count = stats.total_samples();
+        stats.save(&path).unwrap();
+
+        let loaded = SeasonalStats::load_or_new(&path);
+        assert_eq!(loaded.total_samples(), original_count);
+    }
+
+    #[test]
+    fn test_load_missing_file_returns_empty() {
+        let path = PathBuf::from("/nonexistent/path/stats.json");
+        let stats = SeasonalStats::load_or_new(&path);
+        assert_eq!(stats.total_samples(), 0);
+    }
+
+    #[test]
+    fn test_load_corrupt_file_returns_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let stats = SeasonalStats::load_or_new(&path);
+        assert_eq!(stats.total_samples(), 0);
+    }
+
+    #[test]
+    fn test_loaded_stats_can_make_predictions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seasonal_stats.json");
+
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+        for i in 0..50 {
+            stats.record_verified(base + i * 3_600_000, 1000);
+        }
+        stats.save(&path).unwrap();
+
+        let loaded = SeasonalStats::load_or_new(&path);
+        let range = loaded.expected_range(base + 25 * 3_600_000);
+        assert!(range.is_some());
+
+        let (mean, _) = range.unwrap();
+        assert!(mean > 500.0 && mean < 1500.0);
+    }
+}
+
+mod confidence_tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_confidence_with_no_samples() {
+        let stats = SeasonalStats::new();
+        assert!(stats.confidence_score() < 0.01);
+        assert!(stats.needs_es_fallback());
+    }
+
+    #[test]
+    fn test_low_confidence_after_few_samples() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for i in 0..10 {
+            stats.record_verified(base + i * 3_600_000, 100);
+        }
+
+        let score = stats.confidence_score();
+        assert!(score > 0.0 && score < 0.5);
+        assert!(stats.needs_es_fallback());
+    }
+
+    #[test]
+    fn test_confidence_increases_with_samples() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for i in 0..20 {
+            stats.record_verified(base + i * 3_600_000, 100);
+        }
+        let score_20 = stats.confidence_score();
+
+        for i in 20..100 {
+            stats.record_verified(base + i * 3_600_000, 100);
+        }
+        let score_100 = stats.confidence_score();
+
+        assert!(score_100 > score_20);
+    }
+
+    #[test]
+    fn test_confidence_increases_with_diversity() {
+        let stats_clustered = SeasonalStats::new();
+        let stats_spread = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for i in 0..50 {
+            stats_clustered.record_verified(base + i * 60_000, 100);
+        }
+
+        for i in 0..50 {
+            stats_spread.record_verified(base + i * 3_600_000, 100);
+        }
+
+        assert!(stats_spread.confidence_score() > stats_clustered.confidence_score());
+    }
+
+    #[test]
+    fn test_high_confidence_stops_es_fallback() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for day in 0..30 {
+            for hour in 0..24 {
+                let ts = base + day * 86_400_000 + hour * 3_600_000;
+                stats.record_verified(ts, 100);
+            }
+        }
+
+        let score = stats.confidence_score();
+        assert!(score >= 0.90, "expected high confidence, got {:.3}", score);
+    }
+
+    #[test]
+    fn test_record_from_es_adds_sample() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        stats.record_from_es(base, 500);
+        stats.record_from_es(base + 3_600_000, 600);
+
+        assert_eq!(stats.total_samples(), 2);
+    }
+
+    #[test]
+    fn test_record_from_es_deduplicates() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        stats.record_from_es(base, 500);
+        stats.record_from_es(base + 1000, 600);
+
+        assert_eq!(stats.total_samples(), 1);
+    }
+
+    #[test]
+    fn test_record_from_es_rate_limited_at_high_confidence() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for day in 0..30 {
+            for hour in 0..24 {
+                let ts = base + day * 86_400_000 + hour * 3_600_000;
+                stats.record_verified(ts, 100);
+            }
+        }
+
+        let conf_score = stats.confidence_score();
+        assert!(
+            conf_score > 0.9,
+            "should have high confidence: {}",
+            conf_score
+        );
+    }
+
+    #[test]
+    fn test_blend_with_es_no_model() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        let result = stats.blend_with_es(base, 1000);
+        assert!(result.is_some());
+
+        let (mean, _) = result.unwrap();
+        assert!((mean - 1000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_blend_weights_shift_with_confidence() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for i in 0..10 {
+            stats.record_verified(base + i * 3_600_000, 500);
+        }
+        let low_conf = stats.confidence_score();
+        let blend_low = stats.blend_with_es(base + 5 * 3_600_000, 1000);
+
+        for i in 10..200 {
+            stats.record_verified(base + i * 3_600_000, 500);
+        }
+        let high_conf = stats.confidence_score();
+        let blend_high = stats.blend_with_es(base + 100 * 3_600_000, 1000);
+
+        assert!(high_conf > low_conf);
+
+        let (mean_low, _) = blend_low.unwrap();
+        let (mean_high, _) = blend_high.unwrap();
+
+        assert!(mean_low > mean_high);
+    }
+
+    #[test]
+    fn test_blend_approaches_model_at_high_confidence() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for day in 0..30 {
+            for hour in 0..24 {
+                let ts = base + day * 86_400_000 + hour * 3_600_000;
+                stats.record_verified(ts, 500);
+            }
+        }
+
+        let confidence = stats.confidence_score();
+        let model_only = stats.expected_range(base + 15 * 86_400_000);
+        let blended = stats.blend_with_es(base + 15 * 86_400_000, 5000);
+
+        assert!(model_only.is_some());
+        assert!(blended.is_some());
+
+        let (model_mean, _) = model_only.unwrap();
+        let (blend_mean, _) = blended.unwrap();
+
+        let es_contribution = (blend_mean - model_mean).abs();
+        let max_es_contribution = (5000.0 - model_mean) * (1.0 - confidence);
+
+        assert!(
+            es_contribution <= max_es_contribution * 1.1,
+            "ES contribution {:.0} should be roughly {:.0} at confidence {:.3}",
+            es_contribution,
+            max_es_contribution,
+            confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_struct_methods() {
+        let stats = SeasonalStats::new();
+        let base = 1700000000000i64;
+
+        for i in 0..50 {
+            stats.record_verified(base + i * 3_600_000, 100);
+        }
+
+        let conf = stats.confidence();
+        assert!(conf.score() > 0.0);
+        assert!(conf.model_weight() + conf.es_weight() - 1.0 < 0.001);
+    }
+}

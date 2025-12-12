@@ -1,10 +1,17 @@
 use std::f64::consts::PI;
+use std::path::Path;
 use std::sync::RwLock;
+
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::stress::{StressLevel, StressTracker};
 
 const MAX_SAMPLES: usize = 1000;
 const MIN_SAMPLES_FOR_STATS: usize = 5;
+
+const CONFIDENCE_SAMPLE_SCALE: f64 = 100.0;
+const MIN_ES_BLEND_CONFIDENCE: f64 = 0.85;
 
 const HOUR_BANDWIDTH: f64 = 2.0;
 const DAY_BANDWIDTH: f64 = 1.0;
@@ -21,7 +28,7 @@ pub struct SeasonalStats {
     samples: RwLock<SampleBuffer>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 struct Sample {
     timestamp_ms: i64,
     value: f64,
@@ -95,6 +102,10 @@ impl Sample {
         }
     }
 
+    fn new_es_sourced(timestamp_ms: i64, value: u64) -> Self {
+        Self::new(timestamp_ms, value)
+    }
+
     fn fourier_distance_sq(&self, other: &Sample) -> f64 {
         let hour =
             (self.hour_sin - other.hour_sin).powi(2) + (self.hour_cos - other.hour_cos).powi(2);
@@ -141,6 +152,53 @@ impl Sample {
     }
 }
 
+fn compute_fourier_confidence(samples: &[Sample]) -> f64 {
+    let n = samples.len();
+    if n < MIN_SAMPLES_FOR_STATS {
+        return 0.0;
+    }
+
+    let sample_confidence = 1.0 - (-((n as f64) / CONFIDENCE_SAMPLE_SCALE)).exp();
+
+    let hour_coverage = fourier_axis_coverage(samples, |s| (s.hour_sin, s.hour_cos));
+    let day_coverage = fourier_axis_coverage(samples, |s| (s.day_sin, s.day_cos));
+
+    let primary_coverage = (hour_coverage * 0.6 + day_coverage * 0.4).min(1.0);
+
+    (sample_confidence * primary_coverage).min(1.0)
+}
+
+fn fourier_axis_coverage<F>(samples: &[Sample], extract: F) -> f64
+where
+    F: Fn(&Sample) -> (f64, f64),
+{
+    if samples.is_empty() {
+        return 0.0;
+    }
+
+    let points: Vec<(f64, f64)> = samples.iter().map(&extract).collect();
+
+    let mut sum_sin = 0.0;
+    let mut sum_cos = 0.0;
+    for (sin_v, cos_v) in &points {
+        sum_sin += sin_v;
+        sum_cos += cos_v;
+    }
+
+    let n = points.len() as f64;
+    let mean_sin = sum_sin / n;
+    let mean_cos = sum_cos / n;
+
+    let resultant_length = (mean_sin * mean_sin + mean_cos * mean_cos).sqrt();
+
+    let dispersion = 1.0 - resultant_length;
+
+    let min_samples_for_full_coverage = 24.0;
+    let sample_factor = (n / min_samples_for_full_coverage).min(1.0);
+
+    (dispersion * sample_factor).min(1.0)
+}
+
 impl SampleBuffer {
     fn new() -> Self {
         Self {
@@ -181,6 +239,12 @@ impl SampleBuffer {
     fn reference_time(&self) -> i64 {
         self.data.iter().map(|s| s.timestamp_ms).max().unwrap_or(0)
     }
+
+    fn has_sample_near(&self, timestamp_ms: i64, tolerance_ms: i64) -> bool {
+        self.data
+            .iter()
+            .any(|s| (s.timestamp_ms - timestamp_ms).abs() < tolerance_ms)
+    }
 }
 
 impl Default for SeasonalStats {
@@ -194,6 +258,54 @@ impl SeasonalStats {
         Self {
             samples: RwLock::new(SampleBuffer::new()),
         }
+    }
+
+    pub fn load_or_new(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(data) => match serde_json::from_slice::<Vec<Sample>>(&data) {
+                Ok(samples) => {
+                    info!(
+                        "seasonal_stats: loaded {} samples from {}",
+                        samples.len(),
+                        path.display()
+                    );
+                    let mut buffer = SampleBuffer::new();
+                    for sample in samples {
+                        buffer.data.push(sample);
+                        buffer.recent_window.push(sample.value);
+                    }
+                    Self {
+                        samples: RwLock::new(buffer),
+                    }
+                }
+                Err(e) => {
+                    warn!("seasonal_stats: failed to parse {}: {}", path.display(), e);
+                    Self::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("seasonal_stats: no saved state at {}", path.display());
+                Self::new()
+            }
+            Err(e) => {
+                warn!("seasonal_stats: failed to read {}: {}", path.display(), e);
+                Self::new()
+            }
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let buffer = self.samples.read().unwrap();
+        let data = serde_json::to_vec(&buffer.data)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, data)?;
+        std::fs::rename(&tmp, path)?;
+        info!(
+            "seasonal_stats: saved {} samples to {}",
+            buffer.data.len(),
+            path.display()
+        );
+        Ok(())
     }
 
     pub fn record_verified(&self, timestamp_ms: i64, count: u64) {
@@ -333,6 +445,58 @@ impl SeasonalStats {
         buffer.data.len()
     }
 
+    pub fn confidence_score(&self) -> f64 {
+        let buffer = self.samples.read().unwrap();
+        compute_fourier_confidence(&buffer.data)
+    }
+
+    pub fn confidence(&self) -> Confidence {
+        Confidence(self.confidence_score())
+    }
+
+    pub fn needs_es_fallback(&self) -> bool {
+        self.confidence_score() < MIN_ES_BLEND_CONFIDENCE
+    }
+
+    pub fn record_from_es(&self, timestamp_ms: i64, count: u64) {
+        if self.confidence_score() >= MIN_ES_BLEND_CONFIDENCE {
+            return;
+        }
+        let sample = Sample::new_es_sourced(timestamp_ms, count);
+        let mut buffer = self.samples.write().unwrap();
+        if !buffer.has_sample_near(timestamp_ms, 3_600_000) {
+            buffer.add(sample);
+        }
+    }
+
+    pub fn blend_with_es(&self, timestamp_ms: i64, es_count: u64) -> Option<(f64, f64)> {
+        let model_result = self.expected_range(timestamp_ms);
+        let confidence = self.confidence_score();
+        let es_f = es_count as f64;
+
+        match model_result {
+            None => {
+                let stddev = es_f.sqrt().max(10.0);
+                Some((es_f, stddev))
+            }
+            Some((mean, stddev)) => {
+                let model_weight = confidence;
+                let es_weight = 1.0 - confidence;
+
+                let blended_mean = mean * model_weight + es_f * es_weight;
+                let blended_stddev = if confidence < 0.5 {
+                    stddev
+                        .max((es_f - blended_mean).abs() * (1.0 - confidence))
+                        .max(10.0)
+                } else {
+                    stddev
+                };
+
+                Some((blended_mean, blended_stddev))
+            }
+        }
+    }
+
     pub fn diversity_stats(&self) -> Option<(f64, f64)> {
         let buffer = self.samples.read().unwrap();
         if buffer.data.len() < 2 {
@@ -355,6 +519,27 @@ impl SeasonalStats {
         let min = diversities.iter().cloned().fold(f64::MAX, f64::min);
 
         Some((mean, min))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Confidence(pub f64);
+
+impl Confidence {
+    pub fn score(&self) -> f64 {
+        self.0
+    }
+
+    pub fn es_weight(&self) -> f64 {
+        1.0 - self.0
+    }
+
+    pub fn model_weight(&self) -> f64 {
+        self.0
+    }
+
+    pub fn is_self_reliant(&self) -> bool {
+        self.0 >= MIN_ES_BLEND_CONFIDENCE
     }
 }
 

@@ -13,7 +13,7 @@ use crate::{
     enrich::enrich_event,
     es_counts::EsCounter,
     event_router::EventSender,
-    seasonal_stats::{validate_event_integrity, DataIntegrity, SeasonalStats},
+    seasonal_stats::{validate_event_integrity, Confidence, DataIntegrity, SeasonalStats},
     stress::StressTracker,
     types::LogEvent,
 };
@@ -260,7 +260,7 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     }
 
     let cw_count = events.len() as u64;
-    let feasibility = check_feasibility(ctx, start_ms, end_ms, cw_count);
+    let feasibility = check_feasibility_async(ctx, start_ms, end_ms, cw_count).await;
 
     match feasibility {
         FeasibilityAction::FullReplace => {
@@ -269,31 +269,40 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
         FeasibilityAction::CheckIntegrity => {
             execute_integrity_aware_ingest(ctx, start_ms, end_ms, events).await;
         }
+        FeasibilityAction::LiveLearn => {
+            execute_live_learn_upsert(ctx, start_ms, end_ms, events).await;
+        }
     }
 }
+
+const LIVE_LEARN_THRESHOLD_PCT: u64 = 10;
 
 enum FeasibilityAction {
     FullReplace,
     CheckIntegrity,
+    LiveLearn,
 }
 
-fn check_feasibility(
+async fn check_feasibility_async(
     ctx: &ReconcileContext,
     start_ms: i64,
     end_ms: i64,
     cw_count: u64,
 ) -> FeasibilityAction {
     let range_ms = end_ms - start_ms;
+    let confidence = ctx.seasonal_stats.confidence();
+
+    if ctx.seasonal_stats.needs_es_fallback() {
+        return check_with_es_blend(ctx, start_ms, end_ms, cw_count, range_ms, confidence).await;
+    }
+
     let result = ctx
         .seasonal_stats
         .is_feasible(start_ms, range_ms, cw_count, &ctx.cw_stress);
 
     match &result {
         crate::seasonal_stats::FeasibilityResult::NoHistory => {
-            if cw_count > 0 || !ctx.cw_stress.is_stressed() {
-                ctx.seasonal_stats.record_verified(start_ms, cw_count);
-            }
-            FeasibilityAction::FullReplace
+            live_learn_check(ctx, start_ms, end_ms, cw_count).await
         }
         crate::seasonal_stats::FeasibilityResult::Feasible {
             expected,
@@ -301,8 +310,8 @@ fn check_feasibility(
             sigma_used,
         } => {
             info!(
-                "reconcile feasible: cw={} expected={:.0}±{:.0} ({}σ) for {}-{}",
-                cw_count, expected, stddev, sigma_used, start_ms, end_ms
+                "reconcile feasible: cw={} expected={:.0}±{:.0} ({}σ) conf={:?} for {}-{}",
+                cw_count, expected, stddev, sigma_used, confidence, start_ms, end_ms
             );
             ctx.seasonal_stats.record_verified(start_ms, cw_count);
             FeasibilityAction::FullReplace
@@ -314,11 +323,136 @@ fn check_feasibility(
             sigma_used,
         } => {
             warn!(
-                "reconcile suspicious: cw={} expected={:.0}±{:.0} dev={:.0} ({}σ) for {}-{}",
-                cw_count, expected, stddev, deviation, sigma_used, start_ms, end_ms
+                "reconcile suspicious: cw={} expected={:.0}±{:.0} dev={:.0} ({}σ) conf={:?} for {}-{}",
+                cw_count, expected, stddev, deviation, sigma_used, confidence, start_ms, end_ms
             );
             FeasibilityAction::CheckIntegrity
         }
+    }
+}
+
+async fn check_with_es_blend(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    cw_count: u64,
+    range_ms: i64,
+    confidence: Confidence,
+) -> FeasibilityAction {
+    let es_count = match ctx.es_counter.count_range(start_ms, end_ms).await {
+        Ok(c) => c,
+        Err(_) => {
+            return live_learn_check(ctx, start_ms, end_ms, cw_count).await;
+        }
+    };
+
+    ctx.seasonal_stats.record_from_es(start_ms, es_count);
+
+    let range_hours = (range_ms as f64) / 3_600_000.0;
+    let mid_timestamp = start_ms + range_ms / 2;
+
+    let (expected, stddev) = match ctx.seasonal_stats.blend_with_es(mid_timestamp, es_count) {
+        Some((m, s)) => (m * range_hours, s * range_hours.sqrt()),
+        None => {
+            let es_f = es_count as f64;
+            (es_f, (es_f.sqrt()).max(10.0))
+        }
+    };
+
+    let stress_level = ctx.cw_stress.stress_level();
+    let sigma_multiplier = match stress_level {
+        crate::stress::StressLevel::Normal => 4.0,
+        crate::stress::StressLevel::Elevated => 2.5,
+        crate::stress::StressLevel::Critical => 1.5,
+    };
+
+    let cw_f = cw_count as f64;
+    let deviation = (cw_f - expected).abs();
+    let threshold = (stddev * sigma_multiplier).max(expected * 0.1).max(10.0);
+
+    if deviation <= threshold {
+        info!(
+            "reconcile es_blend feasible: cw={} es={} expected={:.0}±{:.0} conf={:?} for {}-{}",
+            cw_count, es_count, expected, stddev, confidence, start_ms, end_ms
+        );
+        ctx.seasonal_stats.record_verified(start_ms, cw_count);
+        FeasibilityAction::FullReplace
+    } else {
+        let max_count = es_count.max(cw_count);
+        let diff_pct = if max_count > 0 {
+            es_count.abs_diff(cw_count) * 100 / max_count
+        } else {
+            0
+        };
+
+        if diff_pct <= LIVE_LEARN_THRESHOLD_PCT {
+            info!(
+                "reconcile es_blend close: cw={} es={} diff={}% conf={:?}, learning for {}-{}",
+                cw_count, es_count, diff_pct, confidence, start_ms, end_ms
+            );
+            ctx.seasonal_stats.record_verified(start_ms, es_count);
+            FeasibilityAction::LiveLearn
+        } else if es_count > cw_count && ctx.cw_stress.is_stressed() {
+            info!(
+                "reconcile es_blend: es={} > cw={} under stress, conf={:?}, learning for {}-{}",
+                es_count, cw_count, confidence, start_ms, end_ms
+            );
+            ctx.seasonal_stats.record_verified(start_ms, es_count);
+            FeasibilityAction::LiveLearn
+        } else {
+            warn!(
+                "reconcile es_blend suspicious: cw={} es={} expected={:.0} dev={:.0} conf={:?} for {}-{}",
+                cw_count, es_count, expected, deviation, confidence, start_ms, end_ms
+            );
+            FeasibilityAction::CheckIntegrity
+        }
+    }
+}
+
+async fn live_learn_check(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    cw_count: u64,
+) -> FeasibilityAction {
+    let es_count = match ctx.es_counter.count_range(start_ms, end_ms).await {
+        Ok(c) => c,
+        Err(_) => return FeasibilityAction::CheckIntegrity,
+    };
+
+    let max_count = es_count.max(cw_count);
+    let diff = es_count.abs_diff(cw_count);
+
+    if max_count == 0 {
+        ctx.seasonal_stats.record_verified(start_ms, 0);
+        return FeasibilityAction::LiveLearn;
+    }
+
+    let diff_pct = diff * 100 / max_count;
+
+    if diff_pct <= LIVE_LEARN_THRESHOLD_PCT {
+        info!(
+            "reconcile live_learn: es={} cw={} diff={}% (≤{}%), trusting ES for {}-{}",
+            es_count, cw_count, diff_pct, LIVE_LEARN_THRESHOLD_PCT, start_ms, end_ms
+        );
+        ctx.seasonal_stats.record_verified(start_ms, es_count);
+        FeasibilityAction::LiveLearn
+    } else if es_count > cw_count && ctx.cw_stress.is_stressed() {
+        info!(
+            "reconcile live_learn: es={} > cw={} under stress, trusting ES for {}-{}",
+            es_count, cw_count, start_ms, end_ms
+        );
+        ctx.seasonal_stats.record_verified(start_ms, es_count);
+        FeasibilityAction::LiveLearn
+    } else {
+        info!(
+            "reconcile live_learn: es={} vs cw={} diff={}% (>{}%), replacing for {}-{}",
+            es_count, cw_count, diff_pct, LIVE_LEARN_THRESHOLD_PCT, start_ms, end_ms
+        );
+        if cw_count > 0 || !ctx.cw_stress.is_stressed() {
+            ctx.seasonal_stats.record_verified(start_ms, cw_count);
+        }
+        FeasibilityAction::FullReplace
     }
 }
 
@@ -404,6 +538,39 @@ async fn upsert_events(ctx: &ReconcileContext, events: Vec<LogEvent>) {
             }
         }
     }
+}
+
+async fn execute_live_learn_upsert(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    events: Vec<LogEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+
+    let timestamps: Vec<i64> = events.iter().map(|e| e.timestamp_ms).collect();
+    let integrity = validate_event_integrity(&timestamps, start_ms, end_ms);
+
+    if !integrity.is_usable() {
+        info!(
+            "reconcile live_learn: skipping {} events with poor integrity for {}-{}",
+            events.len(),
+            start_ms,
+            end_ms
+        );
+        return;
+    }
+
+    info!(
+        "reconcile live_learn: upserting {} events (no delete) for {}-{}",
+        events.len(),
+        start_ms,
+        end_ms
+    );
+
+    upsert_events(ctx, events).await;
 }
 
 async fn process_day(
