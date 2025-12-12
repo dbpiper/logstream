@@ -15,6 +15,7 @@ use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
 use crate::es_conflicts::EsConflictResolver;
 use crate::es_counts::EsCounter;
+use crate::es_recovery::ClusterStressTracker;
 use crate::event_router::{EventSender, EventSenderFactory};
 use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources, WorkerPool};
 use crate::reconcile;
@@ -316,12 +317,14 @@ const HEAL_CONCURRENCY: usize = 4;
 ///
 /// Like run_backfill_days, this uses a BatchWorkQueue to only spawn
 /// max_ready processes at a time, avoiding memory exhaustion.
+/// Pauses workers when cluster is under stress.
 pub async fn run_heal_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     heal_days: u32,
     buffer_caps: BufferCapacities,
+    stress_tracker: Option<Arc<ClusterStressTracker>>,
 ) {
     if heal_days == 0 {
         return;
@@ -362,27 +365,43 @@ pub async fn run_heal_days(
     let aws_cfg_arc = Arc::new(aws_cfg.clone());
     let sender_factory_arc = Arc::new(sender_factory.clone());
 
-    // Spawn workers with demand-driven factory
-    let worker_handles = worker_pool.spawn_workers(work_queue.clone(), {
-        let cfg = cfg_arc.clone();
-        let aws_cfg = aws_cfg_arc.clone();
-        let sender_factory = sender_factory_arc.clone();
-        move |_pid, info| {
-            let cfg = cfg.clone();
-            let aws_cfg = aws_cfg.clone();
-            let sender_factory = sender_factory.clone();
-            async move {
-                execute_heal_day(
-                    &cfg,
-                    &aws_cfg,
-                    &sender_factory,
-                    buffer_caps,
-                    info.day_offset,
-                )
-                .await
-            }
+    // Create priority-aware pause check function based on cluster stress
+    // Heal work is IDLE priority so it pauses most aggressively
+    let pause_check = {
+        let tracker = stress_tracker.clone();
+        move |priority: u8| -> Option<Duration> {
+            let Some(tracker) = &tracker else {
+                return None;
+            };
+            tracker.should_pause_for_priority(priority)
         }
-    });
+    };
+
+    // Spawn workers with demand-driven factory and stress-aware pausing
+    let worker_handles = worker_pool.spawn_workers_with_pause(
+        work_queue.clone(),
+        {
+            let cfg = cfg_arc.clone();
+            let aws_cfg = aws_cfg_arc.clone();
+            let sender_factory = sender_factory_arc.clone();
+            move |_pid, info| {
+                let cfg = cfg.clone();
+                let aws_cfg = aws_cfg.clone();
+                let sender_factory = sender_factory.clone();
+                async move {
+                    execute_heal_day(
+                        &cfg,
+                        &aws_cfg,
+                        &sender_factory,
+                        buffer_caps,
+                        info.day_offset,
+                    )
+                    .await
+                }
+            }
+        },
+        pause_check,
+    );
 
     // Wait for all workers
     for handle in worker_handles {

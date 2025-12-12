@@ -12,6 +12,7 @@ use crate::buffer::BufferCapacities;
 use crate::config::Config;
 use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
+use crate::es_recovery::ClusterStressTracker;
 use crate::event_router::EventSenderFactory;
 use crate::process::{GroupScheduler, Priority, Resources, WorkerPool};
 use crate::state::CheckpointState;
@@ -93,11 +94,13 @@ impl BackfillStats {
 /// - Only keeps max_ready processes in the ready queue (like RLIMIT_NPROC)
 /// - Spawns new processes as workers complete work (like fork after wait)
 /// - Prioritizes recent days over older days (like nice values)
+/// - Pauses workers when cluster is under stress
 pub async fn run_backfill_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     buffer_caps: BufferCapacities,
+    stress_tracker: Option<Arc<ClusterStressTracker>>,
 ) -> Result<BackfillStats> {
     if cfg.backfill_days == 0 {
         return Ok(BackfillStats::default());
@@ -145,29 +148,45 @@ pub async fn run_backfill_days(
     let aws_cfg_arc = Arc::new(aws_cfg.clone());
     let sender_factory_arc = Arc::new(sender_factory.clone());
 
-    // Spawn workers with demand-driven task factory
-    // Workers complete() on the queue, which spawns the next pending work
-    let worker_handles = worker_pool.spawn_workers(work_queue.clone(), {
-        let cfg = cfg_arc.clone();
-        let aws_cfg = aws_cfg_arc.clone();
-        let sender_factory = sender_factory_arc.clone();
-        move |_pid, info| {
-            let cfg = cfg.clone();
-            let aws_cfg = aws_cfg.clone();
-            let sender_factory = sender_factory.clone();
-            async move {
-                execute_backfill_day(
-                    &cfg,
-                    &aws_cfg,
-                    &sender_factory,
-                    buffer_caps,
-                    info.day_offset,
-                    info.priority,
-                )
-                .await
-            }
+    // Create priority-aware pause check function based on cluster stress
+    // Lower priority work (old backfill days) pauses more aggressively
+    let pause_check = {
+        let tracker = stress_tracker.clone();
+        move |priority: u8| -> Option<Duration> {
+            let Some(tracker) = &tracker else {
+                return None;
+            };
+            tracker.should_pause_for_priority(priority)
         }
-    });
+    };
+
+    // Spawn workers with demand-driven task factory and stress-aware pausing
+    // Workers complete() on the queue, which spawns the next pending work
+    let worker_handles = worker_pool.spawn_workers_with_pause(
+        work_queue.clone(),
+        {
+            let cfg = cfg_arc.clone();
+            let aws_cfg = aws_cfg_arc.clone();
+            let sender_factory = sender_factory_arc.clone();
+            move |_pid, info| {
+                let cfg = cfg.clone();
+                let aws_cfg = aws_cfg.clone();
+                let sender_factory = sender_factory.clone();
+                async move {
+                    execute_backfill_day(
+                        &cfg,
+                        &aws_cfg,
+                        &sender_factory,
+                        buffer_caps,
+                        info.day_offset,
+                        info.priority,
+                    )
+                    .await
+                }
+            }
+        },
+        pause_check,
+    );
 
     // Wait for all workers to complete and collect stats
     let mut stats = BackfillStats::default();

@@ -752,6 +752,10 @@ impl WorkerPool {
     /// - RLIMIT_NPROC limits concurrent processes
     /// - New processes are only created when slots are available
     /// - fork() fails with EAGAIN when at limit
+    ///
+    /// The optional `pause_check` function is called before each task.
+    /// If it returns true, the worker pauses for the returned duration.
+    /// This enables cluster-stress-aware backoff.
     pub fn spawn_workers<F, Fut>(
         &self,
         work_queue: Arc<BatchWorkQueue>,
@@ -761,6 +765,31 @@ impl WorkerPool {
         F: Fn(u64, ProcessInfo) -> Fut + Send + Sync + Clone + 'static,
         Fut: std::future::Future<Output = usize> + Send + 'static,
     {
+        self.spawn_workers_with_pause(work_queue, task_factory, |_priority| None)
+    }
+
+    /// Spawn workers with a priority-aware pause check function.
+    ///
+    /// The pause_check function is called with the process priority before each task.
+    /// If it returns Some(duration), the worker pauses for that duration.
+    /// This enables cluster-stress-aware throttling based on task priority.
+    ///
+    /// Lower priority tasks pause more aggressively:
+    /// - CRITICAL: Never pauses
+    /// - HIGH: Only pauses under critical stress
+    /// - NORMAL: Pauses under elevated stress
+    /// - LOW/IDLE: Pauses under any stress
+    pub fn spawn_workers_with_pause<F, Fut, P>(
+        &self,
+        work_queue: Arc<BatchWorkQueue>,
+        task_factory: F,
+        pause_check: P,
+    ) -> Vec<tokio::task::JoinHandle<WorkerStats>>
+    where
+        F: Fn(u64, ProcessInfo) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = usize> + Send + 'static,
+        P: Fn(u8) -> Option<Duration> + Send + Sync + Clone + 'static,
+    {
         let mut handles = Vec::with_capacity(self.num_workers);
 
         for worker_id in 0..self.num_workers {
@@ -768,6 +797,7 @@ impl WorkerPool {
             let shutdown = self.shutdown.clone();
             let factory = task_factory.clone();
             let queue = work_queue.clone();
+            let pause_fn = pause_check.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut stats = WorkerStats {
@@ -806,6 +836,23 @@ impl WorkerPool {
                         Some(info) => info,
                         None => continue,
                     };
+
+                    // Priority-aware pause check
+                    // Lower priority work pauses more aggressively under cluster stress
+                    let priority_value = info.priority.value();
+                    if let Some(pause_duration) = pause_fn(priority_value) {
+                        tracing::info!(
+                            "worker-{}: pausing {:?} for priority {} (pid={})",
+                            worker_id,
+                            pause_duration,
+                            priority_value,
+                            pid
+                        );
+                        // Put process back in ready queue before pausing
+                        sched.unblock(pid).await;
+                        tokio::time::sleep(pause_duration).await;
+                        continue; // Re-schedule after pause
+                    }
 
                     // Execute the task
                     let started = Instant::now();

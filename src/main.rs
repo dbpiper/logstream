@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
 
     let es_cfg = EsConfig::from_env();
     let sink = create_bulk_sink(&cfg, &es_cfg, &index_prefix)?;
+    let stress_tracker = sink.stress_tracker();
     let adaptive_controller = adaptive::create_controller();
     info!(
         "adaptive controller: initial batch={} in_flight={}",
@@ -91,9 +92,18 @@ async fn main() -> Result<()> {
         let group_cfg = cfg.with_log_group(group.clone(), group_checkpoint.clone());
         let aws_cfg = aws_cfg.clone();
         let sender_factory = sender_factory.clone();
+        let stress_tracker = stress_tracker.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(err) = run_group(group_cfg, aws_cfg, sender_factory, buffer_caps).await {
+            if let Err(err) = run_group(
+                group_cfg,
+                aws_cfg,
+                sender_factory,
+                buffer_caps,
+                stress_tracker,
+            )
+            .await
+            {
                 tracing::error!("group {} failed: {err:?}", group);
             }
         });
@@ -272,6 +282,7 @@ async fn run_group(
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     buffer_caps: BufferCapacities,
+    stress_tracker: std::sync::Arc<crate::es_recovery::ClusterStressTracker>,
 ) -> Result<()> {
     let resources = create_group_resources(&buffer_caps);
     let group_scheduler =
@@ -410,6 +421,7 @@ async fn run_group(
         let cfg_for_heal = cfg.clone();
         let aws_cfg_for_heal = aws_cfg.clone();
         let sender_factory_for_heal = sender_factory.clone();
+        let stress_tracker_for_heal = stress_tracker.clone();
         Some(tokio::spawn(async move {
             run_heal_days(
                 cfg_for_heal,
@@ -417,6 +429,7 @@ async fn run_group(
                 sender_factory_for_heal,
                 env_cfg.heal_days,
                 buffer_caps,
+                Some(stress_tracker_for_heal),
             )
             .await
         }))
@@ -436,6 +449,7 @@ async fn run_group(
                 aws_cfg_for_backfill,
                 sender_factory.clone(),
                 buffer_caps,
+                Some(stress_tracker),
             )
             .await
             {

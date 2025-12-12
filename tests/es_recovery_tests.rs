@@ -965,3 +965,343 @@ fn test_thresholds_are_reasonable() {
     assert!(heap_pct > 50.0 && heap_pct < 100.0);
     assert!(pending > 10);
 }
+
+// ============================================================================
+// ClusterStressTracker Tests
+// ============================================================================
+
+#[test]
+fn test_stress_tracker_new_trips_detected() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // First trip count should always be "new"
+    assert!(!tracker.record_trips(0)); // No trips yet
+    assert!(tracker.record_trips(1)); // New trip!
+    assert!(!tracker.record_trips(1)); // Same count, not new
+    assert!(tracker.record_trips(5)); // More trips!
+    assert!(!tracker.record_trips(5)); // Same count
+}
+
+#[test]
+fn test_stress_tracker_exponential_backoff() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // Initial backoff is MIN_BACKOFF_SECS (3s)
+    let initial = tracker.backoff_duration();
+    assert_eq!(initial.as_secs(), 3);
+
+    // Record stress - backoff doubles
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 6);
+
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 12);
+
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 24);
+
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 48);
+
+    // Should cap at MAX_BACKOFF_SECS (60s)
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 60);
+
+    tracker.record_stress();
+    assert_eq!(tracker.backoff_duration().as_secs(), 60); // Still capped
+}
+
+#[test]
+fn test_stress_tracker_success_decays_backoff() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // Build up backoff
+    for _ in 0..4 {
+        tracker.record_stress();
+    }
+    assert_eq!(tracker.backoff_duration().as_secs(), 48);
+
+    // Success halves backoff
+    tracker.record_success();
+    assert_eq!(tracker.backoff_duration().as_secs(), 24);
+
+    tracker.record_success();
+    assert_eq!(tracker.backoff_duration().as_secs(), 12);
+
+    tracker.record_success();
+    assert_eq!(tracker.backoff_duration().as_secs(), 6);
+
+    tracker.record_success();
+    assert_eq!(tracker.backoff_duration().as_secs(), 3); // Capped at min
+}
+
+#[test]
+fn test_stress_tracker_stress_levels() {
+    use logstream::es_recovery::{ClusterStressTracker, StressLevel};
+
+    let tracker = ClusterStressTracker::new();
+
+    // Initially normal - no pausing
+    assert_eq!(tracker.stress_level(), StressLevel::Normal);
+    assert!(tracker.should_pause_for_priority(0).is_none()); // Even IDLE doesn't pause
+
+    // 1-2 stresses: still normal, but IDLE priority pauses
+    tracker.record_stress();
+    tracker.record_stress();
+    assert_eq!(tracker.stress_level(), StressLevel::Normal);
+    assert!(tracker.should_pause_for_priority(0).is_some()); // IDLE pauses
+
+    // 3+ stresses: elevated - NORMAL priority pauses
+    tracker.record_stress();
+    assert_eq!(tracker.stress_level(), StressLevel::Elevated);
+    assert!(tracker.should_pause_for_priority(128).is_some()); // NORMAL pauses
+
+    // 10+ stresses: critical - HIGH priority pauses
+    for _ in 0..7 {
+        tracker.record_stress();
+    }
+    assert_eq!(tracker.stress_level(), StressLevel::Critical);
+    assert!(tracker.should_pause_for_priority(192).is_some()); // HIGH pauses
+    assert!(tracker.should_pause_for_priority(255).is_none()); // CRITICAL never pauses
+}
+
+#[test]
+fn test_stress_tracker_recovery_resumes_work() {
+    use logstream::es_recovery::{ClusterStressTracker, StressLevel};
+
+    let tracker = ClusterStressTracker::new();
+
+    // Build up to critical (need 10+ stresses)
+    for _ in 0..12 {
+        tracker.record_stress();
+    }
+    assert_eq!(tracker.stress_level(), StressLevel::Critical);
+    assert!(tracker.should_pause_for_priority(192).is_some()); // HIGH pauses
+    assert_eq!(tracker.stress_streak(), 12);
+
+    // Need enough successes to bring streak below 3 for non-Elevated
+    // Each success decrements streak by 1 and updates stress level
+    for _ in 0..10 {
+        tracker.record_success();
+    }
+
+    // Streak should now be 2
+    assert_eq!(tracker.stress_streak(), 2);
+    assert_eq!(tracker.stress_level(), StressLevel::Normal);
+
+    // All work should resume at Normal stress
+    assert!(tracker.should_pause_for_priority(192).is_none()); // HIGH resumes
+    assert!(tracker.should_pause_for_priority(128).is_none()); // NORMAL resumes
+                                                               // Only IDLE/LOW still pauses due to streak >= 1
+    assert!(tracker.should_pause_for_priority(64).is_some()); // LOW still pauses
+}
+
+#[test]
+fn test_stress_tracker_stress_streak() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    assert_eq!(tracker.stress_streak(), 0);
+
+    tracker.record_stress();
+    assert_eq!(tracker.stress_streak(), 1);
+
+    tracker.record_stress();
+    assert_eq!(tracker.stress_streak(), 2);
+
+    // Success decrements streak
+    tracker.record_success();
+    assert_eq!(tracker.stress_streak(), 1);
+
+    tracker.record_success();
+    assert_eq!(tracker.stress_streak(), 0);
+
+    // Can't go below 0
+    tracker.record_success();
+    assert_eq!(tracker.stress_streak(), 0);
+}
+
+// ============================================================================
+// Priority-Aware Pause Tests
+// ============================================================================
+
+#[test]
+fn test_priority_pause_critical_never_pauses() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // Build up to critical stress
+    for _ in 0..15 {
+        tracker.record_stress();
+    }
+
+    // CRITICAL priority (255) should NEVER pause, even under critical stress
+    assert!(tracker.should_pause_for_priority(255).is_none());
+    assert!(tracker.should_pause_for_priority(250).is_none());
+}
+
+#[test]
+fn test_priority_pause_high_only_critical_stress() {
+    use logstream::es_recovery::{ClusterStressTracker, StressLevel};
+
+    let tracker = ClusterStressTracker::new();
+
+    // No stress - HIGH shouldn't pause
+    assert!(tracker.should_pause_for_priority(192).is_none());
+
+    // Elevated stress (3+ streak) - HIGH shouldn't pause
+    for _ in 0..5 {
+        tracker.record_stress();
+    }
+    assert_eq!(tracker.stress_level(), StressLevel::Elevated);
+    assert!(tracker.should_pause_for_priority(192).is_none());
+    assert!(tracker.should_pause_for_priority(180).is_none());
+
+    // Critical stress (10+ streak) - HIGH should pause
+    for _ in 0..6 {
+        tracker.record_stress();
+    }
+    assert_eq!(tracker.stress_level(), StressLevel::Critical);
+    assert!(tracker.should_pause_for_priority(192).is_some());
+    assert!(tracker.should_pause_for_priority(180).is_some());
+}
+
+#[test]
+fn test_priority_pause_normal_elevated_stress() {
+    use logstream::es_recovery::{ClusterStressTracker, StressLevel};
+
+    let tracker = ClusterStressTracker::new();
+
+    // No stress - NORMAL shouldn't pause
+    assert!(tracker.should_pause_for_priority(128).is_none());
+
+    // Minimal stress (1-2 streak) - NORMAL shouldn't pause
+    tracker.record_stress();
+    tracker.record_stress();
+    assert!(tracker.should_pause_for_priority(128).is_none());
+
+    // Elevated stress (3+ streak) - NORMAL should pause
+    tracker.record_stress();
+    assert_eq!(tracker.stress_level(), StressLevel::Elevated);
+    assert!(tracker.should_pause_for_priority(128).is_some());
+    assert!(tracker.should_pause_for_priority(100).is_some());
+}
+
+#[test]
+fn test_priority_pause_low_any_stress() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // No stress - LOW shouldn't pause
+    assert!(tracker.should_pause_for_priority(64).is_none());
+
+    // Any stress (1+ streak) - LOW should pause
+    tracker.record_stress();
+    assert!(tracker.should_pause_for_priority(64).is_some());
+    assert!(tracker.should_pause_for_priority(50).is_some());
+}
+
+#[test]
+fn test_priority_pause_idle_most_aggressive() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // No stress - IDLE shouldn't pause
+    assert!(tracker.should_pause_for_priority(0).is_none());
+
+    // Any stress - IDLE should pause with 2x backoff
+    tracker.record_stress();
+
+    let idle_pause = tracker.should_pause_for_priority(0);
+    let low_pause = tracker.should_pause_for_priority(64);
+
+    assert!(idle_pause.is_some());
+    assert!(low_pause.is_some());
+
+    // IDLE gets 2x the backoff duration
+    assert_eq!(idle_pause.unwrap(), low_pause.unwrap() * 2);
+}
+
+#[test]
+fn test_priority_pause_ordering() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // Create elevated stress
+    for _ in 0..5 {
+        tracker.record_stress();
+    }
+
+    // Check ordering: lower priority pauses first
+    // CRITICAL (255) - no pause
+    assert!(tracker.should_pause_for_priority(255).is_none());
+
+    // HIGH (192) - no pause (only critical stress)
+    assert!(tracker.should_pause_for_priority(192).is_none());
+
+    // NORMAL (128) - pauses (elevated stress)
+    assert!(tracker.should_pause_for_priority(128).is_some());
+
+    // LOW (64) - pauses
+    assert!(tracker.should_pause_for_priority(64).is_some());
+
+    // IDLE (0) - pauses with longer duration
+    assert!(tracker.should_pause_for_priority(0).is_some());
+}
+
+#[test]
+fn test_priority_pause_real_world_scenario() {
+    use logstream::es_recovery::ClusterStressTracker;
+
+    let tracker = ClusterStressTracker::new();
+
+    // Simulate real-world: cluster gets stressed
+    // 1. Circuit breaker trips
+    assert!(tracker.record_trips(1));
+    tracker.record_stress();
+
+    // Real-time tail (CRITICAL=255) should keep flowing
+    assert!(tracker.should_pause_for_priority(255).is_none());
+
+    // Recent backfill (day 0, CRITICAL=255) should keep flowing
+    assert!(tracker.should_pause_for_priority(255).is_none());
+
+    // OLD backfill (day 100+, IDLE=0) should pause immediately
+    assert!(tracker.should_pause_for_priority(0).is_some());
+
+    // 2. Stress continues, builds up
+    for _ in 0..4 {
+        tracker.record_stress();
+    }
+
+    // Real-time still flows
+    assert!(tracker.should_pause_for_priority(255).is_none());
+
+    // Week-old backfill (day 7, HIGH=192) still flows under elevated
+    assert!(tracker.should_pause_for_priority(192).is_none());
+
+    // Month-old backfill (day 30+, NORMAL=128) now pauses
+    assert!(tracker.should_pause_for_priority(128).is_some());
+
+    // 3. Critical stress - almost everything pauses
+    for _ in 0..6 {
+        tracker.record_stress();
+    }
+
+    // Only CRITICAL priority (real-time) keeps flowing
+    assert!(tracker.should_pause_for_priority(255).is_none());
+
+    // Even HIGH priority pauses now
+    assert!(tracker.should_pause_for_priority(192).is_some());
+}

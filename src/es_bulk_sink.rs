@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adaptive::AdaptiveController;
-use crate::es_recovery;
+use crate::es_recovery::{self, ClusterStressTracker};
 use crate::types::EnrichedEvent;
 
 #[derive(Clone, Debug)]
@@ -27,6 +27,7 @@ pub struct EsBulkConfig {
 pub struct EsBulkSink {
     cfg: EsBulkConfig,
     client: Client,
+    stress_tracker: Arc<ClusterStressTracker>,
 }
 
 impl EsBulkSink {
@@ -36,7 +37,16 @@ impl EsBulkSink {
             .pool_max_idle_per_host(64)
             .gzip(cfg.gzip)
             .build()?;
-        Ok(Self { cfg, client })
+        Ok(Self {
+            cfg,
+            client,
+            stress_tracker: Arc::new(ClusterStressTracker::new()),
+        })
+    }
+
+    /// Get the stress tracker for external monitoring.
+    pub fn stress_tracker(&self) -> Arc<ClusterStressTracker> {
+        self.stress_tracker.clone()
     }
 
     /// Start with event router and adaptive rate control.
@@ -47,6 +57,8 @@ impl EsBulkSink {
     ) {
         let cfg = self.cfg.clone();
         let client = self.client.clone();
+        let stress_tracker = self.stress_tracker.clone();
+
         tokio::spawn(async move {
             let mut buf: Vec<EnrichedEvent> = Vec::with_capacity(cfg.max_batch_size);
 
@@ -61,6 +73,16 @@ impl EsBulkSink {
                     sleep(delay).await;
                 }
 
+                // Additional backoff if cluster is stressed
+                let stress_level = stress_tracker.stress_level();
+                if stress_level == es_recovery::StressLevel::Critical {
+                    // Critical stress - long pause to let ES recover
+                    sleep(Duration::from_secs(10)).await;
+                } else if stress_level == es_recovery::StressLevel::Elevated {
+                    // Elevated stress - shorter pause
+                    sleep(Duration::from_secs(2)).await;
+                }
+
                 // Receive events up to batch size
                 let Some(ev) = event_router.recv().await else {
                     break;
@@ -68,7 +90,16 @@ impl EsBulkSink {
                 buf.push(ev);
 
                 // Drain more if available (up to batch size)
-                while buf.len() < target_batch {
+                // But drain less if cluster is stressed
+                let effective_batch = if stress_level == es_recovery::StressLevel::Critical {
+                    target_batch / 4 // 25% batch size when critical
+                } else if stress_level == es_recovery::StressLevel::Elevated {
+                    target_batch / 2 // 50% batch size when elevated
+                } else {
+                    target_batch
+                };
+
+                while buf.len() < effective_batch {
                     match tokio::time::timeout(Duration::from_millis(10), event_router.recv()).await
                     {
                         Ok(Some(ev)) => buf.push(ev),
@@ -76,13 +107,19 @@ impl EsBulkSink {
                     }
                 }
 
-                if buf.len() >= target_batch || buf.len() >= cfg.min_batch_for_send() {
+                if buf.len() >= effective_batch || buf.len() >= cfg.min_batch_for_send() {
                     let batch = std::mem::take(&mut buf);
                     let started = std::time::Instant::now();
 
-                    let res =
-                        send_bulk_adaptive(&client, &cfg, &batch, adaptive.clone(), max_in_flight)
-                            .await;
+                    let res = send_bulk_adaptive_tracked(
+                        &client,
+                        &cfg,
+                        &batch,
+                        adaptive.clone(),
+                        max_in_flight,
+                        &stress_tracker,
+                    )
+                    .await;
 
                     let elapsed = started.elapsed();
                     let latency_ms = elapsed.as_millis() as u64;
@@ -91,11 +128,12 @@ impl EsBulkSink {
                         Ok(_) => {
                             adaptive.record_latency(latency_ms, true).await;
                             info!(
-                                "adaptive bulk: batch={} latency={}ms (target_batch={} in_flight={})",
+                                "adaptive bulk: batch={} latency={}ms (target_batch={} in_flight={} stress={:?})",
                                 batch.len(),
                                 latency_ms,
                                 target_batch,
-                                max_in_flight
+                                max_in_flight,
+                                stress_level
                             );
                         }
                         Err(err) => {
@@ -108,7 +146,7 @@ impl EsBulkSink {
 
             // Flush remaining
             if !buf.is_empty() {
-                let _ = send_bulk(
+                let _ = send_bulk_tracked(
                     &client,
                     &cfg.url,
                     &cfg.user,
@@ -128,16 +166,24 @@ impl EsBulkConfig {
     }
 }
 
-/// Send bulk with adaptive concurrency control.
-async fn send_bulk_adaptive(
+/// Send bulk with adaptive concurrency control and stress tracking.
+async fn send_bulk_adaptive_tracked(
     client: &Client,
     cfg: &EsBulkConfig,
     batch: &[EnrichedEvent],
     adaptive: Arc<AdaptiveController>,
     max_in_flight: usize,
+    stress_tracker: &ClusterStressTracker,
 ) -> Result<()> {
-    let sem = Arc::new(Semaphore::new(max_in_flight));
-    let chunk_size = (batch.len() / max_in_flight).max(100);
+    // Reduce concurrency if cluster is stressed
+    let effective_in_flight = match stress_tracker.stress_level() {
+        es_recovery::StressLevel::Critical => 1, // Single request when critical
+        es_recovery::StressLevel::Elevated => (max_in_flight / 2).max(1),
+        es_recovery::StressLevel::Normal => max_in_flight,
+    };
+
+    let sem = Arc::new(Semaphore::new(effective_in_flight));
+    let chunk_size = (batch.len() / effective_in_flight).max(100);
 
     let mut handles: FuturesUnordered<tokio::task::JoinHandle<Result<()>>> =
         FuturesUnordered::new();
@@ -155,7 +201,7 @@ async fn send_bulk_adaptive(
         handles.push(tokio::spawn(async move {
             let _p = permit;
             let started = std::time::Instant::now();
-            let res = send_bulk(&c, &url, &user, &pass, &index_prefix, &chunk_vec).await;
+            let res = send_bulk_tracked(&c, &url, &user, &pass, &index_prefix, &chunk_vec).await;
             let latency = started.elapsed().as_millis() as u64;
 
             // Record chunk latency for fine-grained adaptation
@@ -181,7 +227,8 @@ async fn send_bulk_adaptive(
     }
 }
 
-async fn send_bulk(
+/// Send bulk with tracked recovery (uses new circuit breaker detection).
+async fn send_bulk_tracked(
     client: &Client,
     base_url: &str,
     user: &str,
@@ -207,11 +254,8 @@ async fn send_bulk(
     }
 
     let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
-    let mut attempt = 0u64;
-    let mut recovery_attempts = 0u64;
 
-    loop {
-        attempt += 1;
+    for attempt in 1..=20u64 {
         let send_result = client
             .post(&url)
             .basic_auth(user, Some(pass))
@@ -225,28 +269,7 @@ async fn send_bulk(
                 let resp_body = resp.text().await.unwrap_or_default();
 
                 if resp_body.contains("\"errors\":true") {
-                    // Some items failed - check cluster health and fix any issues
-                    if recovery_attempts < 3 {
-                        let recovered = es_recovery::check_and_recover(
-                            client,
-                            base_url,
-                            user,
-                            pass,
-                            index_prefix,
-                        )
-                        .await;
-
-                        if recovered {
-                            recovery_attempts += 1;
-                            info!(
-                                "es bulk: cluster issue fixed, retrying (attempt {})",
-                                recovery_attempts
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Log remaining errors but continue (may be version conflicts, etc)
+                    // Log errors but don't retry - version conflicts are normal
                     warn!(
                         "es bulk has item errors, sample: {}",
                         &resp_body[..resp_body.len().min(500)]
@@ -260,23 +283,6 @@ async fn send_bulk(
             Ok(resp) => {
                 let status = resp.status();
                 let resp_body = resp.text().await.unwrap_or_default();
-
-                // Non-2xx response - check cluster health and fix any issues
-                if recovery_attempts < 3 {
-                    let recovered =
-                        es_recovery::check_and_recover(client, base_url, user, pass, index_prefix)
-                            .await;
-
-                    if recovered {
-                        recovery_attempts += 1;
-                        info!(
-                            "es bulk status={}: cluster issue fixed, retrying (attempt {})",
-                            status, recovery_attempts
-                        );
-                        continue;
-                    }
-                }
-
                 warn!(
                     "es bulk status={} attempt={} body_sample={}",
                     status,
@@ -294,9 +300,12 @@ async fn send_bulk(
             anyhow::bail!("es bulk failed after 20 retries");
         }
 
+        // Exponential backoff
         let backoff = Duration::from_millis(500 * attempt.min(10));
         sleep(backoff).await;
     }
+
+    Ok(())
 }
 
 pub fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
