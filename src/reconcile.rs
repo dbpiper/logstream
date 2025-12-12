@@ -8,8 +8,13 @@ use tracing::{info, warn};
 use std::sync::Arc;
 
 use crate::{
-    cw_counts::CwCounter, cw_tail::CloudWatchTailer, enrich::enrich_event, es_counts::EsCounter,
-    event_router::EventSender, seasonal_stats::SeasonalStats, stress::StressTracker,
+    cw_counts::CwCounter,
+    cw_tail::CloudWatchTailer,
+    enrich::enrich_event,
+    es_counts::EsCounter,
+    event_router::EventSender,
+    seasonal_stats::{validate_event_integrity, DataIntegrity, SeasonalStats},
+    stress::StressTracker,
     types::LogEvent,
 };
 
@@ -255,15 +260,75 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     }
 
     let cw_count = events.len() as u64;
+    let feasibility = check_feasibility(ctx, start_ms, end_ms, cw_count);
 
-    if !is_cw_response_feasible(ctx, start_ms, end_ms, cw_count) {
-        info!(
-            "reconcile CW response not feasible (cw={}), preserving data for {}-{}",
-            cw_count, start_ms, end_ms
-        );
-        return;
+    match feasibility {
+        FeasibilityAction::FullReplace => {
+            execute_full_replace(ctx, start_ms, end_ms, events, cw_count).await;
+        }
+        FeasibilityAction::CheckIntegrity => {
+            execute_integrity_aware_ingest(ctx, start_ms, end_ms, events).await;
+        }
     }
+}
 
+enum FeasibilityAction {
+    FullReplace,
+    CheckIntegrity,
+}
+
+fn check_feasibility(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    cw_count: u64,
+) -> FeasibilityAction {
+    let range_ms = end_ms - start_ms;
+    let result = ctx
+        .seasonal_stats
+        .is_feasible(start_ms, range_ms, cw_count, &ctx.cw_stress);
+
+    match &result {
+        crate::seasonal_stats::FeasibilityResult::NoHistory => {
+            if cw_count > 0 || !ctx.cw_stress.is_stressed() {
+                ctx.seasonal_stats.record_verified(start_ms, cw_count);
+            }
+            FeasibilityAction::FullReplace
+        }
+        crate::seasonal_stats::FeasibilityResult::Feasible {
+            expected,
+            stddev,
+            sigma_used,
+        } => {
+            info!(
+                "reconcile feasible: cw={} expected={:.0}±{:.0} ({}σ) for {}-{}",
+                cw_count, expected, stddev, sigma_used, start_ms, end_ms
+            );
+            ctx.seasonal_stats.record_verified(start_ms, cw_count);
+            FeasibilityAction::FullReplace
+        }
+        crate::seasonal_stats::FeasibilityResult::Suspicious {
+            expected,
+            stddev,
+            deviation,
+            sigma_used,
+        } => {
+            warn!(
+                "reconcile suspicious: cw={} expected={:.0}±{:.0} dev={:.0} ({}σ) for {}-{}",
+                cw_count, expected, stddev, deviation, sigma_used, start_ms, end_ms
+            );
+            FeasibilityAction::CheckIntegrity
+        }
+    }
+}
+
+async fn execute_full_replace(
+    ctx: &ReconcileContext,
+    start_ms: i64,
+    end_ms: i64,
+    events: Vec<LogEvent>,
+    cw_count: u64,
+) {
     if let Err(err) = ctx.es_counter.delete_range(start_ms, end_ms).await {
         warn!(
             "reconcile ES delete failed: {err:?} for {}-{}",
@@ -281,52 +346,62 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     }
 
     info!(
-        "reconcile complete: {} events for {}-{}",
+        "reconcile complete (full replace): {} events for {}-{}",
         cw_count, start_ms, end_ms
     );
 }
 
-fn is_cw_response_feasible(
+async fn execute_integrity_aware_ingest(
     ctx: &ReconcileContext,
     start_ms: i64,
     end_ms: i64,
-    cw_count: u64,
-) -> bool {
-    let range_ms = end_ms - start_ms;
-    let result = ctx
-        .seasonal_stats
-        .is_feasible(start_ms, range_ms, cw_count, &ctx.cw_stress);
+    events: Vec<LogEvent>,
+) {
+    if events.is_empty() {
+        info!(
+            "reconcile: suspicious empty response, preserving ES data for {}-{}",
+            start_ms, end_ms
+        );
+        return;
+    }
 
-    match &result {
-        crate::seasonal_stats::FeasibilityResult::NoHistory => {
-            if cw_count > 0 || !ctx.cw_stress.is_stressed() {
-                ctx.seasonal_stats.record_verified(start_ms, cw_count);
-            }
-            true
-        }
-        crate::seasonal_stats::FeasibilityResult::Feasible {
-            expected,
-            stddev,
-            sigma_used,
-        } => {
+    let timestamps: Vec<i64> = events.iter().map(|e| e.timestamp_ms).collect();
+    let integrity = validate_event_integrity(&timestamps, start_ms, end_ms);
+
+    match integrity {
+        DataIntegrity::Valid => {
             info!(
-                "reconcile feasible: cw={} expected={:.0}±{:.0} ({}σ) for {}-{}",
-                cw_count, expected, stddev, sigma_used, start_ms, end_ms
+                "reconcile: data integrity valid despite suspicious count, upserting {} events for {}-{}",
+                events.len(), start_ms, end_ms
             );
-            ctx.seasonal_stats.record_verified(start_ms, cw_count);
-            true
+            upsert_events(ctx, events).await;
         }
-        crate::seasonal_stats::FeasibilityResult::Suspicious {
-            expected,
-            stddev,
-            deviation,
-            sigma_used,
-        } => {
-            warn!(
-                "reconcile suspicious: cw={} expected={:.0}±{:.0} dev={:.0} ({}σ) for {}-{}",
-                cw_count, expected, stddev, deviation, sigma_used, start_ms, end_ms
+        DataIntegrity::Partial { coverage } => {
+            info!(
+                "reconcile: partial data integrity (coverage={:.2}), upserting {} events for {}-{}",
+                coverage,
+                events.len(),
+                start_ms,
+                end_ms
             );
-            false
+            upsert_events(ctx, events).await;
+        }
+        DataIntegrity::Invalid => {
+            warn!(
+                "reconcile: data integrity check failed, preserving ES data for {}-{}",
+                start_ms, end_ms
+            );
+        }
+    }
+}
+
+async fn upsert_events(ctx: &ReconcileContext, events: Vec<LogEvent>) {
+    for raw in events {
+        if let Some(enriched) = enrich_event(raw, None) {
+            if ctx.sink_tx.send(enriched).await.is_err() {
+                warn!("reconcile upsert: sink closed");
+                break;
+            }
         }
     }
 }

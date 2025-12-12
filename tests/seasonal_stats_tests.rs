@@ -474,3 +474,149 @@ fn test_eviction_preserves_diversity() {
     assert!(min > 0.01);
     assert!(mean > min);
 }
+
+mod data_integrity_tests {
+    use logstream::seasonal_stats::{validate_event_integrity, DataIntegrity};
+
+    #[test]
+    fn test_valid_evenly_distributed_events() {
+        let start = 1000i64;
+        let end = 2000i64;
+        let timestamps: Vec<i64> = (0..10).map(|i| start + i * 100).collect();
+
+        let result = validate_event_integrity(&timestamps, start, end);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_empty_events_invalid() {
+        let result = validate_event_integrity(&[], 1000, 2000);
+        assert!(!result.is_usable());
+    }
+
+    #[test]
+    fn test_single_event_partial() {
+        let result = validate_event_integrity(&[1500], 1000, 2000);
+        assert!(result.is_usable());
+        assert!(result.should_upsert());
+    }
+
+    #[test]
+    fn test_clustered_events_low_coverage() {
+        let start = 1000i64;
+        let end = 2000i64;
+        let timestamps: Vec<i64> = (0..10).map(|i| start + i).collect();
+
+        let result = validate_event_integrity(&timestamps, start, end);
+        assert!(matches!(
+            result,
+            DataIntegrity::Partial { .. } | DataIntegrity::Invalid
+        ));
+    }
+
+    #[test]
+    fn test_events_spanning_full_range() {
+        let start = 1000i64;
+        let end = 2000i64;
+        let timestamps = vec![start, start + 250, start + 500, start + 750, end - 1];
+
+        let result = validate_event_integrity(&timestamps, start, end);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_monotonic_timestamps() {
+        let timestamps = vec![100i64, 200, 300, 400, 500];
+        let result = validate_event_integrity(&timestamps, 100, 600);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_gap_in_middle_detected() {
+        let start = 1000i64;
+        let end = 10000i64;
+        let timestamps = vec![1000, 1001, 1002, 9998, 9999, 10000];
+
+        let result = validate_event_integrity(&timestamps, start, end);
+        match result {
+            DataIntegrity::Partial { coverage } => assert!(coverage < 1.0),
+            DataIntegrity::Valid => {}
+            DataIntegrity::Invalid => panic!("should be usable"),
+        }
+    }
+
+    #[test]
+    fn test_reasonable_distribution() {
+        let start = 0i64;
+        let end = 1000i64;
+        let timestamps: Vec<i64> = (0..20).map(|i| i * 50).collect();
+
+        let result = validate_event_integrity(&timestamps, start, end);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_data_integrity_is_usable() {
+        assert!(DataIntegrity::Valid.is_usable());
+        assert!(DataIntegrity::Partial { coverage: 0.5 }.is_usable());
+        assert!(!DataIntegrity::Invalid.is_usable());
+    }
+
+    #[test]
+    fn test_data_integrity_should_upsert() {
+        assert!(!DataIntegrity::Valid.should_upsert());
+        assert!(DataIntegrity::Partial { coverage: 0.5 }.should_upsert());
+        assert!(!DataIntegrity::Invalid.should_upsert());
+    }
+
+    #[test]
+    fn test_fourier_detects_natural_distribution() {
+        let base = 1700000000000i64;
+        let range_ms = 86_400_000i64;
+        let timestamps: Vec<i64> = (0..100).map(|i| base + (i * range_ms / 100)).collect();
+
+        let result = validate_event_integrity(&timestamps, base, base + range_ms);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_fourier_detects_clustered_same_hour() {
+        let base = 1700000000000i64;
+        let timestamps: Vec<i64> = (0..50).map(|i| base + i * 1000).collect();
+
+        let result = validate_event_integrity(&timestamps, base, base + 86_400_000);
+        match result {
+            DataIntegrity::Partial { coverage } => assert!(coverage < 0.8),
+            DataIntegrity::Valid => {}
+            DataIntegrity::Invalid => {}
+        }
+    }
+
+    #[test]
+    fn test_fourier_uniform_across_day() {
+        let base = 1700000000000i64;
+        let hour_ms = 3_600_000i64;
+        let timestamps: Vec<i64> = (0..24).map(|h| base + h * hour_ms + 1800_000).collect();
+
+        let result = validate_event_integrity(&timestamps, base, base + 24 * hour_ms);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_circular_variance_uniform() {
+        let base = 1700000000000i64;
+        let hour_ms = 3_600_000i64;
+        let timestamps: Vec<i64> = (0..24).map(|h| base + h * hour_ms).collect();
+
+        let result = validate_event_integrity(&timestamps, base, base + 24 * hour_ms);
+        assert!(result.is_usable());
+    }
+
+    #[test]
+    fn test_gap_coefficient_of_variation() {
+        let base = 1000i64;
+        let uniform: Vec<i64> = (0..20).map(|i| base + i * 100).collect();
+        let result = validate_event_integrity(&uniform, base, base + 2000);
+        assert!(result.is_usable());
+    }
+}

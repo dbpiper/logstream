@@ -386,3 +386,238 @@ impl FeasibilityResult {
         matches!(self, FeasibilityResult::Feasible { .. })
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum DataIntegrity {
+    Valid,
+    Partial { coverage: f64 },
+    Invalid,
+}
+
+impl DataIntegrity {
+    pub fn is_usable(&self) -> bool {
+        !matches!(self, DataIntegrity::Invalid)
+    }
+
+    pub fn should_upsert(&self) -> bool {
+        matches!(self, DataIntegrity::Partial { .. })
+    }
+}
+
+pub fn validate_event_integrity(
+    timestamps: &[i64],
+    range_start: i64,
+    range_end: i64,
+) -> DataIntegrity {
+    if timestamps.is_empty() {
+        return DataIntegrity::Invalid;
+    }
+
+    if timestamps.len() < 3 {
+        return DataIntegrity::Partial { coverage: 0.1 };
+    }
+
+    let range_ms = (range_end - range_start).max(1) as f64;
+    let mut sorted = timestamps.to_vec();
+    sorted.sort_unstable();
+
+    let features: Vec<FourierPoint> = sorted.iter().map(|&ts| FourierPoint::new(ts)).collect();
+
+    let temporal_score = temporal_coverage_score(&sorted, range_start, range_end);
+    let fourier_diversity = fourier_diversity_score(&features);
+    let fourier_uniformity = fourier_uniformity_score(&features, range_ms);
+    let gap_score = gap_distribution_score(&sorted, range_ms);
+
+    let weighted_score = temporal_score * 0.25
+        + fourier_diversity * 0.30
+        + fourier_uniformity * 0.25
+        + gap_score * 0.20;
+
+    if weighted_score > 0.7 {
+        DataIntegrity::Valid
+    } else if weighted_score > 0.3 {
+        DataIntegrity::Partial {
+            coverage: weighted_score,
+        }
+    } else {
+        DataIntegrity::Invalid
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FourierPoint {
+    hour_sin: f64,
+    hour_cos: f64,
+    progress_sin: f64,
+    progress_cos: f64,
+}
+
+impl FourierPoint {
+    fn new(timestamp_ms: i64) -> Self {
+        let secs = (timestamp_ms / 1000) as f64;
+        let hour_of_day = (secs % 86400.0) / 86400.0;
+
+        Self {
+            hour_sin: (2.0 * PI * hour_of_day).sin(),
+            hour_cos: (2.0 * PI * hour_of_day).cos(),
+            progress_sin: 0.0,
+            progress_cos: 1.0,
+        }
+    }
+
+    fn distance_sq(&self, other: &FourierPoint) -> f64 {
+        let hour =
+            (self.hour_sin - other.hour_sin).powi(2) + (self.hour_cos - other.hour_cos).powi(2);
+        let progress = (self.progress_sin - other.progress_sin).powi(2)
+            + (self.progress_cos - other.progress_cos).powi(2);
+        hour + progress
+    }
+}
+
+fn temporal_coverage_score(sorted: &[i64], start: i64, end: i64) -> f64 {
+    if sorted.len() < 2 {
+        return 0.5;
+    }
+
+    let range = (end - start).max(1) as f64;
+    let first = sorted.first().copied().unwrap_or(start);
+    let last = sorted.last().copied().unwrap_or(end);
+    let data_range = (last - first).max(0) as f64;
+
+    let coverage = data_range / range;
+    let start_dist = ((first - start).abs() as f64 / range).min(1.0);
+    let end_dist = ((end - last).abs() as f64 / range).min(1.0);
+
+    let boundary_penalty = 1.0 - (start_dist + end_dist) / 4.0;
+
+    (coverage * boundary_penalty).min(1.0)
+}
+
+fn fourier_diversity_score(features: &[FourierPoint]) -> f64 {
+    if features.len() < 3 {
+        return 0.5;
+    }
+
+    let n = features.len();
+    let sample_size = n.min(50);
+    let step = n / sample_size;
+
+    let mut total_min_dist = 0.0;
+    let mut count = 0;
+
+    for i in (0..n).step_by(step.max(1)) {
+        let mut min_dist = f64::MAX;
+        for (j, other) in features.iter().enumerate() {
+            if i != j {
+                let dist = features[i].distance_sq(other);
+                min_dist = min_dist.min(dist);
+            }
+        }
+        if min_dist < f64::MAX {
+            total_min_dist += min_dist.sqrt();
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return 0.5;
+    }
+
+    let avg_min_dist = total_min_dist / count as f64;
+    let max_possible = 4.0_f64.sqrt();
+
+    (avg_min_dist / max_possible * 4.0).min(1.0)
+}
+
+fn fourier_uniformity_score(features: &[FourierPoint], range_ms: f64) -> f64 {
+    if features.len() < 4 {
+        return 0.5;
+    }
+
+    let hour_variance =
+        compute_circular_variance(features.iter().map(|f| (f.hour_sin, f.hour_cos)));
+    let progress_variance =
+        compute_circular_variance(features.iter().map(|f| (f.progress_sin, f.progress_cos)));
+
+    let uniformity = (hour_variance + progress_variance) / 2.0;
+
+    let range_hours = range_ms / 3_600_000.0;
+    let expected_hour_variance = if range_hours >= 24.0 {
+        0.8
+    } else {
+        range_hours / 30.0
+    };
+
+    if expected_hour_variance > 0.0 {
+        (uniformity / expected_hour_variance).min(1.0)
+    } else {
+        uniformity
+    }
+}
+
+fn compute_circular_variance(points: impl Iterator<Item = (f64, f64)>) -> f64 {
+    let mut sum_sin = 0.0;
+    let mut sum_cos = 0.0;
+    let mut count = 0;
+
+    for (sin_val, cos_val) in points {
+        sum_sin += sin_val;
+        sum_cos += cos_val;
+        count += 1;
+    }
+
+    if count == 0 {
+        return 0.0;
+    }
+
+    let mean_sin = sum_sin / count as f64;
+    let mean_cos = sum_cos / count as f64;
+    let r = (mean_sin.powi(2) + mean_cos.powi(2)).sqrt();
+
+    1.0 - r
+}
+
+fn gap_distribution_score(sorted: &[i64], range_ms: f64) -> f64 {
+    if sorted.len() < 3 {
+        return 0.5;
+    }
+
+    let gaps: Vec<f64> = sorted
+        .windows(2)
+        .map(|w| (w[1] - w[0]).max(0) as f64)
+        .collect();
+
+    if gaps.is_empty() {
+        return 0.5;
+    }
+
+    let n = gaps.len();
+    let mean_gap = gaps.iter().sum::<f64>() / n as f64;
+    let variance = gaps.iter().map(|g| (g - mean_gap).powi(2)).sum::<f64>() / n as f64;
+    let stddev = variance.sqrt();
+
+    let expected_gap = range_ms / (sorted.len() as f64);
+    let cv = if mean_gap > 0.0 {
+        stddev / mean_gap
+    } else {
+        1.0
+    };
+
+    let mean_score = if expected_gap > 0.0 {
+        1.0 - ((mean_gap - expected_gap).abs() / expected_gap).min(1.0)
+    } else {
+        0.5
+    };
+
+    let cv_score = (-cv / 2.0).exp();
+
+    let max_gap = gaps.iter().cloned().fold(0.0, f64::max);
+    let max_gap_ratio = max_gap / range_ms;
+    let max_gap_score = if max_gap_ratio > 0.5 {
+        0.3
+    } else {
+        1.0 - max_gap_ratio
+    };
+
+    mean_score * 0.3 + cv_score * 0.4 + max_gap_score * 0.3
+}
