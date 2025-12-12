@@ -1,27 +1,11 @@
-//! Multi-level priority scheduler (OS-style).
-//! Uses SEPARATE channels per priority to prevent backfill from blocking real-time.
-//! Real-time (CRITICAL) is ALWAYS drained completely before any lower priority.
+//! Priority-based event routing for EnrichedEvents.
+//! Routes events through separate channels per priority level to ensure
+//! real-time events are never blocked by historical backfill.
 
 use tokio::sync::mpsc;
 
+use crate::process::Priority;
 use crate::types::EnrichedEvent;
-
-/// Priority levels (higher number = higher priority).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Priority(pub u8);
-
-impl Priority {
-    /// Critical: real-time tail events - never delayed
-    pub const CRITICAL: Priority = Priority(255);
-    /// High: recent reconciliation
-    pub const HIGH: Priority = Priority(192);
-    /// Normal: standard backfill for today
-    pub const NORMAL: Priority = Priority(128);
-    /// Low: historical backfill (last week)
-    pub const LOW: Priority = Priority(64);
-    /// Idle: old backfill, healing - only when nothing else
-    pub const IDLE: Priority = Priority(0);
-}
 
 /// Channel capacity per priority level.
 const CRITICAL_CAPACITY: usize = 10000;
@@ -32,11 +16,11 @@ const IDLE_CAPACITY: usize = 100000;
 
 /// Sender for a specific priority level.
 #[derive(Clone)]
-pub struct PrioritySender {
+pub struct EventSender {
     tx: mpsc::Sender<EnrichedEvent>,
 }
 
-impl PrioritySender {
+impl EventSender {
     pub async fn send(
         &self,
         event: EnrichedEvent,
@@ -45,9 +29,10 @@ impl PrioritySender {
     }
 }
 
-/// Multi-level priority scheduler.
-/// ALWAYS drains higher priority completely before touching lower.
-pub struct Scheduler {
+/// Priority-based event router.
+/// Routes events to the ES bulk sink in strict priority order.
+/// CRITICAL is always fully drained before HIGH, HIGH before NORMAL, etc.
+pub struct EventRouter {
     critical_rx: mpsc::Receiver<EnrichedEvent>,
     high_rx: mpsc::Receiver<EnrichedEvent>,
     normal_rx: mpsc::Receiver<EnrichedEvent>,
@@ -55,7 +40,7 @@ pub struct Scheduler {
     idle_rx: mpsc::Receiver<EnrichedEvent>,
 }
 
-impl Scheduler {
+impl EventRouter {
     /// Receive next event, strictly prioritized.
     /// CRITICAL is always fully drained before HIGH, HIGH before NORMAL, etc.
     pub async fn recv(&mut self) -> Option<EnrichedEvent> {
@@ -97,9 +82,9 @@ impl Scheduler {
     }
 }
 
-/// Factory for creating priority senders.
+/// Factory for creating event senders at different priority levels.
 #[derive(Clone)]
-pub struct SenderFactory {
+pub struct EventSenderFactory {
     critical_tx: mpsc::Sender<EnrichedEvent>,
     high_tx: mpsc::Sender<EnrichedEvent>,
     normal_tx: mpsc::Sender<EnrichedEvent>,
@@ -107,9 +92,9 @@ pub struct SenderFactory {
     idle_tx: mpsc::Sender<EnrichedEvent>,
 }
 
-impl SenderFactory {
+impl EventSenderFactory {
     /// Get a sender for the specified priority level.
-    pub fn at(&self, priority: Priority) -> PrioritySender {
+    pub fn at(&self, priority: Priority) -> EventSender {
         let tx = match priority.0 {
             255 => self.critical_tx.clone(),
             192..=254 => self.high_tx.clone(),
@@ -117,41 +102,33 @@ impl SenderFactory {
             64..=127 => self.low_tx.clone(),
             _ => self.idle_tx.clone(),
         };
-        PrioritySender { tx }
+        EventSender { tx }
     }
 }
 
-/// Builder for the scheduler.
-pub struct SchedulerBuilder;
+/// Build an event router with its sender factory.
+pub fn build_event_router() -> (EventRouter, EventSenderFactory) {
+    let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_CAPACITY);
+    let (high_tx, high_rx) = mpsc::channel(HIGH_CAPACITY);
+    let (normal_tx, normal_rx) = mpsc::channel(NORMAL_CAPACITY);
+    let (low_tx, low_rx) = mpsc::channel(LOW_CAPACITY);
+    let (idle_tx, idle_rx) = mpsc::channel(IDLE_CAPACITY);
 
-impl SchedulerBuilder {
-    pub fn new(_capacity: usize) -> Self {
-        Self
-    }
+    let router = EventRouter {
+        critical_rx,
+        high_rx,
+        normal_rx,
+        low_rx,
+        idle_rx,
+    };
 
-    pub fn build(self) -> (Scheduler, SenderFactory) {
-        let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_CAPACITY);
-        let (high_tx, high_rx) = mpsc::channel(HIGH_CAPACITY);
-        let (normal_tx, normal_rx) = mpsc::channel(NORMAL_CAPACITY);
-        let (low_tx, low_rx) = mpsc::channel(LOW_CAPACITY);
-        let (idle_tx, idle_rx) = mpsc::channel(IDLE_CAPACITY);
+    let factory = EventSenderFactory {
+        critical_tx,
+        high_tx,
+        normal_tx,
+        low_tx,
+        idle_tx,
+    };
 
-        let scheduler = Scheduler {
-            critical_rx,
-            high_rx,
-            normal_rx,
-            low_rx,
-            idle_rx,
-        };
-
-        let factory = SenderFactory {
-            critical_tx,
-            high_tx,
-            normal_tx,
-            low_tx,
-            idle_tx,
-        };
-
-        (scheduler, factory)
-    }
+    (router, factory)
 }

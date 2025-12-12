@@ -39,10 +39,10 @@ impl EsBulkSink {
         Ok(Self { cfg, client })
     }
 
-    /// Start with scheduler and adaptive rate control.
+    /// Start with event router and adaptive rate control.
     pub fn start_adaptive(
         &self,
-        mut scheduler: crate::scheduler::Scheduler,
+        mut event_router: crate::event_router::EventRouter,
         adaptive: Arc<AdaptiveController>,
     ) {
         let cfg = self.cfg.clone();
@@ -62,14 +62,15 @@ impl EsBulkSink {
                 }
 
                 // Receive events up to batch size
-                let Some(ev) = scheduler.recv().await else {
+                let Some(ev) = event_router.recv().await else {
                     break;
                 };
                 buf.push(ev);
 
                 // Drain more if available (up to batch size)
                 while buf.len() < target_batch {
-                    match tokio::time::timeout(Duration::from_millis(10), scheduler.recv()).await {
+                    match tokio::time::timeout(Duration::from_millis(10), event_router.recv()).await
+                    {
                         Ok(Some(ev)) => buf.push(ev),
                         _ => break,
                     }
