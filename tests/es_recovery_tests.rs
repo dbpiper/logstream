@@ -887,3 +887,81 @@ async fn check_cluster_and_recover(
 
     recovered
 }
+
+// ============================================================================
+// Unit tests for parse_index_date
+// ============================================================================
+
+use logstream::es_recovery::parse_index_date;
+
+#[test]
+fn test_parse_index_date_valid() {
+    let date = parse_index_date("logs-2025.12.11", "logs").unwrap();
+    use chrono::Datelike;
+    assert_eq!(date.year(), 2025);
+    assert_eq!(date.month(), 12);
+    assert_eq!(date.day(), 11);
+}
+
+#[test]
+fn test_parse_index_date_different_prefix() {
+    let date = parse_index_date("myapp-2024.01.15", "myapp").unwrap();
+    use chrono::Datelike;
+    assert_eq!(date.year(), 2024);
+    assert_eq!(date.month(), 1);
+    assert_eq!(date.day(), 15);
+}
+
+#[test]
+fn test_parse_index_date_wrong_prefix() {
+    let result = parse_index_date("logs-2025.12.11", "other");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_index_date_no_dash() {
+    let result = parse_index_date("logs2025.12.11", "logs");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_index_date_invalid_date() {
+    let result = parse_index_date("logs-2025.13.45", "logs");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_index_date_wrong_format() {
+    let result = parse_index_date("logs-2025-12-11", "logs");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_index_date_empty() {
+    let result = parse_index_date("", "logs");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_index_date_just_prefix() {
+    let result = parse_index_date("logs-", "logs");
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_thresholds_are_reasonable() {
+    use logstream::es_recovery::{
+        DISK_WATERMARK_PERCENT, HEAP_PRESSURE_PERCENT, PENDING_TASKS_THRESHOLD,
+        SHARD_LIMIT_THRESHOLD,
+    };
+
+    let shard_limit = SHARD_LIMIT_THRESHOLD;
+    let disk_pct = DISK_WATERMARK_PERCENT;
+    let heap_pct = HEAP_PRESSURE_PERCENT;
+    let pending = PENDING_TASKS_THRESHOLD;
+
+    assert!(shard_limit < 1000 && shard_limit > 500);
+    assert!(disk_pct > 50.0 && disk_pct < 100.0);
+    assert!(heap_pct > 50.0 && heap_pct < 100.0);
+    assert!(pending > 10);
+}

@@ -10,6 +10,11 @@ repository = "https://github.com/dbpiper/logstream"
 keywords = ["logging", "elasticsearch", "cloudwatch", "aws", "observability"]
 categories = ["command-line-utilities", "web-programming"]
 
+[features]
+default = []
+# Enable test-only accessors and internals for integration tests
+testing = []
+
 [dependencies]
 anyhow = "1"
 aws-config = "1"

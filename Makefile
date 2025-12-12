@@ -7,13 +7,13 @@ build:
 	$(CARGO) build --release
 
 test:
-	$(CARGO) test --release
+	$(CARGO) test --release --features testing
 
 fmt:
 	$(CARGO) fmt --all
 
 clippy:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --all-targets --features testing -- -D warnings
 
 docker-build:
 	docker build \

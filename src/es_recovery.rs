@@ -10,11 +10,11 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-// Thresholds for health checks
-const SHARD_LIMIT_THRESHOLD: usize = 900;
-const DISK_WATERMARK_PERCENT: f64 = 85.0;
-const HEAP_PRESSURE_PERCENT: f64 = 85.0;
-const PENDING_TASKS_THRESHOLD: usize = 100;
+// Thresholds for health checks (public for testing)
+pub const SHARD_LIMIT_THRESHOLD: usize = 900;
+pub const DISK_WATERMARK_PERCENT: f64 = 85.0;
+pub const HEAP_PRESSURE_PERCENT: f64 = 85.0;
+pub const PENDING_TASKS_THRESHOLD: usize = 100;
 
 #[derive(Debug, Deserialize)]
 struct IndexInfo {
@@ -378,7 +378,7 @@ async fn delete_index(
     }
 }
 
-fn parse_index_date(index_name: &str, prefix: &str) -> Option<NaiveDate> {
+pub fn parse_index_date(index_name: &str, prefix: &str) -> Option<NaiveDate> {
     let suffix = index_name.strip_prefix(prefix)?.strip_prefix('-')?;
     NaiveDate::parse_from_str(suffix, "%Y.%m.%d").ok()
 }
@@ -394,76 +394,4 @@ pub async fn check_on_startup(
     let client = Client::builder().timeout(timeout).build()?;
     let _ = check_and_recover(&client, base_url, user, pass, index_prefix).await;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Datelike;
-
-    #[test]
-    fn test_parse_index_date_valid() {
-        let date = parse_index_date("logs-2025.12.11", "logs").unwrap();
-        assert_eq!(date.year(), 2025);
-        assert_eq!(date.month(), 12);
-        assert_eq!(date.day(), 11);
-    }
-
-    #[test]
-    fn test_parse_index_date_different_prefix() {
-        let date = parse_index_date("myapp-2024.01.15", "myapp").unwrap();
-        assert_eq!(date.year(), 2024);
-        assert_eq!(date.month(), 1);
-        assert_eq!(date.day(), 15);
-    }
-
-    #[test]
-    fn test_parse_index_date_wrong_prefix() {
-        let result = parse_index_date("logs-2025.12.11", "other");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_index_date_no_dash() {
-        let result = parse_index_date("logs2025.12.11", "logs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_index_date_invalid_date() {
-        let result = parse_index_date("logs-2025.13.45", "logs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_index_date_wrong_format() {
-        let result = parse_index_date("logs-2025-12-11", "logs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_index_date_empty() {
-        let result = parse_index_date("", "logs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_parse_index_date_just_prefix() {
-        let result = parse_index_date("logs-", "logs");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_thresholds_are_reasonable() {
-        // Test threshold values at runtime
-        let shard_limit = SHARD_LIMIT_THRESHOLD;
-        let disk_pct = DISK_WATERMARK_PERCENT;
-        let heap_pct = HEAP_PRESSURE_PERCENT;
-        let pending = PENDING_TASKS_THRESHOLD;
-
-        assert!(shard_limit < 1000 && shard_limit > 500);
-        assert!(disk_pct > 50.0 && disk_pct < 100.0);
-        assert!(heap_pct > 50.0 && heap_pct < 100.0);
-        assert!(pending > 10);
-    }
 }

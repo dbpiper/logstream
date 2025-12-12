@@ -1,18 +1,3 @@
-mod adaptive;
-mod config;
-mod cw_counts;
-mod cw_tail;
-mod enrich;
-mod es_bulk_sink;
-mod es_conflicts;
-mod es_counts;
-mod es_recovery;
-mod es_schema_heal;
-mod reconcile;
-mod scheduler;
-mod state;
-mod types;
-
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -21,14 +6,21 @@ use std::{
 use anyhow::Result;
 use aws_config::{timeout::TimeoutConfig, BehaviorVersion};
 use chrono::{Duration as ChronoDuration, Utc};
-use config::Config;
-use cw_counts::CwCounter;
-use cw_tail::{CloudWatchTailer, TailConfig};
 use dotenvy::dotenv;
-use enrich::enrich_event;
-use es_bulk_sink::{EsBulkConfig, EsBulkSink};
-use es_conflicts::EsConflictResolver;
-use es_counts::EsCounter;
+use logstream::config::Config;
+use logstream::cw_counts::CwCounter;
+use logstream::cw_tail::{CloudWatchTailer, TailConfig};
+use logstream::enrich::enrich_event;
+use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
+use logstream::es_conflicts::EsConflictResolver;
+use logstream::es_counts::EsCounter;
+use logstream::es_recovery;
+use logstream::es_schema_heal::SchemaHealer;
+use logstream::reconcile;
+use logstream::scheduler::{self, Priority, SenderFactory};
+use logstream::state::CheckpointState;
+use logstream::types::LogEvent;
+use logstream::adaptive;
 use reqwest::Client;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -60,7 +52,7 @@ struct BufferCapacities {
 struct GroupContext {
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
-    sender_factory: scheduler::SenderFactory,
+    sender_factory: SenderFactory,
     buffer_caps: BufferCapacities,
 }
 
@@ -213,7 +205,7 @@ async fn main() -> Result<()> {
     }
 
     // Run schema healing to fix any indices with drifted mappings (O(log n) detection)
-    let schema_healer = es_schema_heal::SchemaHealer::new(
+    let schema_healer = SchemaHealer::new(
         es_url.clone(),
         es_user.clone(),
         es_pass.clone(),
@@ -383,7 +375,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
 
     let cw_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
     let cwi_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
-    let checkpoint = state::CheckpointState::load(&cfg.checkpoint_path)?;
+    let checkpoint = CheckpointState::load(&cfg.checkpoint_path)?;
     let es_url = std::env::var("ES_HOST").unwrap_or_else(|_| "http://localhost:9200".into());
     let es_user = std::env::var("ES_USER").unwrap_or_else(|_| "elastic".into());
     let es_pass = std::env::var("ES_PASS").unwrap_or_else(|_| "changeme".into());
@@ -449,9 +441,9 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
     }
 
     // Real-time tail uses CRITICAL priority (never delayed)
-    let tail_sink = sender_factory.at(scheduler::Priority::CRITICAL);
+    let tail_sink = sender_factory.at(Priority::CRITICAL);
     let mut tail_handle = tokio::spawn(async move {
-        let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.tail_raw);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.tail_raw);
         tokio::spawn(async move {
             while let Some(raw) = raw_rx.recv().await {
                 if let Some(enriched) = enrich_event(raw, None) {
@@ -483,7 +475,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
                 aws_cfg.clone(),
             )
             .await?,
-            sink_tx: sender_factory.at(scheduler::Priority::HIGH),
+            sink_tx: sender_factory.at(Priority::HIGH),
             es_counter: es_counter.clone(),
             cw_counter: cw_counter.clone(),
         };
@@ -507,7 +499,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
                 aws_cfg.clone(),
             )
             .await?,
-            sink_tx: sender_factory.at(scheduler::Priority::NORMAL),
+            sink_tx: sender_factory.at(Priority::NORMAL),
             es_counter: es_counter.clone(),
             cw_counter: cw_counter.clone(),
         };
@@ -536,7 +528,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
     let heal_handle = tokio::spawn(run_recent_heal(
         cfg.clone(),
         aws_cfg.clone(),
-        sender_factory.at(scheduler::Priority::IDLE),
+        sender_factory.at(Priority::IDLE),
         heal_days,
         buffer_caps,
     ));
@@ -574,7 +566,7 @@ async fn tailer_clone_for_reconcile(
     aws_cfg: aws_config::SdkConfig,
 ) -> Result<CloudWatchTailer> {
     let cw_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
-    let checkpoint = state::CheckpointState::load(&checkpoint_path)?;
+    let checkpoint = CheckpointState::load(&checkpoint_path)?;
     Ok(CloudWatchTailer::new(
         TailConfig {
             log_group: cfg.log_group.clone(),
@@ -591,7 +583,7 @@ async fn tailer_clone_for_reconcile(
 async fn run_backfill_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
-    sender_factory: scheduler::SenderFactory,
+    sender_factory: SenderFactory,
     buffer_caps: BufferCapacities,
 ) -> Result<()> {
     if cfg.backfill_days == 0 {
@@ -623,19 +615,19 @@ async fn run_backfill_days(
 
         // Priority based on recency: today=NORMAL, yesterday=LOW, older=IDLE
         let priority = match day_offset {
-            0 => scheduler::Priority::NORMAL,
-            1..=7 => scheduler::Priority::LOW,
-            _ => scheduler::Priority::IDLE,
+            0 => Priority::NORMAL,
+            1..=7 => Priority::LOW,
+            _ => Priority::IDLE,
         };
         let sink_tx = sender_factory.at(priority);
 
-        let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.backfill_raw);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.backfill_raw);
         let log_group_clone = cfg.log_group.clone();
 
         let consumer_handle = tokio::spawn(async move {
             let mut sent = 0usize;
             while let Some(raw) = raw_rx.recv().await {
-                if let Some(enriched) = crate::enrich::enrich_event(raw, None) {
+                if let Some(enriched) = enrich_event(raw, None) {
                     if sink_tx.send(enriched).await.is_err() {
                         break;
                     }
@@ -707,13 +699,13 @@ async fn run_recent_heal(
         let start_ms = start.and_utc().timestamp_millis();
         let end_ms = end.and_utc().timestamp_millis();
 
-        let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.heal_raw);
+        let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.heal_raw);
         let sink_clone = sink_tx.clone();
 
         // Consumer sends to low-priority channel; realtime always preempts
         tokio::spawn(async move {
             while let Some(raw) = raw_rx.recv().await {
-                if let Some(enriched) = crate::enrich::enrich_event(raw, None) {
+                if let Some(enriched) = enrich_event(raw, None) {
                     if sink_clone.send(enriched).await.is_err() {
                         break;
                     }
