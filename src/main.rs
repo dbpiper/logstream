@@ -1,3 +1,4 @@
+mod adaptive;
 mod config;
 mod cw_counts;
 mod cw_tail;
@@ -169,13 +170,18 @@ async fn main() -> Result<()> {
         pass: es_pass.clone(),
         batch_size: cfg.batch_size,
         max_batch_size: max_batch,
-        max_in_flight: cfg.max_in_flight,
         timeout: cfg.http_timeout(),
         gzip: true,
         index_prefix: index_prefix.clone(),
     };
     let sink = EsBulkSink::new(sink_cfg)?;
-    sink.start_scheduled(priority_scheduler);
+    let adaptive_controller = adaptive::create_controller();
+    info!(
+        "adaptive controller: initial batch={} in_flight={}",
+        adaptive_controller.batch_size(),
+        adaptive_controller.max_in_flight()
+    );
+    sink.start_adaptive(priority_scheduler, adaptive_controller.clone());
 
     // Always ensure index hygiene and backfill-friendly settings
     let default_index = format!("{}-default", index_prefix);

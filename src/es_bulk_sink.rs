@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::adaptive::AdaptiveController;
 use crate::es_recovery;
 use crate::types::EnrichedEvent;
 
@@ -18,7 +19,6 @@ pub struct EsBulkConfig {
     pub pass: String,
     pub batch_size: usize, // min batch
     pub max_batch_size: usize,
-    pub max_in_flight: usize,
     pub timeout: Duration,
     pub gzip: bool,
     pub index_prefix: String,
@@ -39,67 +39,144 @@ impl EsBulkSink {
         Ok(Self { cfg, client })
     }
 
-    /// Start with scheduler - events processed in priority order.
-    pub fn start_scheduled(&self, mut scheduler: crate::scheduler::Scheduler) {
+    /// Start with scheduler and adaptive rate control.
+    pub fn start_adaptive(
+        &self,
+        mut scheduler: crate::scheduler::Scheduler,
+        adaptive: Arc<AdaptiveController>,
+    ) {
         let cfg = self.cfg.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
-            let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
-            let mut in_flight: FuturesUnordered<tokio::task::JoinHandle<()>> =
-                FuturesUnordered::new();
             let mut buf: Vec<EnrichedEvent> = Vec::with_capacity(cfg.max_batch_size);
-            let target_batch = cfg.max_batch_size.max(cfg.batch_size);
 
-            while let Some(ev) = scheduler.recv().await {
-                buf.push(ev);
-                if buf.len() >= target_batch {
-                    let batch = std::mem::take(&mut buf);
-                    let permit = sem.clone().acquire_owned().await.unwrap();
-                    let c = client.clone();
-                    let url = cfg.url.clone();
-                    let user = cfg.user.clone();
-                    let pass = cfg.pass.clone();
-                    let index_prefix = cfg.index_prefix.clone();
-                    in_flight.push(tokio::spawn(async move {
-                        let _p = permit;
-                        let started = std::time::Instant::now();
-                        let res = send_bulk(&c, &url, &user, &pass, &index_prefix, &batch).await;
-                        let elapsed = started.elapsed();
-                        match res {
-                            Ok(_) => {
-                                info!(
-                                    "es bulk sent batch={} status=200 latency_ms={}",
-                                    batch.len(),
-                                    elapsed.as_millis()
-                                );
-                            }
-                            Err(err) => {
-                                warn!("es bulk send failed: {err:?}");
-                            }
-                        }
-                    }));
+            loop {
+                // Get current adaptive parameters
+                let target_batch = adaptive.batch_size();
+                let max_in_flight = adaptive.max_in_flight();
+                let delay = adaptive.delay();
+
+                // Apply delay if needed (backpressure)
+                if !delay.is_zero() {
+                    sleep(delay).await;
                 }
-                while in_flight.len() >= cfg.max_in_flight {
-                    let _ = in_flight.next().await;
+
+                // Receive events up to batch size
+                let Some(ev) = scheduler.recv().await else {
+                    break;
+                };
+                buf.push(ev);
+
+                // Drain more if available (up to batch size)
+                while buf.len() < target_batch {
+                    match tokio::time::timeout(Duration::from_millis(10), scheduler.recv()).await {
+                        Ok(Some(ev)) => buf.push(ev),
+                        _ => break,
+                    }
+                }
+
+                if buf.len() >= target_batch || buf.len() >= cfg.min_batch_for_send() {
+                    let batch = std::mem::take(&mut buf);
+                    let started = std::time::Instant::now();
+
+                    let res =
+                        send_bulk_adaptive(&client, &cfg, &batch, adaptive.clone(), max_in_flight)
+                            .await;
+
+                    let elapsed = started.elapsed();
+                    let latency_ms = elapsed.as_millis() as u64;
+
+                    match res {
+                        Ok(_) => {
+                            adaptive.record_latency(latency_ms, true).await;
+                            info!(
+                                "adaptive bulk: batch={} latency={}ms (target_batch={} in_flight={})",
+                                batch.len(),
+                                latency_ms,
+                                target_batch,
+                                max_in_flight
+                            );
+                        }
+                        Err(err) => {
+                            adaptive.record_latency(latency_ms, false).await;
+                            warn!("adaptive bulk failed: {err:?}");
+                        }
+                    }
                 }
             }
+
+            // Flush remaining
             if !buf.is_empty() {
-                let batch = std::mem::take(&mut buf);
-                if let Err(err) = send_bulk(
+                let _ = send_bulk(
                     &client,
                     &cfg.url,
                     &cfg.user,
                     &cfg.pass,
                     &cfg.index_prefix,
-                    batch.as_slice(),
+                    &buf,
                 )
-                .await
-                {
-                    warn!("es bulk send failed: {err:?}");
-                }
+                .await;
             }
-            while let Some(_done) = in_flight.next().await {}
         });
+    }
+}
+
+impl EsBulkConfig {
+    fn min_batch_for_send(&self) -> usize {
+        self.batch_size.max(100)
+    }
+}
+
+/// Send bulk with adaptive concurrency control.
+async fn send_bulk_adaptive(
+    client: &Client,
+    cfg: &EsBulkConfig,
+    batch: &[EnrichedEvent],
+    adaptive: Arc<AdaptiveController>,
+    max_in_flight: usize,
+) -> Result<()> {
+    let sem = Arc::new(Semaphore::new(max_in_flight));
+    let chunk_size = (batch.len() / max_in_flight).max(100);
+
+    let mut handles: FuturesUnordered<tokio::task::JoinHandle<Result<()>>> =
+        FuturesUnordered::new();
+
+    for chunk in batch.chunks(chunk_size) {
+        let permit = sem.clone().acquire_owned().await?;
+        let c = client.clone();
+        let url = cfg.url.clone();
+        let user = cfg.user.clone();
+        let pass = cfg.pass.clone();
+        let index_prefix = cfg.index_prefix.clone();
+        let chunk_vec: Vec<EnrichedEvent> = chunk.to_vec();
+        let adaptive_clone = adaptive.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _p = permit;
+            let started = std::time::Instant::now();
+            let res = send_bulk(&c, &url, &user, &pass, &index_prefix, &chunk_vec).await;
+            let latency = started.elapsed().as_millis() as u64;
+
+            // Record chunk latency for fine-grained adaptation
+            adaptive_clone.record_latency(latency, res.is_ok()).await;
+
+            res
+        }));
+    }
+
+    // Wait for all chunks
+    let mut any_error = None;
+    while let Some(result) = handles.next().await {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => any_error = Some(e),
+            Err(e) => any_error = Some(anyhow::anyhow!("task failed: {e}")),
+        }
+    }
+
+    match any_error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -293,7 +370,6 @@ mod tests {
             pass: "password".to_string(),
             batch_size: 100,
             max_batch_size: 1000,
-            max_in_flight: 4,
             timeout: Duration::from_secs(30),
             gzip: true,
             index_prefix: "logs".to_string(),
@@ -313,7 +389,6 @@ mod tests {
             pass: "password".to_string(),
             batch_size: 100,
             max_batch_size: 1000,
-            max_in_flight: 4,
             timeout: Duration::from_secs(30),
             gzip: true,
             index_prefix: "logs".to_string(),
