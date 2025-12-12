@@ -268,12 +268,25 @@ async fn send_bulk_tracked(
             Ok(resp) if resp.status().is_success() => {
                 let resp_body = resp.text().await.unwrap_or_default();
 
+                // Only warn if there are actual failures (status >= 400)
+                // ES sets "errors":true for version conflicts (updates) which are normal
                 if resp_body.contains("\"errors\":true") {
-                    // Log errors but don't retry - version conflicts are normal
-                    warn!(
-                        "es bulk has item errors, sample: {}",
-                        &resp_body[..resp_body.len().min(500)]
-                    );
+                    let has_real_errors = resp_body.contains("\"status\":4")
+                        || resp_body.contains("\"status\":5")
+                        || resp_body.contains("\"failed\":1");
+
+                    if has_real_errors {
+                        warn!(
+                            "es bulk has item failures: {}",
+                            &resp_body[..resp_body.len().min(500)]
+                        );
+                    } else {
+                        // Version conflicts/updates are normal during backfill - just debug log
+                        tracing::debug!(
+                            "es bulk has updates (not errors): {} items",
+                            batch.len()
+                        );
+                    }
                 }
 
                 info!("es bulk sent batch={} status=200 OK", batch.len());
