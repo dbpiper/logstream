@@ -639,14 +639,23 @@ mod live_learn_tests {
     fn test_threshold_edge_cases() {
         assert_eq!(decide_live_learn(10, 11, false), LiveLearnDecision::TrustEs);
         assert_eq!(decide_live_learn(10, 13, false), LiveLearnDecision::Replace);
-        assert_eq!(decide_live_learn(100, 110, false), LiveLearnDecision::TrustEs);
-        assert_eq!(decide_live_learn(100, 120, false), LiveLearnDecision::Replace);
+        assert_eq!(
+            decide_live_learn(100, 110, false),
+            LiveLearnDecision::TrustEs
+        );
+        assert_eq!(
+            decide_live_learn(100, 120, false),
+            LiveLearnDecision::Replace
+        );
     }
 
     #[test]
     fn test_stress_only_protects_when_es_has_more() {
         assert_eq!(decide_live_learn(100, 50, true), LiveLearnDecision::TrustEs);
         assert_eq!(decide_live_learn(50, 100, true), LiveLearnDecision::Replace);
-        assert_eq!(decide_live_learn(100, 100, true), LiveLearnDecision::TrustEs);
+        assert_eq!(
+            decide_live_learn(100, 100, true),
+            LiveLearnDecision::TrustEs
+        );
     }
 }

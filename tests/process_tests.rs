@@ -630,7 +630,8 @@ async fn test_optimal_throughput_scales_with_workers() {
         start.elapsed()
     };
 
-    let speedup = single_worker_time.as_millis() as f64 / multi_worker_time.as_millis().max(1) as f64;
+    let speedup =
+        single_worker_time.as_millis() as f64 / multi_worker_time.as_millis().max(1) as f64;
     assert!(
         multi_worker_time < single_worker_time,
         "4 workers ({:?}) should be faster than 1 ({:?}), speedup={:.2}x",
@@ -1120,17 +1121,11 @@ async fn test_group_scheduler_shutdown_daemons() {
     let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.state, ProcessState::Terminated);
 
-    let reconcile_info = group_sched
-        .scheduler()
-        .get_process(reconcile_pid)
-        .unwrap();
+    let reconcile_info = group_sched.scheduler().get_process(reconcile_pid).unwrap();
     assert_eq!(reconcile_info.state, ProcessState::Terminated);
 
     // Backfill should still be ready
-    let backfill_info = group_sched
-        .scheduler()
-        .get_process(backfill_pid)
-        .unwrap();
+    let backfill_info = group_sched.scheduler().get_process(backfill_pid).unwrap();
     assert_eq!(backfill_info.state, ProcessState::Ready);
 }
 
@@ -1167,10 +1162,7 @@ async fn test_group_scheduler_mixed_workload() {
     let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.priority, Priority::CRITICAL);
 
-    let reconcile_info = group_sched
-        .scheduler()
-        .get_process(reconcile_pid)
-        .unwrap();
+    let reconcile_info = group_sched.scheduler().get_process(reconcile_pid).unwrap();
     assert_eq!(reconcile_info.priority, Priority::HIGH);
 
     let full_history_info = group_sched
@@ -1179,10 +1171,7 @@ async fn test_group_scheduler_mixed_workload() {
         .unwrap();
     assert_eq!(full_history_info.priority, Priority::NORMAL);
 
-    let conflict_info = group_sched
-        .scheduler()
-        .get_process(conflict_pid)
-        .unwrap();
+    let conflict_info = group_sched.scheduler().get_process(conflict_pid).unwrap();
     assert_eq!(conflict_info.priority, Priority::LOW);
 
     // Verify batch queues track work correctly
@@ -1204,16 +1193,10 @@ async fn test_group_scheduler_process_naming() {
     let tail_info = group_sched.scheduler().get_process(tail_pid).unwrap();
     assert_eq!(tail_info.name, "my-app-logs/tail");
 
-    let reconcile_info = group_sched
-        .scheduler()
-        .get_process(reconcile_pid)
-        .unwrap();
+    let reconcile_info = group_sched.scheduler().get_process(reconcile_pid).unwrap();
     assert_eq!(reconcile_info.name, "my-app-logs/reconcile");
 
-    let backfill_info = group_sched
-        .scheduler()
-        .get_process(backfill_pid)
-        .unwrap();
+    let backfill_info = group_sched.scheduler().get_process(backfill_pid).unwrap();
     assert_eq!(backfill_info.name, "my-app-logs/backfill-day-5");
 
     let heal_info = group_sched.scheduler().get_process(heal_pid).unwrap();
