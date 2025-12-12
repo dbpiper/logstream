@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -39,7 +39,8 @@ impl EsBulkSink {
         Ok(Self { cfg, client })
     }
 
-    pub fn start(&self, mut rx: mpsc::Receiver<EnrichedEvent>) {
+    /// Start with scheduler - events processed in priority order.
+    pub fn start_scheduled(&self, mut scheduler: crate::scheduler::Scheduler) {
         let cfg = self.cfg.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
@@ -49,7 +50,7 @@ impl EsBulkSink {
             let mut buf: Vec<EnrichedEvent> = Vec::with_capacity(cfg.max_batch_size);
             let target_batch = cfg.max_batch_size.max(cfg.batch_size);
 
-            while let Some(ev) = rx.recv().await {
+            while let Some(ev) = scheduler.recv().await {
                 buf.push(ev);
                 if buf.len() >= target_batch {
                     let batch = std::mem::take(&mut buf);

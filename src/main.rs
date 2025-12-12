@@ -8,6 +8,7 @@ mod es_counts;
 mod es_recovery;
 mod es_schema_heal;
 mod reconcile;
+mod scheduler;
 mod state;
 mod types;
 
@@ -58,7 +59,7 @@ struct BufferCapacities {
 struct GroupContext {
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
-    sink_tx: mpsc::Sender<types::EnrichedEvent>,
+    sender_factory: scheduler::SenderFactory,
     buffer_caps: BufferCapacities,
 }
 
@@ -144,7 +145,12 @@ async fn main() -> Result<()> {
         .timeout_config(timeout_config)
         .load()
         .await;
-    let (tx_sink, rx_sink) = mpsc::channel::<types::EnrichedEvent>(buffer_caps.sink_enriched);
+    // Multi-level priority scheduler (OS-style)
+    let (priority_scheduler, sender_factory) =
+        scheduler::SchedulerBuilder::new(buffer_caps.sink_enriched + buffer_caps.backfill_raw)
+            .build();
+    info!("scheduler: multi-level priority (CRITICAL > HIGH > NORMAL > LOW > IDLE)");
+
     let es_url = std::env::var("ES_HOST").unwrap_or_else(|_| "http://localhost:9200".into());
     let es_user = std::env::var("ES_USER").unwrap_or_else(|_| "elastic".into());
     let es_pass = std::env::var("ES_PASS").unwrap_or_else(|_| "changeme".into());
@@ -169,7 +175,7 @@ async fn main() -> Result<()> {
         index_prefix: index_prefix.clone(),
     };
     let sink = EsBulkSink::new(sink_cfg)?;
-    sink.start(rx_sink);
+    sink.start_scheduled(priority_scheduler);
 
     // Always ensure index hygiene and backfill-friendly settings
     let default_index = format!("{}-default", index_prefix);
@@ -237,7 +243,7 @@ async fn main() -> Result<()> {
         let ctx = GroupContext {
             cfg: group_cfg,
             aws_cfg: aws_cfg.clone(),
-            sink_tx: tx_sink.clone(),
+            sender_factory: sender_factory.clone(),
             buffer_caps,
         };
 
@@ -366,7 +372,7 @@ fn init_tracing() {
 async fn run_group(ctx: GroupContext) -> Result<()> {
     let cfg = ctx.cfg;
     let aws_cfg = ctx.aws_cfg;
-    let sink_tx = ctx.sink_tx;
+    let sender_factory = ctx.sender_factory;
     let buffer_caps = ctx.buffer_caps;
 
     let cw_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
@@ -436,7 +442,8 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
         });
     }
 
-    let tail_sink = sink_tx.clone();
+    // Real-time tail uses CRITICAL priority (never delayed)
+    let tail_sink = sender_factory.at(scheduler::Priority::CRITICAL);
     let mut tail_handle = tokio::spawn(async move {
         let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.tail_raw);
         tokio::spawn(async move {
@@ -458,6 +465,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
+    // Reconcile uses HIGH priority (recent data matters)
     let reconcile_handle = if disable_reconcile {
         None
     } else {
@@ -469,7 +477,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
                 aws_cfg.clone(),
             )
             .await?,
-            sink_tx: sink_tx.clone(),
+            sink_tx: sender_factory.at(scheduler::Priority::HIGH),
             es_counter: es_counter.clone(),
             cw_counter: cw_counter.clone(),
         };
@@ -482,6 +490,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
         Some(tokio::spawn(reconcile::run_reconcile_loop(ctx, params)))
     };
 
+    // Full history reconcile uses NORMAL priority
     let reconcile_full_handle = if disable_reconcile || cfg.backfill_days > 0 {
         None
     } else {
@@ -492,7 +501,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
                 aws_cfg.clone(),
             )
             .await?,
-            sink_tx: sink_tx.clone(),
+            sink_tx: sender_factory.at(scheduler::Priority::NORMAL),
             es_counter: es_counter.clone(),
             cw_counter: cw_counter.clone(),
         };
@@ -509,6 +518,7 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
         )))
     };
 
+    // Heal uses IDLE priority (only when nothing else to do)
     let heal_days = if cfg.backfill_days > 0 {
         0
     } else {
@@ -520,15 +530,16 @@ async fn run_group(ctx: GroupContext) -> Result<()> {
     let heal_handle = tokio::spawn(run_recent_heal(
         cfg.clone(),
         aws_cfg.clone(),
-        sink_tx.clone(),
+        sender_factory.at(scheduler::Priority::IDLE),
         heal_days,
         buffer_caps,
     ));
 
+    // Backfill uses LOW priority for historical, NORMAL for today
     let backfill_handle = tokio::spawn(run_backfill_days(
         cfg.clone(),
         aws_cfg.clone(),
-        sink_tx.clone(),
+        sender_factory.clone(),
         buffer_caps,
     ));
 
@@ -574,7 +585,7 @@ async fn tailer_clone_for_reconcile(
 async fn run_backfill_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
-    sink_tx: mpsc::Sender<types::EnrichedEvent>,
+    sender_factory: scheduler::SenderFactory,
     buffer_caps: BufferCapacities,
 ) -> Result<()> {
     if cfg.backfill_days == 0 {
@@ -586,90 +597,77 @@ async fn run_backfill_days(
             .await?;
 
     tracing::info!(
-        "backfill starting: days 0-{} for log group {} (batch parallel)",
+        "backfill starting: days 0-{} for log group {} (priority: today=NORMAL, older=LOW)",
         cfg.backfill_days - 1,
         cfg.log_group
     );
 
-    // Process days sequentially to avoid CW connect timeouts
-    let batch_size = 1u32;
-    let mut offset = 0u32;
+    // Process days sequentially, starting from TODAY and going backwards
+    for day_offset in 0..cfg.backfill_days {
+        let day = Utc::now().date_naive() - ChronoDuration::days(day_offset as i64);
+        let start = day
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_else(|| (Utc::now() - ChronoDuration::days(365)).naive_utc());
+        let end = day
+            .and_hms_opt(23, 59, 59)
+            .unwrap_or_else(|| Utc::now().naive_utc());
 
-    while offset < cfg.backfill_days {
-        let batch_end = (offset + batch_size).min(cfg.backfill_days);
-        let mut batch_handles = Vec::new();
+        let start_ms = start.and_utc().timestamp_millis();
+        let end_ms = end.and_utc().timestamp_millis();
 
-        for day_offset in offset..batch_end {
-            let tailer = tailer.clone();
-            let sink_tx = sink_tx.clone();
-            let log_group = cfg.log_group.clone();
+        // Priority based on recency: today=NORMAL, yesterday=LOW, older=IDLE
+        let priority = match day_offset {
+            0 => scheduler::Priority::NORMAL,
+            1..=7 => scheduler::Priority::LOW,
+            _ => scheduler::Priority::IDLE,
+        };
+        let sink_tx = sender_factory.at(priority);
 
-            batch_handles.push(tokio::spawn(async move {
-                let day = Utc::now().date_naive() - ChronoDuration::days(day_offset as i64);
-                let start = day
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap_or_else(|| (Utc::now() - ChronoDuration::days(365)).naive_utc());
-                let end = day
-                    .and_hms_opt(23, 59, 59)
-                    .unwrap_or_else(|| Utc::now().naive_utc());
+        let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.backfill_raw);
+        let log_group_clone = cfg.log_group.clone();
 
-                let start_ms = start.and_utc().timestamp_millis();
-                let end_ms = end.and_utc().timestamp_millis();
-
-                let (raw_tx, mut raw_rx) =
-                    mpsc::channel::<types::LogEvent>(buffer_caps.backfill_raw);
-                let sink_clone = sink_tx.clone();
-                let log_group_clone = log_group.clone();
-                let consumer_handle = tokio::spawn(async move {
-                    let mut sent = 0usize;
-                    while let Some(raw) = raw_rx.recv().await {
-                        if let Some(enriched) = crate::enrich::enrich_event(raw, None) {
-                            if sink_clone.send(enriched).await.is_err() {
-                                break;
-                            }
-                            sent += 1;
-                        }
+        let consumer_handle = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while let Some(raw) = raw_rx.recv().await {
+                if let Some(enriched) = crate::enrich::enrich_event(raw, None) {
+                    if sink_tx.send(enriched).await.is_err() {
+                        break;
                     }
-                    tracing::info!(
-                        "backfill {} day {} drained {} events",
-                        log_group_clone,
-                        day,
-                        sent
-                    );
-                    sent
-                });
-
-                let started = std::time::Instant::now();
-                let fetch_result = tailer.fetch_range(start_ms, end_ms, &raw_tx).await;
-                drop(raw_tx);
-
-                if let Ok(count) = fetch_result {
-                    let elapsed_ms = started.elapsed().as_millis();
-                    let eps = if elapsed_ms > 0 {
-                        count as u128 * 1000 / elapsed_ms
-                    } else {
-                        0
-                    };
-                    tracing::info!(
-                        "backfill {} day {} fetched {} events in {}ms ({} eps)",
-                        log_group,
-                        day,
-                        count,
-                        elapsed_ms,
-                        eps
-                    );
+                    sent += 1;
                 }
+            }
+            tracing::info!(
+                "backfill {} day {} drained {} events (priority {:?})",
+                log_group_clone,
+                day,
+                sent,
+                priority
+            );
+            sent
+        });
 
-                let _ = consumer_handle.await;
-            }));
+        let started = std::time::Instant::now();
+        let fetch_result = tailer.fetch_range(start_ms, end_ms, &raw_tx).await;
+        drop(raw_tx);
+
+        if let Ok(count) = fetch_result {
+            let elapsed_ms = started.elapsed().as_millis();
+            let eps = if elapsed_ms > 0 {
+                count as u128 * 1000 / elapsed_ms
+            } else {
+                0
+            };
+            tracing::info!(
+                "backfill {} day {} fetched {} events in {}ms ({} eps)",
+                cfg.log_group,
+                day,
+                count,
+                elapsed_ms,
+                eps
+            );
         }
 
-        // Wait for this batch to complete before starting next batch
-        for h in batch_handles {
-            let _ = h.await;
-        }
-
-        offset = batch_end;
+        let _ = consumer_handle.await;
     }
 
     tracing::info!("backfill complete for log group {}", cfg.log_group);
@@ -679,13 +677,14 @@ async fn run_backfill_days(
 async fn run_recent_heal(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
-    sink_tx: mpsc::Sender<types::EnrichedEvent>,
+    sink_tx: scheduler::PrioritySender,
     days: u32,
     buffer_caps: BufferCapacities,
 ) -> Result<()> {
     if days == 0 {
         return Ok(());
     }
+
     let tailer =
         tailer_clone_for_reconcile(cfg.clone(), cfg.checkpoint_path.clone(), aws_cfg.clone())
             .await?;
@@ -704,6 +703,8 @@ async fn run_recent_heal(
 
         let (raw_tx, mut raw_rx) = mpsc::channel::<types::LogEvent>(buffer_caps.heal_raw);
         let sink_clone = sink_tx.clone();
+
+        // Consumer sends to low-priority channel; realtime always preempts
         tokio::spawn(async move {
             while let Some(raw) = raw_rx.recv().await {
                 if let Some(enriched) = crate::enrich::enrich_event(raw, None) {

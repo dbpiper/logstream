@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::{
     cw_counts::CwCounter, cw_tail::CloudWatchTailer, enrich::enrich_event, es_counts::EsCounter,
-    types::LogEvent,
+    scheduler::PrioritySender, types::LogEvent,
 };
 
 const FULL_RESYNC_THRESHOLD_PCT: u64 = 5;
@@ -18,7 +18,7 @@ const MAX_PARALLEL_DAYS: usize = 2;
 #[derive(Clone)]
 pub struct ReconcileContext {
     pub tailer: CloudWatchTailer,
-    pub sink_tx: tokio::sync::mpsc::Sender<crate::types::EnrichedEvent>,
+    pub sink_tx: PrioritySender,
     pub es_counter: EsCounter,
     pub cw_counter: CwCounter,
 }
