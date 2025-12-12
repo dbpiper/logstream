@@ -30,7 +30,7 @@ use logstream::process::GroupScheduler;
 use logstream::process::Priority;
 use logstream::runner::{
     create_group_resources, execute_conflict_daemon, execute_full_history_daemon,
-    execute_reconcile_daemon, execute_tail_daemon, run_heal_with_scheduler, GroupEnvConfig,
+    execute_reconcile_daemon, execute_tail_daemon, run_heal_days, GroupEnvConfig,
     ReconcileExecContext,
 };
 use logstream::state::CheckpointState;
@@ -338,18 +338,14 @@ async fn run_group(
         None
     };
 
-    // Spawn batch processes
-    let backfill_pids = group_scheduler.spawn_all_backfill(cfg.backfill_days).await;
-    let heal_pids = group_scheduler.spawn_all_heal(env_cfg.heal_days).await;
-
     let counts = group_scheduler.process_counts().await;
     info!(
         log_group = %cfg.log_group,
         daemons = 1 + reconcile_pid.is_some() as usize + full_history_pid.is_some() as usize + conflict_pid.is_some() as usize,
-        backfill_batches = backfill_pids.len(),
-        heal_batches = heal_pids.len(),
+        backfill_days = cfg.backfill_days,
+        heal_days = env_cfg.heal_days,
         ready = counts.ready,
-        "run_group: all processes spawned"
+        "run_group: daemons spawned, batch work will be demand-driven"
     );
 
     // Execute conflict daemon
@@ -409,19 +405,17 @@ async fn run_group(
         None
     };
 
-    // Execute heal batch
-    let heal_handle = if !heal_pids.is_empty() {
+    // Execute heal batch (demand-driven spawning)
+    let heal_handle = if env_cfg.heal_days > 0 {
         let cfg_for_heal = cfg.clone();
         let aws_cfg_for_heal = aws_cfg.clone();
         let sender_factory_for_heal = sender_factory.clone();
-        let heal_scheduler = group_scheduler.scheduler().clone();
         Some(tokio::spawn(async move {
-            run_heal_with_scheduler(
+            run_heal_days(
                 cfg_for_heal,
                 aws_cfg_for_heal,
                 sender_factory_for_heal,
-                heal_scheduler,
-                heal_pids,
+                env_cfg.heal_days,
                 buffer_caps,
             )
             .await

@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
 use crate::event_router::EventSenderFactory;
-use crate::process::{priority_for_day_offset, Priority, ProcessScheduler, Resources, WorkerPool};
+use crate::process::{GroupScheduler, Priority, Resources, WorkerPool};
 use crate::state::CheckpointState;
 use crate::types::LogEvent;
 
@@ -87,8 +87,12 @@ impl BackfillStats {
     }
 }
 
-/// OS-style process scheduler for backfill.
-/// Uses nice values, aging, and multi-level feedback queue.
+/// OS-style process scheduler for backfill with demand-driven spawning.
+///
+/// Like Linux's process management:
+/// - Only keeps max_ready processes in the ready queue (like RLIMIT_NPROC)
+/// - Spawns new processes as workers complete work (like fork after wait)
+/// - Prioritizes recent days over older days (like nice values)
 pub async fn run_backfill_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
@@ -99,40 +103,37 @@ pub async fn run_backfill_days(
         return Ok(BackfillStats::default());
     }
 
-    // Create OS-style process scheduler
+    // Create OS-style process scheduler with group scheduler
     let resources = Resources {
         cw_api_quota: 100,
         es_bulk_capacity: buffer_caps.backfill_raw,
         memory_quota: buffer_caps.backfill_raw * 10,
     };
-    let scheduler = ProcessScheduler::new(resources, BACKFILL_CONCURRENCY, 100);
+    let group_scheduler =
+        GroupScheduler::new(cfg.log_group.clone(), resources, BACKFILL_CONCURRENCY);
+
+    // Create demand-driven work queue (Linux-style RLIMIT_NPROC)
+    // Only spawns max_ready processes at a time, spawning more as workers complete
+    let work_queue = Arc::new(group_scheduler.create_backfill_queue(cfg.backfill_days));
 
     tracing::info!(
-        "backfill scheduler: {} days for {} (concurrency={}, time_quantum=100ms)",
+        "backfill scheduler: {} days for {} (concurrency={}, max_ready={})",
         cfg.backfill_days,
         cfg.log_group,
-        BACKFILL_CONCURRENCY
+        BACKFILL_CONCURRENCY,
+        BACKFILL_CONCURRENCY * 2
     );
 
-    // Spawn all day processes with priorities
-    for day_offset in 0..cfg.backfill_days {
-        let priority = priority_for_day_offset(day_offset);
-        scheduler
-            .spawn(
-                format!("{}/day-{}", cfg.log_group, day_offset),
-                day_offset,
-                priority,
-            )
-            .await;
-    }
-
+    // Start the queue - spawns initial batch of processes (like init)
+    let initial_pids = work_queue.start().await;
     tracing::info!(
-        "backfill: spawned {} processes (ready queue)",
-        cfg.backfill_days
+        "backfill: spawned {} initial processes (demand-driven, {} pending)",
+        initial_pids.len(),
+        work_queue.pending_count().await
     );
 
     // Create worker pool with OS thread mapping
-    let worker_pool = WorkerPool::new(scheduler.clone(), BACKFILL_CONCURRENCY);
+    let worker_pool = WorkerPool::new(group_scheduler.scheduler().clone(), BACKFILL_CONCURRENCY);
     tracing::info!(
         "backfill: worker pool with {} workers (optimal={})",
         worker_pool.num_workers(),
@@ -144,8 +145,9 @@ pub async fn run_backfill_days(
     let aws_cfg_arc = Arc::new(aws_cfg.clone());
     let sender_factory_arc = Arc::new(sender_factory.clone());
 
-    // Spawn workers with task factory
-    let worker_handles = worker_pool.spawn_workers({
+    // Spawn workers with demand-driven task factory
+    // Workers complete() on the queue, which spawns the next pending work
+    let worker_handles = worker_pool.spawn_workers(work_queue.clone(), {
         let cfg = cfg_arc.clone();
         let aws_cfg = aws_cfg_arc.clone();
         let sender_factory = sender_factory_arc.clone();
@@ -185,7 +187,7 @@ pub async fn run_backfill_days(
     }
 
     // Log final stats
-    let counts = scheduler.process_counts().await;
+    let counts = group_scheduler.process_counts().await;
     tracing::info!(
         "backfill complete: {} events in {:?} ({:.2} eps), {} processes terminated",
         stats.total_events,

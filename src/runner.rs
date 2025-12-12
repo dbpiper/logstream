@@ -16,7 +16,7 @@ use crate::enrich::enrich_event;
 use crate::es_conflicts::EsConflictResolver;
 use crate::es_counts::EsCounter;
 use crate::event_router::{EventSender, EventSenderFactory};
-use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources};
+use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources, WorkerPool};
 use crate::reconcile;
 use crate::state::CheckpointState;
 use crate::types::LogEvent;
@@ -192,27 +192,6 @@ pub async fn spawn_daemon_processes(
     }
 }
 
-/// Spawn batch process IDs.
-pub struct SpawnedBatches {
-    pub backfill_pids: Vec<u64>,
-    pub heal_pids: Vec<u64>,
-}
-
-/// Spawn all batch processes.
-pub async fn spawn_batch_processes(
-    group_scheduler: &GroupScheduler,
-    backfill_days: u32,
-    heal_days: u32,
-) -> SpawnedBatches {
-    let backfill_pids = group_scheduler.spawn_all_backfill(backfill_days).await;
-    let heal_pids = group_scheduler.spawn_all_heal(heal_days).await;
-
-    SpawnedBatches {
-        backfill_pids,
-        heal_pids,
-    }
-}
-
 // ============================================================================
 // Daemon Execution
 // ============================================================================
@@ -330,76 +309,145 @@ pub async fn execute_full_history_daemon(
 // Heal Execution
 // ============================================================================
 
-/// Execute heal days using the process scheduler.
-pub async fn run_heal_with_scheduler(
+/// Heal concurrency - same as backfill for simplicity.
+const HEAL_CONCURRENCY: usize = 4;
+
+/// Execute heal days with demand-driven spawning (Linux-style).
+///
+/// Like run_backfill_days, this uses a BatchWorkQueue to only spawn
+/// max_ready processes at a time, avoiding memory exhaustion.
+pub async fn run_heal_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
-    scheduler: Arc<ProcessScheduler>,
-    pids: Vec<u64>,
+    heal_days: u32,
     buffer_caps: BufferCapacities,
 ) {
-    if pids.is_empty() {
+    if heal_days == 0 {
         return;
     }
 
-    let tailer =
-        match create_tailer_for_reconcile(&cfg, cfg.checkpoint_path.clone(), &aws_cfg).await {
-            Ok(t) => t,
-            Err(err) => {
-                tracing::error!("heal: failed to create tailer: {err:?}");
-                return;
-            }
-        };
+    // Create group scheduler for heal
+    let resources = Resources {
+        cw_api_quota: 50,
+        es_bulk_capacity: buffer_caps.heal_raw,
+        memory_quota: buffer_caps.heal_raw * 5,
+    };
+    let group_scheduler = GroupScheduler::new(cfg.log_group.clone(), resources, HEAL_CONCURRENCY);
 
+    // Create demand-driven work queue
+    let work_queue = Arc::new(group_scheduler.create_heal_queue(heal_days));
+
+    tracing::info!(
+        "heal scheduler: {} days for {} (concurrency={}, max_ready={})",
+        heal_days,
+        cfg.log_group,
+        HEAL_CONCURRENCY,
+        HEAL_CONCURRENCY * 2
+    );
+
+    // Start the queue
+    let initial_pids = work_queue.start().await;
+    tracing::info!(
+        "heal: spawned {} initial processes (demand-driven, {} pending)",
+        initial_pids.len(),
+        work_queue.pending_count().await
+    );
+
+    // Create worker pool
+    let worker_pool = WorkerPool::new(group_scheduler.scheduler().clone(), HEAL_CONCURRENCY);
+
+    // Create shared context
+    let cfg_arc = Arc::new(cfg.clone());
+    let aws_cfg_arc = Arc::new(aws_cfg.clone());
+    let sender_factory_arc = Arc::new(sender_factory.clone());
+
+    // Spawn workers with demand-driven factory
+    let worker_handles = worker_pool.spawn_workers(work_queue.clone(), {
+        let cfg = cfg_arc.clone();
+        let aws_cfg = aws_cfg_arc.clone();
+        let sender_factory = sender_factory_arc.clone();
+        move |_pid, info| {
+            let cfg = cfg.clone();
+            let aws_cfg = aws_cfg.clone();
+            let sender_factory = sender_factory.clone();
+            async move {
+                execute_heal_day(
+                    &cfg,
+                    &aws_cfg,
+                    &sender_factory,
+                    buffer_caps,
+                    info.day_offset,
+                )
+                .await
+            }
+        }
+    });
+
+    // Wait for all workers
+    for handle in worker_handles {
+        let _ = handle.await;
+    }
+
+    let counts = group_scheduler.process_counts().await;
+    tracing::info!(
+        "heal complete: {} processes terminated for {}",
+        counts.terminated,
+        cfg.log_group
+    );
+}
+
+/// Execute heal for a single day.
+async fn execute_heal_day(
+    cfg: &Config,
+    aws_cfg: &aws_config::SdkConfig,
+    sender_factory: &EventSenderFactory,
+    buffer_caps: BufferCapacities,
+    day_offset: u32,
+) -> usize {
+    let tailer = match create_tailer_for_reconcile(cfg, cfg.checkpoint_path.clone(), aws_cfg).await
+    {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::error!("heal day {}: failed to create tailer: {err:?}", day_offset);
+            return 0;
+        }
+    };
+
+    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(day_offset as i64);
+    let start = day
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_else(|| (chrono::Utc::now() - chrono::Duration::days(365)).naive_utc());
+    let end = day
+        .and_hms_opt(23, 59, 59)
+        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+
+    let start_ms = start.and_utc().timestamp_millis();
+    let end_ms = end.and_utc().timestamp_millis();
+
+    let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.heal_raw);
     let sink_tx = sender_factory.at(Priority::IDLE);
 
-    for pid in pids {
-        let info = match scheduler.get_process(pid).await {
-            Some(i) => i,
-            None => continue,
-        };
-
-        let day_offset = info.day_offset;
-        let day = chrono::Utc::now().date_naive() - chrono::Duration::days(day_offset as i64);
-        let start = day
-            .and_hms_opt(0, 0, 0)
-            .unwrap_or_else(|| (chrono::Utc::now() - chrono::Duration::days(365)).naive_utc());
-        let end = day
-            .and_hms_opt(23, 59, 59)
-            .unwrap_or_else(|| chrono::Utc::now().naive_utc());
-
-        let start_ms = start.and_utc().timestamp_millis();
-        let end_ms = end.and_utc().timestamp_millis();
-
-        let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.heal_raw);
-        let sink_clone = sink_tx.clone();
-
-        let consumer = tokio::spawn(async move {
-            let mut sent = 0usize;
-            while let Some(raw) = raw_rx.recv().await {
-                if let Some(enriched) = enrich_event(raw, None) {
-                    if sink_clone.send(enriched).await.is_err() {
-                        break;
-                    }
-                    sent += 1;
+    let consumer = tokio::spawn(async move {
+        let mut sent = 0usize;
+        while let Some(raw) = raw_rx.recv().await {
+            if let Some(enriched) = enrich_event(raw, None) {
+                if sink_tx.send(enriched).await.is_err() {
+                    break;
                 }
+                sent += 1;
             }
-            sent
-        });
-
-        let fetch_start = std::time::Instant::now();
-        match tailer.fetch_range(start_ms, end_ms, &raw_tx).await {
-            Ok(count) => tracing::info!("heal day offset {} replayed {} events", day_offset, count),
-            Err(err) => tracing::warn!("heal day offset {} error: {err:?}", day_offset),
         }
+        sent
+    });
 
-        drop(raw_tx);
-        let events = consumer.await.unwrap_or(0);
-        scheduler
-            .terminate(pid, events, fetch_start.elapsed())
-            .await;
+    match tailer.fetch_range(start_ms, end_ms, &raw_tx).await {
+        Ok(count) => tracing::info!("heal day offset {} replayed {} events", day_offset, count),
+        Err(err) => tracing::warn!("heal day offset {} error: {err:?}", day_offset),
     }
+
+    drop(raw_tx);
+    consumer.await.unwrap_or(0)
 }
 
 // ============================================================================

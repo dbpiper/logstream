@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 // ============================================================================
 // Priority System
@@ -197,6 +197,11 @@ impl ResourcePool {
             .max_concurrency
             .saturating_sub(self.cw_available.load(Ordering::Relaxed));
         cw_used as f64 / self.max_concurrency as f64
+    }
+
+    /// Get maximum concurrency (like Linux's RLIMIT_NPROC).
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency
     }
 }
 
@@ -401,6 +406,11 @@ impl PartialEq for SchedulerEntry {
 impl Eq for SchedulerEntry {}
 
 /// Multi-level feedback queue scheduler.
+///
+/// Uses Linux-style wakeup semantics:
+/// - `spawn()` never blocks - like `wake_up_process()` setting TIF_NEED_RESCHED
+/// - `schedule()` waits efficiently on a Notify - like sleeping on a wait queue
+/// - Multiple wakeups are coalesced - like the need_resched flag
 pub struct ProcessScheduler {
     /// Next PID to assign.
     next_pid: AtomicU64,
@@ -412,23 +422,20 @@ pub struct ProcessScheduler {
     resources: Arc<ResourcePool>,
     /// Time quantum for round-robin (ms).
     time_quantum_ms: u64,
-    /// Channel to notify scheduler of new processes.
-    notify_tx: mpsc::Sender<u64>,
-    /// Channel to receive notifications.
-    notify_rx: Mutex<mpsc::Receiver<u64>>,
+    /// Wakeup signal for scheduler (like Linux's TIF_NEED_RESCHED).
+    /// Never blocks on signal, multiple signals coalesce.
+    wakeup: Notify,
 }
 
 impl ProcessScheduler {
     pub fn new(resources: Resources, max_concurrency: usize, time_quantum_ms: u64) -> Arc<Self> {
-        let (notify_tx, notify_rx) = mpsc::channel(1000);
         Arc::new(Self {
             next_pid: AtomicU64::new(1),
             processes: RwLock::new(std::collections::HashMap::new()),
             ready_queue: Mutex::new(BinaryHeap::new()),
             resources: Arc::new(ResourcePool::new(resources, max_concurrency)),
             time_quantum_ms,
-            notify_tx,
-            notify_rx: Mutex::new(notify_rx),
+            wakeup: Notify::new(),
         })
     }
 
@@ -459,7 +466,9 @@ impl ProcessScheduler {
             });
         }
 
-        let _ = self.notify_tx.send(pid).await;
+        // Linux-style wakeup: notify_one() never blocks, just sets the
+        // "need_resched" equivalent. Multiple calls coalesce into one wakeup.
+        self.wakeup.notify_one();
         pid
     }
 
@@ -490,14 +499,21 @@ impl ProcessScheduler {
             });
         }
 
-        let _ = self.notify_tx.send(pid).await;
+        // Linux-style wakeup: notify_one() never blocks, just sets the
+        // "need_resched" equivalent. Multiple calls coalesce into one wakeup.
+        self.wakeup.notify_one();
         pid
     }
 
     /// Get the next process to run (blocks until one is available).
+    ///
+    /// Uses Linux-style wait queue semantics:
+    /// - First checks if work is available (like checking TIF_NEED_RESCHED)
+    /// - If not, sleeps on the wakeup signal (like sleeping on a wait queue)
+    /// - Wakes up when any process is spawned or unblocked
     pub async fn schedule(&self) -> Option<u64> {
         loop {
-            // Try to get from ready queue
+            // Try to get from ready queue (like checking need_resched)
             {
                 let mut queue = self.ready_queue.lock().await;
                 if let Some(entry) = queue.pop() {
@@ -514,9 +530,9 @@ impl ProcessScheduler {
                 }
             }
 
-            // Wait for notification of new process
-            let mut rx = self.notify_rx.lock().await;
-            rx.recv().await?;
+            // Sleep on wait queue until woken by spawn/unblock
+            // Like Linux's schedule() sleeping when no runnable tasks
+            self.wakeup.notified().await;
         }
     }
 
@@ -539,6 +555,9 @@ impl ProcessScheduler {
     }
 
     /// Unblock a process and return to ready queue.
+    ///
+    /// Like Linux's `wake_up_process()` - moves process to runnable state
+    /// and signals the scheduler.
     pub async fn unblock(&self, pid: u64) {
         let effective_priority;
         {
@@ -551,12 +570,16 @@ impl ProcessScheduler {
             }
         }
 
-        let mut queue = self.ready_queue.lock().await;
-        queue.push(SchedulerEntry {
-            effective_priority,
-            pid,
-        });
-        let _ = self.notify_tx.send(pid).await;
+        {
+            let mut queue = self.ready_queue.lock().await;
+            queue.push(SchedulerEntry {
+                effective_priority,
+                pid,
+            });
+        }
+
+        // Linux-style wakeup
+        self.wakeup.notify_one();
     }
 
     /// Get process info.
@@ -599,6 +622,11 @@ impl ProcessScheduler {
     /// Get resource pool.
     pub fn resources(&self) -> &Arc<ResourcePool> {
         &self.resources
+    }
+
+    /// Get maximum concurrency (like Linux's RLIMIT_NPROC).
+    pub fn max_concurrency(&self) -> usize {
+        self.resources.max_concurrency()
     }
 
     /// Get time quantum.
@@ -696,84 +724,6 @@ impl WorkerPool {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Spawn workers that execute scheduled processes.
-    /// Each worker runs on its own OS thread via spawn_blocking for CPU-bound work.
-    /// Returns handles to all worker tasks.
-    pub fn spawn_workers<F, Fut>(
-        &self,
-        task_factory: F,
-    ) -> Vec<tokio::task::JoinHandle<WorkerStats>>
-    where
-        F: Fn(u64, ProcessInfo) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = usize> + Send + 'static,
-    {
-        let mut handles = Vec::with_capacity(self.num_workers);
-
-        for worker_id in 0..self.num_workers {
-            let sched = self.scheduler.clone();
-            let shutdown = self.shutdown.clone();
-            let factory = task_factory.clone();
-
-            handles.push(tokio::spawn(async move {
-                let mut stats = WorkerStats {
-                    worker_id,
-                    processes_completed: 0,
-                    total_events: 0,
-                    total_cpu_time: Duration::ZERO,
-                };
-
-                loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    // Schedule next process with timeout
-                    let pid = match tokio::time::timeout(Duration::from_secs(5), sched.schedule())
-                        .await
-                    {
-                        Ok(Some(pid)) => pid,
-                        Ok(None) => break,
-                        Err(_) => {
-                            if shutdown.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-
-                    let info = match sched.get_process(pid).await {
-                        Some(info) => info,
-                        None => continue,
-                    };
-
-                    // Execute the task
-                    let started = Instant::now();
-                    let events = factory(pid, info.clone()).await;
-                    let cpu_time = started.elapsed();
-
-                    // Record completion
-                    sched.terminate(pid, events, cpu_time).await;
-
-                    stats.processes_completed += 1;
-                    stats.total_events += events;
-                    stats.total_cpu_time += cpu_time;
-
-                    tracing::debug!(
-                        "worker-{}: pid={} completed events={} cpu={:?}",
-                        worker_id,
-                        pid,
-                        events,
-                        cpu_time
-                    );
-                }
-
-                stats
-            }));
-        }
-
-        handles
-    }
-
     /// Run CPU-bound work on a dedicated OS thread.
     /// This uses tokio's spawn_blocking to run on a real OS thread.
     pub async fn run_cpu_bound<F, R>(f: F) -> R
@@ -791,6 +741,104 @@ impl WorkerPool {
         std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4)
+    }
+
+    /// Spawn workers with demand-driven spawning (Linux-style).
+    ///
+    /// Uses a BatchWorkQueue to only keep max_ready processes in the ready
+    /// queue at a time, spawning more as workers complete work.
+    ///
+    /// This mimics Linux's process management where:
+    /// - RLIMIT_NPROC limits concurrent processes
+    /// - New processes are only created when slots are available
+    /// - fork() fails with EAGAIN when at limit
+    pub fn spawn_workers<F, Fut>(
+        &self,
+        work_queue: Arc<BatchWorkQueue>,
+        task_factory: F,
+    ) -> Vec<tokio::task::JoinHandle<WorkerStats>>
+    where
+        F: Fn(u64, ProcessInfo) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = usize> + Send + 'static,
+    {
+        let mut handles = Vec::with_capacity(self.num_workers);
+
+        for worker_id in 0..self.num_workers {
+            let sched = self.scheduler.clone();
+            let shutdown = self.shutdown.clone();
+            let factory = task_factory.clone();
+            let queue = work_queue.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut stats = WorkerStats {
+                    worker_id,
+                    processes_completed: 0,
+                    total_events: 0,
+                    total_cpu_time: Duration::ZERO,
+                };
+
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    // Check if all work is complete
+                    if queue.is_complete() {
+                        break;
+                    }
+
+                    // Schedule next process with timeout
+                    let pid = match tokio::time::timeout(Duration::from_secs(5), sched.schedule())
+                        .await
+                    {
+                        Ok(Some(pid)) => pid,
+                        Ok(None) => break,
+                        Err(_) => {
+                            // Timeout - check if work is complete
+                            if queue.is_complete() || shutdown.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    let info = match sched.get_process(pid).await {
+                        Some(info) => info,
+                        None => continue,
+                    };
+
+                    // Execute the task
+                    let started = Instant::now();
+                    let events = factory(pid, info.clone()).await;
+                    let cpu_time = started.elapsed();
+
+                    // Record completion in scheduler
+                    sched.terminate(pid, events, cpu_time).await;
+
+                    // Demand-driven: complete() spawns next pending work
+                    // This is the key Linux-style behavior - completing a process
+                    // frees a slot and allows the next pending work to be spawned
+                    queue.complete(pid).await;
+
+                    stats.processes_completed += 1;
+                    stats.total_events += events;
+                    stats.total_cpu_time += cpu_time;
+
+                    tracing::debug!(
+                        "worker-{}: pid={} completed events={} cpu={:?} progress={:.1}%",
+                        worker_id,
+                        pid,
+                        events,
+                        cpu_time,
+                        queue.progress_percent()
+                    );
+                }
+
+                stats
+            }));
+        }
+
+        handles
     }
 }
 
@@ -1018,24 +1066,28 @@ impl GroupScheduler {
             .await
     }
 
-    /// Spawn all backfill processes for the given number of days.
-    pub async fn spawn_all_backfill(&self, days: u32) -> Vec<u64> {
-        let mut pids = Vec::with_capacity(days as usize);
-        for day_offset in 0..days {
-            let pid = self.spawn_backfill_day(day_offset).await;
-            pids.push(pid);
-        }
-        pids
+    /// Create a demand-driven batch work queue for backfill.
+    ///
+    /// Like Linux's process limits (RLIMIT_NPROC), this only keeps a limited
+    /// number of processes in the ready queue and spawns more as workers
+    /// complete work. This prevents memory exhaustion when processing many days.
+    pub fn create_backfill_queue(self: &Arc<Self>, total_days: u32) -> BatchWorkQueue {
+        BatchWorkQueue::new(
+            self.clone(),
+            TaskType::Backfill,
+            total_days,
+            self.scheduler.max_concurrency() * 2, // Like RLIMIT_NPROC
+        )
     }
 
-    /// Spawn all heal processes for the given number of days.
-    pub async fn spawn_all_heal(&self, days: u32) -> Vec<u64> {
-        let mut pids = Vec::with_capacity(days as usize);
-        for day_offset in 0..days {
-            let pid = self.spawn_heal_day(day_offset).await;
-            pids.push(pid);
-        }
-        pids
+    /// Create a demand-driven batch work queue for healing.
+    pub fn create_heal_queue(self: &Arc<Self>, total_days: u32) -> BatchWorkQueue {
+        BatchWorkQueue::new(
+            self.clone(),
+            TaskType::SchemaHeal,
+            total_days,
+            self.scheduler.max_concurrency() * 2,
+        )
     }
 
     /// Get process counts.
@@ -1070,5 +1122,216 @@ impl GroupScheduler {
         for pid in pids {
             self.scheduler.terminate(pid, 0, Duration::ZERO).await;
         }
+    }
+}
+
+// ============================================================================
+// Demand-Driven Batch Work Queue (Linux-style RLIMIT_NPROC)
+// ============================================================================
+
+/// Pending work item waiting to be spawned.
+#[derive(Debug, Clone)]
+struct PendingWork {
+    day_offset: u32,
+    priority: Priority,
+}
+
+/// Demand-driven batch work queue.
+///
+/// Like Linux's process limits (RLIMIT_NPROC, kernel.pid_max), this prevents
+/// spawning more processes than the system can handle. Instead of pre-spawning
+/// thousands of processes:
+///
+/// 1. Pending work is tracked in a queue (not as spawned processes)
+/// 2. Only `max_ready` processes are spawned at a time
+/// 3. When a process completes, the next pending work is spawned
+/// 4. Higher priority work is spawned first (like nice values)
+///
+/// This mimics how Linux handles fork():
+/// - fork() fails with EAGAIN if RLIMIT_NPROC is exceeded
+/// - Work must wait until a process slot is available
+pub struct BatchWorkQueue {
+    /// Group scheduler to spawn processes on.
+    group_scheduler: Arc<GroupScheduler>,
+    /// Task type for spawned processes.
+    task_type: TaskType,
+    /// Pending work items (not yet spawned).
+    pending: Mutex<std::collections::BinaryHeap<PendingWorkEntry>>,
+    /// Currently spawned PIDs.
+    spawned: Mutex<Vec<u64>>,
+    /// Maximum processes to keep in ready state (like RLIMIT_NPROC).
+    max_ready: usize,
+    /// Total work items (for progress tracking).
+    total_work: u32,
+    /// Completed work count.
+    completed: AtomicUsize,
+}
+
+/// Entry for priority queue (higher priority first).
+struct PendingWorkEntry {
+    work: PendingWork,
+}
+
+impl Ord for PendingWorkEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Higher priority value = higher priority
+        self.work.priority.cmp(&other.work.priority)
+    }
+}
+
+impl PartialOrd for PendingWorkEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PendingWorkEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.work.priority == other.work.priority
+    }
+}
+
+impl Eq for PendingWorkEntry {}
+
+impl BatchWorkQueue {
+    /// Create a new demand-driven batch work queue.
+    ///
+    /// # Arguments
+    /// * `group_scheduler` - The scheduler to spawn processes on
+    /// * `task_type` - Type of task (Backfill or SchemaHeal)
+    /// * `total_days` - Total days to process
+    /// * `max_ready` - Maximum processes to keep spawned (like RLIMIT_NPROC)
+    pub fn new(
+        group_scheduler: Arc<GroupScheduler>,
+        task_type: TaskType,
+        total_days: u32,
+        max_ready: usize,
+    ) -> Self {
+        // Build pending work queue with priorities
+        let mut pending = std::collections::BinaryHeap::new();
+        for day_offset in 0..total_days {
+            let priority = match task_type {
+                TaskType::Backfill => priority_for_day_offset(day_offset),
+                TaskType::SchemaHeal => Priority::IDLE,
+                _ => Priority::NORMAL,
+            };
+            pending.push(PendingWorkEntry {
+                work: PendingWork {
+                    day_offset,
+                    priority,
+                },
+            });
+        }
+
+        Self {
+            group_scheduler,
+            task_type,
+            pending: Mutex::new(pending),
+            spawned: Mutex::new(Vec::with_capacity(max_ready)),
+            max_ready,
+            total_work: total_days,
+            completed: AtomicUsize::new(0),
+        }
+    }
+
+    /// Get total work items.
+    pub fn total_work(&self) -> u32 {
+        self.total_work
+    }
+
+    /// Get completed work count.
+    pub fn completed(&self) -> usize {
+        self.completed.load(Ordering::SeqCst)
+    }
+
+    /// Get pending work count (not yet spawned).
+    pub async fn pending_count(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
+    /// Get spawned process count.
+    pub async fn spawned_count(&self) -> usize {
+        self.spawned.lock().await.len()
+    }
+
+    /// Check if all work is complete.
+    pub fn is_complete(&self) -> bool {
+        self.completed() >= self.total_work as usize
+    }
+
+    /// Initialize the queue by spawning initial batch of processes.
+    /// Like Linux's init process spawning initial daemons.
+    pub async fn start(&self) -> Vec<u64> {
+        let mut initial_pids = Vec::new();
+
+        // Spawn up to max_ready processes initially
+        for _ in 0..self.max_ready {
+            if let Some(pid) = self.spawn_next().await {
+                initial_pids.push(pid);
+            } else {
+                break;
+            }
+        }
+
+        initial_pids
+    }
+
+    /// Spawn the next pending work item if under the limit.
+    /// Returns None if no pending work or at capacity.
+    async fn spawn_next(&self) -> Option<u64> {
+        // Check if we're at capacity (like RLIMIT_NPROC)
+        let spawned_count = self.spawned.lock().await.len();
+        if spawned_count >= self.max_ready {
+            return None;
+        }
+
+        // Get next highest priority work
+        let work = {
+            let mut pending = self.pending.lock().await;
+            pending.pop().map(|e| e.work)
+        }?;
+
+        // Spawn the process
+        let pid = match self.task_type {
+            TaskType::Backfill => {
+                self.group_scheduler
+                    .spawn_backfill_day(work.day_offset)
+                    .await
+            }
+            TaskType::SchemaHeal => self.group_scheduler.spawn_heal_day(work.day_offset).await,
+            _ => return None,
+        };
+
+        self.spawned.lock().await.push(pid);
+        Some(pid)
+    }
+
+    /// Mark a process as complete and spawn the next pending work.
+    /// Like Linux's wait() followed by fork() pattern.
+    pub async fn complete(&self, pid: u64) -> Option<u64> {
+        // Remove from spawned list
+        {
+            let mut spawned = self.spawned.lock().await;
+            spawned.retain(|&p| p != pid);
+        }
+
+        // Increment completed count
+        self.completed.fetch_add(1, Ordering::SeqCst);
+
+        // Spawn next work item if available
+        self.spawn_next().await
+    }
+
+    /// Get all currently spawned PIDs.
+    pub async fn spawned_pids(&self) -> Vec<u64> {
+        self.spawned.lock().await.clone()
+    }
+
+    /// Progress as a percentage (0.0 to 100.0).
+    pub fn progress_percent(&self) -> f64 {
+        if self.total_work == 0 {
+            return 100.0;
+        }
+        (self.completed() as f64 / self.total_work as f64) * 100.0
     }
 }

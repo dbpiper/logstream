@@ -1028,25 +1028,39 @@ async fn test_group_scheduler_spawn_backfill_day() {
 }
 
 #[tokio::test]
-async fn test_group_scheduler_spawn_all_backfill() {
+async fn test_group_scheduler_create_backfill_queue() {
     let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
 
-    let pids = group_sched.spawn_all_backfill(10).await;
-    assert_eq!(pids.len(), 10);
+    // Create queue with 100 days but only 8 max ready (4 concurrency * 2)
+    let queue = group_sched.create_backfill_queue(100);
+
+    assert_eq!(queue.total_work(), 100);
+    assert_eq!(queue.completed(), 0);
+    assert!(!queue.is_complete());
+
+    // Start only spawns max_ready processes
+    let initial_pids = queue.start().await;
+    assert_eq!(initial_pids.len(), 8);
 
     let counts = group_sched.process_counts().await;
-    assert_eq!(counts.ready, 10);
+    assert_eq!(counts.ready, 8);
+    assert_eq!(queue.pending_count().await, 92);
 }
 
 #[tokio::test]
-async fn test_group_scheduler_spawn_all_heal() {
+async fn test_group_scheduler_create_heal_queue() {
     let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
 
-    let pids = group_sched.spawn_all_heal(5).await;
-    assert_eq!(pids.len(), 5);
+    let queue = group_sched.create_heal_queue(5);
+
+    assert_eq!(queue.total_work(), 5);
+
+    // All 5 can fit in max_ready (8)
+    let initial_pids = queue.start().await;
+    assert_eq!(initial_pids.len(), 5);
 
     // All heal processes should be IDLE priority
-    for pid in pids {
+    for pid in initial_pids {
         let info = group_sched.scheduler().get_process(pid).await.unwrap();
         assert_eq!(info.priority, Priority::IDLE);
         assert_eq!(info.task_type, TaskType::SchemaHeal);
@@ -1137,16 +1151,22 @@ async fn test_group_scheduler_shutdown_daemons() {
 async fn test_group_scheduler_mixed_workload() {
     let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 8);
 
-    // Spawn all types of processes
+    // Spawn daemon processes
     let tail_pid = group_sched.spawn_realtime_tail().await;
     let reconcile_pid = group_sched.spawn_reconcile().await;
     let full_history_pid = group_sched.spawn_full_history_reconcile().await;
     let conflict_pid = group_sched.spawn_conflict_reindex().await;
 
-    let _backfill_pids = group_sched.spawn_all_backfill(7).await;
-    let _heal_pids = group_sched.spawn_all_heal(3).await;
+    // Create demand-driven batch queues
+    let backfill_queue = group_sched.create_backfill_queue(7);
+    let heal_queue = group_sched.create_heal_queue(3);
+
+    // Start queues - only spawns up to max_ready
+    let backfill_pids = backfill_queue.start().await;
+    let heal_pids = heal_queue.start().await;
 
     // Total: 4 daemons + 7 backfill + 3 heal = 14 processes
+    // All fit in max_ready (16) so all should be spawned
     let all_processes = group_sched.list_processes().await;
     assert_eq!(all_processes.len(), 14);
 
@@ -1156,7 +1176,7 @@ async fn test_group_scheduler_mixed_workload() {
     let batches = group_sched.list_batches().await;
     assert_eq!(batches.len(), 10);
 
-    // Verify priorities are correct
+    // Verify daemon priorities are correct
     let tail_info = group_sched.scheduler().get_process(tail_pid).await.unwrap();
     assert_eq!(tail_info.priority, Priority::CRITICAL);
 
@@ -1180,6 +1200,12 @@ async fn test_group_scheduler_mixed_workload() {
         .await
         .unwrap();
     assert_eq!(conflict_info.priority, Priority::LOW);
+
+    // Verify batch queues track work correctly
+    assert_eq!(backfill_pids.len(), 7);
+    assert_eq!(heal_pids.len(), 3);
+    assert_eq!(backfill_queue.pending_count().await, 0);
+    assert_eq!(heal_queue.pending_count().await, 0);
 }
 
 #[tokio::test]
@@ -1210,4 +1236,438 @@ async fn test_group_scheduler_process_naming() {
 
     let heal_info = group_sched.scheduler().get_process(heal_pid).await.unwrap();
     assert_eq!(heal_info.name, "my-app-logs/heal-day-3");
+}
+
+// ============================================================================
+// Linux-style Wakeup Tests
+// ============================================================================
+
+/// Test that spawning many processes never blocks.
+/// This is the key fix: Linux's wake_up_process() never blocks.
+#[tokio::test]
+async fn test_spawn_never_blocks_with_many_processes() {
+    use std::time::Instant;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 8, 100);
+
+    let start = Instant::now();
+
+    // Spawn 10,000 processes - should complete nearly instantly
+    // (previously this would block after ~1000 due to channel capacity)
+    for i in 0..10000 {
+        scheduler
+            .spawn(format!("process-{}", i), i % 365, Priority::NORMAL)
+            .await;
+    }
+
+    let elapsed = start.elapsed();
+
+    // Should complete in under 5 seconds (usually < 1 second)
+    assert!(
+        elapsed.as_secs() < 5,
+        "Spawning 10,000 processes took {:?}, should be < 5s",
+        elapsed
+    );
+
+    let counts = scheduler.process_counts().await;
+    assert_eq!(counts.ready, 10000);
+}
+
+/// Test that scheduler wakes up when a process is spawned.
+#[tokio::test]
+async fn test_scheduler_wakes_on_spawn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 4, 100);
+    let scheduler_clone = scheduler.clone();
+
+    let scheduled = Arc::new(AtomicBool::new(false));
+    let scheduled_clone = scheduled.clone();
+
+    // Start scheduler waiting for work
+    let handle = tokio::spawn(async move {
+        let pid = scheduler_clone.schedule().await;
+        scheduled_clone.store(true, Ordering::SeqCst);
+        pid
+    });
+
+    // Small delay to ensure scheduler is waiting
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !scheduled.load(Ordering::SeqCst),
+        "Scheduler should be waiting"
+    );
+
+    // Spawn a process - this should wake the scheduler
+    scheduler
+        .spawn("test-process".into(), 0, Priority::NORMAL)
+        .await;
+
+    // Scheduler should complete quickly
+    let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    assert!(result.is_ok(), "Scheduler should have been woken up");
+    assert!(scheduled.load(Ordering::SeqCst));
+}
+
+/// Test that multiple spawns coalesce into efficient wakeups.
+#[tokio::test]
+async fn test_multiple_spawns_coalesce_wakeups() {
+    use std::time::Instant;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 4, 100);
+
+    // Spawn many processes rapidly
+    let start = Instant::now();
+    for i in 0..1000 {
+        scheduler
+            .spawn(format!("rapid-{}", i), 0, Priority::NORMAL)
+            .await;
+    }
+    let spawn_time = start.elapsed();
+
+    // All should be spawned quickly (coalesced wakeups, no blocking)
+    assert!(
+        spawn_time.as_millis() < 500,
+        "Rapid spawning took {:?}, expected < 500ms",
+        spawn_time
+    );
+
+    // Now consume them - all should be in ready queue
+    let mut count = 0;
+    while let Some(pid) = scheduler.schedule().await {
+        scheduler.terminate(pid, 0, Duration::ZERO).await;
+        count += 1;
+        if count >= 1000 {
+            break;
+        }
+    }
+    assert_eq!(count, 1000);
+}
+
+/// Test that unblock wakes the scheduler.
+#[tokio::test]
+async fn test_unblock_wakes_scheduler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 4, 100);
+
+    // Spawn a process and immediately block it
+    let pid = scheduler
+        .spawn("blocked-process".into(), 0, Priority::NORMAL)
+        .await;
+
+    // Schedule it to make it running, then block it
+    scheduler.schedule().await;
+    scheduler.block(pid).await;
+
+    let scheduler_clone = scheduler.clone();
+    let woken = Arc::new(AtomicBool::new(false));
+    let woken_clone = woken.clone();
+
+    // Start scheduler waiting for work
+    let handle = tokio::spawn(async move {
+        let pid = scheduler_clone.schedule().await;
+        woken_clone.store(true, Ordering::SeqCst);
+        pid
+    });
+
+    // Small delay to ensure scheduler is waiting
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!woken.load(Ordering::SeqCst), "Scheduler should be waiting");
+
+    // Unblock the process - this should wake the scheduler
+    scheduler.unblock(pid).await;
+
+    // Scheduler should complete quickly
+    let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+    assert!(
+        result.is_ok(),
+        "Scheduler should have been woken by unblock"
+    );
+    assert!(woken.load(Ordering::SeqCst));
+}
+
+/// Test spawning from multiple concurrent tasks never blocks.
+#[tokio::test]
+async fn test_concurrent_spawn_never_blocks() {
+    use std::time::Instant;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 8, 100);
+
+    let start = Instant::now();
+
+    // Spawn from 10 concurrent tasks, each spawning 1000 processes
+    let mut handles = vec![];
+    for task_id in 0..10 {
+        let scheduler = scheduler.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..1000 {
+                scheduler
+                    .spawn(
+                        format!("task-{}-proc-{}", task_id, i),
+                        i % 30,
+                        Priority::NORMAL,
+                    )
+                    .await;
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let elapsed = start.elapsed();
+
+    // Should complete quickly even with concurrent spawning
+    assert!(
+        elapsed.as_secs() < 5,
+        "Concurrent spawning of 10,000 processes took {:?}, should be < 5s",
+        elapsed
+    );
+
+    let counts = scheduler.process_counts().await;
+    assert_eq!(counts.ready, 10000);
+}
+
+/// Test that scheduler handles empty queue correctly and wakes on new work.
+#[tokio::test]
+async fn test_scheduler_empty_queue_then_spawn() {
+    use std::time::Duration;
+
+    let scheduler = ProcessScheduler::new(Resources::default(), 4, 100);
+    let scheduler_clone = scheduler.clone();
+
+    // Start multiple scheduler waiters
+    let mut handles = vec![];
+    for _ in 0..3 {
+        let s = scheduler.clone();
+        handles.push(tokio::spawn(async move { s.schedule().await }));
+    }
+
+    // Small delay to let all waiters start
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Spawn 3 processes to wake all waiters
+    for i in 0..3 {
+        scheduler_clone
+            .spawn(format!("wakeup-{}", i), 0, Priority::NORMAL)
+            .await;
+    }
+
+    // All should complete
+    for handle in handles {
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(result.is_ok(), "All schedulers should be woken");
+    }
+}
+
+// ============================================================================
+// BatchWorkQueue Tests (Linux-style RLIMIT_NPROC)
+// ============================================================================
+
+/// Test that BatchWorkQueue respects max_ready limit (like RLIMIT_NPROC).
+#[tokio::test]
+async fn test_batch_queue_respects_max_ready_limit() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+
+    // Create queue with 100 days but only 8 max ready
+    let queue = group_sched.create_backfill_queue(100);
+
+    assert_eq!(queue.total_work(), 100);
+    assert_eq!(queue.completed(), 0);
+    assert!(!queue.is_complete());
+
+    // Start should only spawn max_ready processes
+    let initial_pids = queue.start().await;
+    assert_eq!(initial_pids.len(), 8); // 4 concurrency * 2
+
+    // Spawned count should be at max_ready
+    assert_eq!(queue.spawned_count().await, 8);
+
+    // Pending should be total - spawned
+    assert_eq!(queue.pending_count().await, 92);
+}
+
+/// Test that completing a process spawns the next pending work.
+#[tokio::test]
+async fn test_batch_queue_spawns_on_complete() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+
+    let queue = group_sched.create_backfill_queue(10);
+    let initial_pids = queue.start().await;
+
+    assert_eq!(initial_pids.len(), 4); // 2 concurrency * 2
+    assert_eq!(queue.pending_count().await, 6);
+
+    // Complete first process - should spawn next
+    let new_pid = queue.complete(initial_pids[0]).await;
+    assert!(new_pid.is_some());
+
+    // Spawned count should still be at max
+    assert_eq!(queue.spawned_count().await, 4);
+
+    // Pending should decrease
+    assert_eq!(queue.pending_count().await, 5);
+
+    // Completed should increase
+    assert_eq!(queue.completed(), 1);
+}
+
+/// Test that queue correctly tracks completion.
+#[tokio::test]
+async fn test_batch_queue_tracks_completion() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+
+    let queue = group_sched.create_backfill_queue(5);
+    let initial_pids = queue.start().await;
+
+    // Complete all initial processes
+    for pid in &initial_pids {
+        queue.complete(*pid).await;
+    }
+
+    // Should have completed 4 processes
+    assert_eq!(queue.completed(), 4);
+
+    // Should have spawned 1 more (5 total - 4 initial = 1 pending)
+    // Actually after completing 4, we'd spawn 4 more if available
+    // With only 5 total and 4 initial, only 1 was pending
+}
+
+/// Test that queue completes when all work is done.
+#[tokio::test]
+async fn test_batch_queue_completes_all_work() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+
+    // Small queue that fits entirely in max_ready
+    let queue = group_sched.create_backfill_queue(3);
+    let initial_pids = queue.start().await;
+
+    assert_eq!(initial_pids.len(), 3); // Less than max_ready
+    assert_eq!(queue.pending_count().await, 0);
+
+    // Complete all
+    for pid in initial_pids {
+        queue.complete(pid).await;
+    }
+
+    assert!(queue.is_complete());
+    assert_eq!(queue.completed(), 3);
+    assert_eq!(queue.progress_percent(), 100.0);
+}
+
+/// Test that queue prioritizes higher priority work first.
+#[tokio::test]
+async fn test_batch_queue_prioritizes_work() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+
+    // Create queue with 365 days - should prioritize recent days
+    let queue = group_sched.create_backfill_queue(365);
+    let initial_pids = queue.start().await;
+
+    // Get info about spawned processes - recent days should be spawned first
+    let scheduler = group_sched.scheduler();
+    let mut day_offsets: Vec<u32> = Vec::new();
+    for pid in initial_pids {
+        if let Some(info) = scheduler.get_process(pid).await {
+            day_offsets.push(info.day_offset);
+        }
+    }
+
+    // First spawned should be day 0 (highest priority)
+    assert!(
+        day_offsets.contains(&0),
+        "Day 0 (CRITICAL) should be in first batch"
+    );
+
+    // Should have recent days, not old ones like 364
+    assert!(
+        !day_offsets.contains(&364),
+        "Old days should not be in first batch"
+    );
+}
+
+/// Test that queue handles zero work correctly.
+#[tokio::test]
+async fn test_batch_queue_handles_zero_work() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+
+    let queue = group_sched.create_backfill_queue(0);
+
+    assert_eq!(queue.total_work(), 0);
+    assert!(queue.is_complete());
+    assert_eq!(queue.progress_percent(), 100.0);
+
+    let initial_pids = queue.start().await;
+    assert!(initial_pids.is_empty());
+}
+
+/// Test that queue handles large day counts efficiently.
+#[tokio::test]
+async fn test_batch_queue_handles_large_day_counts() {
+    use std::time::Instant;
+
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 8);
+
+    let start = Instant::now();
+
+    // Create queue with 10 years of days - should be fast!
+    let queue = group_sched.create_backfill_queue(3650);
+
+    let creation_time = start.elapsed();
+
+    // Queue creation should be fast (just building pending list)
+    assert!(
+        creation_time.as_millis() < 100,
+        "Queue creation took {:?}, should be < 100ms",
+        creation_time
+    );
+
+    // Start should only spawn 16 processes (8 * 2)
+    let start_time = Instant::now();
+    let initial_pids = queue.start().await;
+    let spawn_time = start_time.elapsed();
+
+    assert_eq!(initial_pids.len(), 16);
+    assert!(
+        spawn_time.as_millis() < 100,
+        "Initial spawn took {:?}, should be < 100ms",
+        spawn_time
+    );
+
+    // Most work should still be pending
+    assert_eq!(queue.pending_count().await, 3650 - 16);
+}
+
+/// Test concurrent completion and spawning.
+#[tokio::test]
+async fn test_batch_queue_concurrent_operations() {
+    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+
+    let queue = Arc::new(group_sched.create_backfill_queue(50));
+    let initial_pids = queue.start().await;
+
+    // Complete processes concurrently from multiple tasks
+    let mut handles = vec![];
+    for pid in initial_pids {
+        let queue = queue.clone();
+        handles.push(tokio::spawn(async move {
+            queue.complete(pid).await;
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Should have completed 8 processes
+    assert_eq!(queue.completed(), 8);
+
+    // Should have spawned more to refill
+    // (actual count depends on timing, but should be reasonable)
+    let spawned = queue.spawned_count().await;
+    assert!(spawned <= 8, "Should not exceed max_ready");
 }
