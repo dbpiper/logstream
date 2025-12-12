@@ -111,7 +111,7 @@ impl AdaptiveController {
     }
 
     /// Get current latency samples (for testing).
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn latencies(&self) -> Vec<u64> {
         self.latencies.read().await.clone()
     }

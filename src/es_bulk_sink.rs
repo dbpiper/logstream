@@ -247,22 +247,55 @@ struct BulkItemResult {
     error: Option<BulkItemError>,
 }
 
-#[derive(Deserialize)]
-struct BulkItemError {
+/// Error from an individual bulk item.
+#[derive(Deserialize, Clone, Debug)]
+#[cfg_attr(any(test, feature = "testing"), derive(PartialEq, Eq))]
+pub struct BulkItemError {
     #[serde(rename = "type")]
-    error_type: String,
-    reason: String,
+    pub error_type: String,
+    pub reason: String,
 }
 
-fn is_mapping_error(error: &BulkItemError) -> bool {
-    matches!(
+/// Classification of ES bulk item failures.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FailureKind {
+    /// Mapping-related error (e.g., type conflict, dynamic mapping).
+    Mapping,
+    /// Document already exists with different version - safe to skip.
+    VersionConflict,
+    /// Transient error that can be retried (circuit breaker, timeout, etc).
+    Retryable,
+    /// Unknown or unrecoverable error.
+    Other,
+}
+
+/// Classify a bulk item error into a failure kind.
+pub fn classify_error(error: &BulkItemError) -> FailureKind {
+    let is_mapping = matches!(
         error.error_type.as_str(),
         "mapper_parsing_exception"
             | "illegal_argument_exception"
             | "strict_dynamic_mapping_exception"
     ) || error.reason.contains("mapper")
         || error.reason.contains("dynamic")
-        || error.reason.contains("type")
+        || error.reason.contains("type");
+    if is_mapping {
+        return FailureKind::Mapping;
+    }
+    if error.error_type == "version_conflict_engine_exception" {
+        return FailureKind::VersionConflict;
+    }
+    let is_retryable = matches!(
+        error.error_type.as_str(),
+        "circuit_breaker_exception"
+            | "timeout_exception"
+            | "es_rejected_execution_exception"
+            | "cluster_block_exception"
+    );
+    if is_retryable {
+        return FailureKind::Retryable;
+    }
+    FailureKind::Other
 }
 
 async fn send_bulk_tracked(
@@ -300,50 +333,133 @@ async fn send_bulk_tracked(
                     return Ok(());
                 }
 
-                let failed_indices = parse_failed_indices(&resp_body, &current_batch);
+                let failed_items = parse_failed_items(&resp_body, &current_batch);
 
-                if failed_indices.is_empty() {
+                if failed_items.is_empty() {
                     info!("es bulk sent batch={} status=200 OK", current_batch.len());
                     return Ok(());
                 }
 
-                let (mapping_failures, other_failures): (Vec<_>, Vec<_>) = failed_indices
-                    .into_iter()
-                    .partition(|(_, is_mapping)| *is_mapping);
+                let mut mapping_indices: HashSet<usize> = HashSet::new();
+                let mut retryable_indices: HashSet<usize> = HashSet::new();
+                let mut version_conflict_count = 0usize;
+                let mut other_count = 0usize;
 
-                if !other_failures.is_empty() {
-                    warn!(
-                        "es bulk has {} non-mapping failures (attempt {})",
-                        other_failures.len(),
-                        attempt
+                for item in &failed_items {
+                    match item.kind {
+                        FailureKind::Mapping => {
+                            mapping_indices.insert(item.index);
+                        }
+                        FailureKind::VersionConflict => {
+                            version_conflict_count += 1;
+                        }
+                        FailureKind::Retryable => {
+                            retryable_indices.insert(item.index);
+                            warn!(
+                                "es bulk retryable failure: type={} reason={}",
+                                item.error_type,
+                                &item.reason[..item.reason.len().min(200)]
+                            );
+                        }
+                        FailureKind::Other => {
+                            other_count += 1;
+                            warn!(
+                                "es bulk unknown failure: type={} reason={}",
+                                item.error_type,
+                                &item.reason[..item.reason.len().min(200)]
+                            );
+                        }
+                    }
+                }
+
+                if version_conflict_count > 0 {
+                    info!(
+                        "es bulk: {} version conflicts (already indexed, skipping)",
+                        version_conflict_count
                     );
                 }
 
-                if mapping_failures.is_empty() {
-                    info!(
-                        "es bulk sent batch={} (with {} other failures)",
-                        current_batch.len(),
+                let mut other_failures: Vec<(usize, String, String)> = Vec::new();
+                for item in &failed_items {
+                    if item.kind == FailureKind::Other {
+                        other_failures.push((
+                            item.index,
+                            item.error_type.clone(),
+                            item.reason.clone(),
+                        ));
+                    }
+                }
+
+                if !other_failures.is_empty() && attempt == 5 {
+                    warn!(
+                        "es bulk: {} docs with unrecoverable errors, ingesting as raw with error info",
                         other_failures.len()
+                    );
+                    let fallback_docs: Vec<EnrichedEvent> = other_failures
+                        .iter()
+                        .filter_map(|(idx, err_type, reason)| {
+                            current_batch
+                                .get(*idx)
+                                .map(|ev| create_fallback_event(ev, err_type, reason))
+                        })
+                        .collect();
+
+                    if !fallback_docs.is_empty() {
+                        let fallback_body = build_bulk_body(&fallback_docs, index_prefix).ok();
+                        if let Some(body) = fallback_body {
+                            let _ = client
+                                .post(&url)
+                                .basic_auth(user, Some(pass))
+                                .header("Content-Type", "application/x-ndjson")
+                                .body(body)
+                                .send()
+                                .await;
+                            info!(
+                                "es bulk: ingested {} fallback docs with raw message",
+                                fallback_docs.len()
+                            );
+                        }
+                    }
+                }
+
+                let needs_retry = !mapping_indices.is_empty() || !retryable_indices.is_empty();
+                if !needs_retry {
+                    info!(
+                        "es bulk sent batch={} (version_conflicts={} other={})",
+                        current_batch.len(),
+                        version_conflict_count,
+                        other_count
                     );
                     return Ok(());
                 }
 
-                let failed_ids: HashSet<usize> =
-                    mapping_failures.iter().map(|(idx, _)| *idx).collect();
+                if !mapping_indices.is_empty() {
+                    warn!(
+                        "es bulk mapping failures: {} docs, re-normalizing (attempt {})",
+                        mapping_indices.len(),
+                        attempt
+                    );
+                }
 
-                warn!(
-                    "es bulk mapping failures: {} docs, re-normalizing (attempt {})",
-                    failed_ids.len(),
-                    attempt
-                );
+                if !retryable_indices.is_empty() {
+                    warn!(
+                        "es bulk retryable failures: {} docs, will retry (attempt {})",
+                        retryable_indices.len(),
+                        attempt
+                    );
+                }
 
+                let retry_indices: HashSet<usize> =
+                    mapping_indices.union(&retryable_indices).copied().collect();
                 current_batch = current_batch
                     .into_iter()
                     .enumerate()
                     .filter_map(|(i, mut ev)| {
-                        if failed_ids.contains(&i) {
-                            if let Some(ref mut parsed) = ev.parsed {
-                                normalize_for_es(parsed);
+                        if retry_indices.contains(&i) {
+                            if mapping_indices.contains(&i) {
+                                if let Some(ref mut parsed) = ev.parsed {
+                                    normalize_for_es(parsed);
+                                }
                             }
                             Some(ev)
                         } else {
@@ -420,7 +536,56 @@ fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str) -> Result<String
     Ok(body)
 }
 
-fn parse_failed_indices(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<(usize, bool)> {
+/// Create a fallback event with raw message and error info when ES ingestion fails.
+pub fn create_fallback_event(
+    original: &EnrichedEvent,
+    error_type: &str,
+    error_reason: &str,
+) -> EnrichedEvent {
+    let mut fallback_parsed = serde_json::json!({
+        "_ingestion_error": {
+            "type": error_type,
+            "reason": error_reason.chars().take(500).collect::<String>(),
+            "original_message_preview": original.message.as_str()
+                .map(|s| s.chars().take(1000).collect::<String>())
+                .unwrap_or_else(|| original.message.to_string().chars().take(1000).collect()),
+        }
+    });
+
+    if let Some(ref parsed) = original.parsed {
+        if let Some(event) = parsed.get("event") {
+            fallback_parsed["event"] = event.clone();
+        }
+        if let Some(level) = parsed.get("level") {
+            fallback_parsed["level"] = level.clone();
+        }
+        if let Some(service) = parsed.get("service_name") {
+            fallback_parsed["service_name"] = service.clone();
+        }
+    }
+
+    EnrichedEvent {
+        timestamp: original.timestamp.clone(),
+        event: original.event.clone(),
+        message: original.message.clone(),
+        parsed: Some(fallback_parsed),
+        target_index: original.target_index.clone(),
+        tags: {
+            let mut tags = original.tags.clone();
+            tags.push("ingestion_error".to_string());
+            tags
+        },
+    }
+}
+
+struct FailedItem {
+    index: usize,
+    kind: FailureKind,
+    error_type: String,
+    reason: String,
+}
+
+fn parse_failed_items(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<FailedItem> {
     let parsed: Result<BulkResponse, _> = serde_json::from_str(resp_body);
     let Ok(bulk_resp) = parsed else {
         return Vec::new();
@@ -437,9 +602,25 @@ fn parse_failed_indices(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<(usize,
         .filter_map(|(i, item)| {
             let result = item.index?;
             if result.status >= 400 {
-                let is_mapping = result.error.as_ref().map(is_mapping_error).unwrap_or(false);
                 if i < batch.len() {
-                    Some((i, is_mapping))
+                    let (kind, error_type, reason) = match result.error {
+                        Some(ref err) => (
+                            classify_error(err),
+                            err.error_type.clone(),
+                            err.reason.clone(),
+                        ),
+                        None => (
+                            FailureKind::Other,
+                            "unknown".to_string(),
+                            "no error details".to_string(),
+                        ),
+                    };
+                    Some(FailedItem {
+                        index: i,
+                        kind,
+                        error_type,
+                        reason,
+                    })
                 } else {
                     None
                 }
