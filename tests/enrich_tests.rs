@@ -101,14 +101,14 @@ fn test_enrich_strips_carriage_return() {
 
 #[test]
 fn test_sanitize_key_alphanumeric() {
-    assert_eq!(sanitize_key("validKey123"), "validKey123");
+    assert_eq!(sanitize_key("validKey123"), "validkey123");
 }
 
 #[test]
 fn test_sanitize_key_with_special_chars() {
     assert_eq!(sanitize_key("key.with.dots"), "key_with_dots");
     assert_eq!(sanitize_key("key-with-dashes"), "key_with_dashes");
-    assert_eq!(sanitize_key("key@special#chars!"), "key_special_chars_");
+    assert_eq!(sanitize_key("key@special#chars!"), "key_special_chars");
 }
 
 #[test]
@@ -126,7 +126,7 @@ fn test_normalize_large_numbers_to_strings() {
 
     let enriched = enrich_event(raw, None).unwrap();
     let parsed = enriched.parsed.unwrap();
-    assert!(parsed["bigNum"].is_string());
+    assert!(parsed["bignum"].is_string());
 }
 
 #[test]
@@ -182,4 +182,99 @@ fn test_enrich_invalid_json() {
     let enriched = enrich_event(raw, None).unwrap();
     assert!(enriched.parsed.is_none());
     assert!(enriched.tags.contains(&"json_failure".to_string()));
+}
+
+#[test]
+fn test_reserved_field_sanitized() {
+    let raw = LogEvent {
+        id: "reserved".to_string(),
+        timestamp_ms: 1733900000000,
+        message: r#"{"_id": "user-id", "_source": "custom"}"#.to_string(),
+    };
+
+    let enriched = enrich_event(raw, None).unwrap();
+    let parsed = enriched.parsed.unwrap();
+    let obj = parsed.as_object().unwrap();
+    assert!(obj.contains_key("id") || obj.contains_key("field_id"));
+    assert!(obj.contains_key("source") || obj.contains_key("field_source"));
+}
+
+#[test]
+fn test_heterogeneous_array_flattened() {
+    let raw = LogEvent {
+        id: "hetero".to_string(),
+        timestamp_ms: 1733900000000,
+        message: r#"{"mixed": [1, "two", {"three": 3}]}"#.to_string(),
+    };
+
+    let enriched = enrich_event(raw, None).unwrap();
+    let parsed = enriched.parsed.unwrap();
+    let arr = parsed["mixed"].as_array().unwrap();
+    assert!(arr.iter().all(|v| v.is_string()));
+}
+
+#[test]
+fn test_deep_nesting_flattened() {
+    let mut msg = String::from("{");
+    for i in 0..25 {
+        msg.push_str(&format!("\"level{}\": {{", i));
+    }
+    msg.push_str("\"deep\": \"value\"");
+    for _ in 0..25 {
+        msg.push('}');
+    }
+    msg.push('}');
+
+    let raw = LogEvent {
+        id: "deep".to_string(),
+        timestamp_ms: 1733900000000,
+        message: msg,
+    };
+
+    let enriched = enrich_event(raw, None).unwrap();
+    assert!(enriched.parsed.is_some());
+}
+
+#[test]
+fn test_type_conflict_field_stringified() {
+    let raw = LogEvent {
+        id: "conflict".to_string(),
+        timestamp_ms: 1733900000000,
+        message: r#"{"id": {"nested": "object"}, "status": [1, 2, 3]}"#.to_string(),
+    };
+
+    let enriched = enrich_event(raw, None).unwrap();
+    let parsed = enriched.parsed.unwrap();
+    assert!(parsed["id"].is_string());
+    assert!(parsed["status"].is_string());
+}
+
+#[test]
+fn test_sanitize_key_leading_digit() {
+    assert_eq!(sanitize_key("123abc"), "field_123abc");
+}
+
+#[test]
+fn test_sanitize_key_empty() {
+    assert_eq!(sanitize_key("..."), "field_");
+}
+
+#[test]
+fn test_normalize_nan_becomes_null() {
+    use logstream::enrich::normalize_for_es;
+    use serde_json::json;
+
+    let mut val = json!({"num": f64::NAN});
+    normalize_for_es(&mut val);
+    assert!(val["num"].is_null());
+}
+
+#[test]
+fn test_normalize_infinity_becomes_null() {
+    use logstream::enrich::normalize_for_es;
+    use serde_json::json;
+
+    let mut val = json!({"num": f64::INFINITY});
+    normalize_for_es(&mut val);
+    assert!(val["num"].is_null());
 }

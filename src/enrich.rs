@@ -5,7 +5,10 @@ use tracing::warn;
 
 use crate::types::{EnrichedEvent, EventMeta};
 
-/// Enrich raw log event with timestamp and optional JSON parsing.
+const MAX_FIELD_NAME_LEN: usize = 256;
+const MAX_STRING_VALUE_LEN: usize = 32000;
+const MAX_ARRAY_LEN: usize = 1000;
+
 pub fn enrich_event(
     raw: crate::types::LogEvent,
     target_index: Option<String>,
@@ -18,17 +21,14 @@ pub fn enrich_event(
         format!("logs-{}", date)
     });
 
-    // Normalize message
     let mut message_str = raw.message.replace('\r', "");
     message_str = message_str.trim().to_string();
     if message_str.is_empty() {
         return None;
     }
 
-    // Keep original as string for ES text mapping
     let message = Value::String(message_str.clone());
 
-    // Best-effort parse and normalize into JSON; keep alongside original string
     let (parsed, mut tags) = match try_parse_and_normalize(&message_str) {
         Ok(Some(val)) => (Some(val), vec!["json_parsed".into()]),
         Ok(None) => (None, vec!["not_json_message".into()]),
@@ -38,7 +38,6 @@ pub fn enrich_event(
         }
     };
 
-    // Always include sync tags
     tags.push("sync".into());
     tags.push("synced".into());
 
@@ -52,11 +51,14 @@ pub fn enrich_event(
     })
 }
 
+pub fn normalize_for_es(value: &mut Value) {
+    normalize_value(value, 0);
+}
+
 fn try_parse_and_normalize(s: &str) -> Result<Option<Value>> {
     if s.is_empty() {
         return Ok(None);
     }
-    // Quick check for likely JSON object/array
     let trimmed = s.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return Ok(None);
@@ -67,11 +69,14 @@ fn try_parse_and_normalize(s: &str) -> Result<Option<Value>> {
 }
 
 fn normalize_value(v: &mut Value, depth: usize) {
-    const MAX_DEPTH: usize = 50;
+    const MAX_DEPTH: usize = 20;
     const INT_MAX: i64 = 2_147_483_647;
+
     if depth > MAX_DEPTH {
+        *v = flatten_to_string(v);
         return;
     }
+
     match v {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
@@ -80,39 +85,153 @@ fn normalize_value(v: &mut Value, depth: usize) {
                     if child.is_null() {
                         continue;
                     }
+
                     let clean_key = sanitize_key(&k);
-                    normalize_value(&mut child, depth + 1);
-                    map.insert(clean_key, child);
+                    if clean_key.is_empty() || clean_key.len() > MAX_FIELD_NAME_LEN {
+                        continue;
+                    }
+
+                    if is_reserved_field(&clean_key) {
+                        let renamed = format!("_user_{}", clean_key);
+                        normalize_value(&mut child, depth + 1);
+                        map.insert(renamed, child);
+                    } else if has_type_conflict(&child, &clean_key) {
+                        let stringified = flatten_to_string(&child);
+                        map.insert(clean_key, stringified);
+                    } else {
+                        normalize_value(&mut child, depth + 1);
+                        map.insert(clean_key, child);
+                    }
                 }
             }
         }
         Value::Array(arr) => {
             arr.retain(|x| !x.is_null());
-            for child in arr.iter_mut() {
-                normalize_value(child, depth + 1);
+            if arr.len() > MAX_ARRAY_LEN {
+                arr.truncate(MAX_ARRAY_LEN);
+            }
+            if !is_homogeneous_array(arr) {
+                *v = flatten_array_to_strings(arr);
+            } else {
+                for child in arr.iter_mut() {
+                    normalize_value(child, depth + 1);
+                }
             }
         }
         Value::Number(num) => {
             if let Some(f) = num.as_f64() {
-                *v = Value::String(f.to_string());
+                if f.is_nan() || f.is_infinite() {
+                    *v = Value::Null;
+                } else {
+                    *v = Value::String(f.to_string());
+                }
             } else if let Some(i) = num.as_i64() {
                 if i.abs() > INT_MAX {
                     *v = Value::String(i.to_string());
                 }
             }
         }
+        Value::String(s) => {
+            if s.len() > MAX_STRING_VALUE_LEN {
+                s.truncate(MAX_STRING_VALUE_LEN);
+                s.push_str("...[truncated]");
+            }
+        }
         _ => {}
     }
 }
 
+fn is_reserved_field(key: &str) -> bool {
+    matches!(
+        key,
+        "_id"
+            | "_index"
+            | "_type"
+            | "_source"
+            | "_score"
+            | "_routing"
+            | "_version"
+            | "_seq_no"
+            | "_primary_term"
+    )
+}
+
+fn has_type_conflict(value: &Value, key: &str) -> bool {
+    let problematic_keys = [
+        "id", "type", "status", "code", "version", "count", "size", "time", "duration",
+    ];
+    if !problematic_keys.contains(&key) {
+        return false;
+    }
+    matches!(value, Value::Object(_) | Value::Array(_))
+}
+
+fn is_homogeneous_array(arr: &[Value]) -> bool {
+    if arr.is_empty() {
+        return true;
+    }
+    let first_type = value_type(&arr[0]);
+    arr.iter().all(|v| value_type(v) == first_type)
+}
+
+fn value_type(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => 2,
+        Value::String(_) => 3,
+        Value::Array(_) => 4,
+        Value::Object(_) => 5,
+    }
+}
+
+fn flatten_to_string(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(s.clone()),
+        Value::Null => Value::Null,
+        _ => Value::String(v.to_string()),
+    }
+}
+
+fn flatten_array_to_strings(arr: &[Value]) -> Value {
+    let strings: Vec<Value> = arr.iter().map(flatten_to_string).collect();
+    Value::Array(strings)
+}
+
 pub fn sanitize_key(k: &str) -> String {
-    let mut out = String::with_capacity(k.len());
-    for ch in k.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else {
+    let mut out = String::with_capacity(k.len().min(MAX_FIELD_NAME_LEN));
+    let mut last_was_underscore = false;
+
+    for ch in k.chars().take(MAX_FIELD_NAME_LEN) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(if ch.is_ascii_uppercase() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            });
+            last_was_underscore = false;
+        } else if !last_was_underscore && !out.is_empty() {
             out.push('_');
+            last_was_underscore = true;
         }
     }
-    out
+
+    while out.ends_with('_') {
+        out.pop();
+    }
+    while out.starts_with('_') {
+        out.remove(0);
+    }
+
+    if out.is_empty()
+        || out
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    {
+        format!("field_{}", out)
+    } else {
+        out
+    }
 }

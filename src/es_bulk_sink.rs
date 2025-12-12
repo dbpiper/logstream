@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,11 +6,13 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
+use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adaptive::AdaptiveController;
+use crate::enrich::normalize_for_es;
 use crate::stress::{StressConfig, StressLevel, StressTracker};
 use crate::types::EnrichedEvent;
 
@@ -226,7 +229,42 @@ async fn send_bulk_adaptive_tracked(
     }
 }
 
-/// Send bulk with tracked recovery (uses new circuit breaker detection).
+#[derive(Deserialize)]
+struct BulkResponse {
+    errors: bool,
+    items: Vec<BulkItemResponse>,
+}
+
+#[derive(Deserialize)]
+struct BulkItemResponse {
+    index: Option<BulkItemResult>,
+}
+
+#[derive(Deserialize)]
+struct BulkItemResult {
+    #[serde(default)]
+    status: u16,
+    error: Option<BulkItemError>,
+}
+
+#[derive(Deserialize)]
+struct BulkItemError {
+    #[serde(rename = "type")]
+    error_type: String,
+    reason: String,
+}
+
+fn is_mapping_error(error: &BulkItemError) -> bool {
+    matches!(
+        error.error_type.as_str(),
+        "mapper_parsing_exception"
+            | "illegal_argument_exception"
+            | "strict_dynamic_mapping_exception"
+    ) || error.reason.contains("mapper")
+        || error.reason.contains("dynamic")
+        || error.reason.contains("type")
+}
+
 async fn send_bulk_tracked(
     client: &Client,
     base_url: &str,
@@ -239,27 +277,17 @@ async fn send_bulk_tracked(
         return Ok(());
     }
 
-    let mut body = String::with_capacity(batch.len() * 256);
-    for ev in batch {
-        let id = ev.event.id.clone();
-        let idx = resolve_index(ev, index_prefix);
-        body.push_str("{\"index\":{\"_index\":\"");
-        body.push_str(&idx);
-        body.push_str("\",\"_id\":\"");
-        body.push_str(&id);
-        body.push_str("\"}}\n");
-        body.push_str(&serde_json::to_string(&ev)?);
-        body.push('\n');
-    }
-
     let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
+    let mut current_batch: Vec<EnrichedEvent> = batch.to_vec();
 
-    for attempt in 1..=20u64 {
+    for attempt in 1..=5u64 {
+        let body = build_bulk_body(&current_batch, index_prefix)?;
+
         let send_result = client
             .post(&url)
             .basic_auth(user, Some(pass))
             .header("Content-Type", "application/x-ndjson")
-            .body(body.clone())
+            .body(body)
             .send()
             .await;
 
@@ -267,26 +295,68 @@ async fn send_bulk_tracked(
             Ok(resp) if resp.status().is_success() => {
                 let resp_body = resp.text().await.unwrap_or_default();
 
-                // Only warn if there are actual failures (status >= 400)
-                // ES sets "errors":true for version conflicts (updates) which are normal
-                if resp_body.contains("\"errors\":true") {
-                    let has_real_errors = resp_body.contains("\"status\":4")
-                        || resp_body.contains("\"status\":5")
-                        || resp_body.contains("\"failed\":1");
-
-                    if has_real_errors {
-                        warn!(
-                            "es bulk has item failures: {}",
-                            &resp_body[..resp_body.len().min(500)]
-                        );
-                    } else {
-                        // Version conflicts/updates are normal during backfill - just debug log
-                        tracing::debug!("es bulk has updates (not errors): {} items", batch.len());
-                    }
+                if !resp_body.contains("\"errors\":true") {
+                    info!("es bulk sent batch={} status=200 OK", current_batch.len());
+                    return Ok(());
                 }
 
-                info!("es bulk sent batch={} status=200 OK", batch.len());
-                return Ok(());
+                let failed_indices = parse_failed_indices(&resp_body, &current_batch);
+
+                if failed_indices.is_empty() {
+                    info!("es bulk sent batch={} status=200 OK", current_batch.len());
+                    return Ok(());
+                }
+
+                let (mapping_failures, other_failures): (Vec<_>, Vec<_>) = failed_indices
+                    .into_iter()
+                    .partition(|(_, is_mapping)| *is_mapping);
+
+                if !other_failures.is_empty() {
+                    warn!(
+                        "es bulk has {} non-mapping failures (attempt {})",
+                        other_failures.len(),
+                        attempt
+                    );
+                }
+
+                if mapping_failures.is_empty() {
+                    info!(
+                        "es bulk sent batch={} (with {} other failures)",
+                        current_batch.len(),
+                        other_failures.len()
+                    );
+                    return Ok(());
+                }
+
+                let failed_ids: HashSet<usize> =
+                    mapping_failures.iter().map(|(idx, _)| *idx).collect();
+
+                warn!(
+                    "es bulk mapping failures: {} docs, re-normalizing (attempt {})",
+                    failed_ids.len(),
+                    attempt
+                );
+
+                current_batch = current_batch
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, mut ev)| {
+                        if failed_ids.contains(&i) {
+                            if let Some(ref mut parsed) = ev.parsed {
+                                normalize_for_es(parsed);
+                            }
+                            Some(ev)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if current_batch.is_empty() {
+                    return Ok(());
+                }
+
+                continue;
             }
 
             Ok(resp) => {
@@ -305,16 +375,79 @@ async fn send_bulk_tracked(
             }
         }
 
-        if attempt >= 20 {
-            anyhow::bail!("es bulk failed after 20 retries");
-        }
-
-        // Exponential backoff
         let backoff = Duration::from_millis(500 * attempt.min(10));
         sleep(backoff).await;
     }
 
+    if !current_batch.is_empty() {
+        warn!(
+            "es bulk: {} docs failed after retries, stringifying all parsed fields",
+            current_batch.len()
+        );
+        for ev in &mut current_batch {
+            ev.parsed = ev
+                .parsed
+                .take()
+                .map(|v| serde_json::Value::String(v.to_string()));
+        }
+
+        let body = build_bulk_body(&current_batch, index_prefix)?;
+        let _ = client
+            .post(&url)
+            .basic_auth(user, Some(pass))
+            .header("Content-Type", "application/x-ndjson")
+            .body(body)
+            .send()
+            .await;
+    }
+
     Ok(())
+}
+
+fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str) -> Result<String> {
+    let mut body = String::with_capacity(batch.len() * 256);
+    for ev in batch {
+        let id = &ev.event.id;
+        let idx = resolve_index(ev, index_prefix);
+        body.push_str("{\"index\":{\"_index\":\"");
+        body.push_str(&idx);
+        body.push_str("\",\"_id\":\"");
+        body.push_str(id);
+        body.push_str("\"}}\n");
+        body.push_str(&serde_json::to_string(&ev)?);
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+fn parse_failed_indices(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<(usize, bool)> {
+    let parsed: Result<BulkResponse, _> = serde_json::from_str(resp_body);
+    let Ok(bulk_resp) = parsed else {
+        return Vec::new();
+    };
+
+    if !bulk_resp.errors {
+        return Vec::new();
+    }
+
+    bulk_resp
+        .items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let result = item.index?;
+            if result.status >= 400 {
+                let is_mapping = result.error.as_ref().map(is_mapping_error).unwrap_or(false);
+                if i < batch.len() {
+                    Some((i, is_mapping))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
