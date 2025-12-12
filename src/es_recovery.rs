@@ -15,7 +15,6 @@ const SHARD_LIMIT_THRESHOLD: usize = 900;
 const DISK_WATERMARK_PERCENT: f64 = 85.0;
 const HEAP_PRESSURE_PERCENT: f64 = 85.0;
 const PENDING_TASKS_THRESHOLD: usize = 100;
-const UNASSIGNED_SHARDS_THRESHOLD: usize = 10;
 
 #[derive(Debug, Deserialize)]
 struct IndexInfo {
@@ -26,7 +25,7 @@ struct IndexInfo {
 struct ClusterHealth {
     status: String,
     active_shards: usize,
-    unassigned_shards: usize,
+    unassigned_primary_shards: usize,
     number_of_pending_tasks: usize,
 }
 
@@ -115,11 +114,11 @@ pub async fn check_and_recover(
             }
         }
 
-        // Unassigned shards - allocation issues
-        if health.unassigned_shards > UNASSIGNED_SHARDS_THRESHOLD {
+        // Unassigned PRIMARY shards - data loss risk (ignore replica shards in single-node)
+        if health.unassigned_primary_shards > 0 {
             warn!(
-                "recovery: {} unassigned shards, triggering reroute",
-                health.unassigned_shards
+                "recovery: {} unassigned PRIMARY shards, triggering reroute",
+                health.unassigned_primary_shards
             );
             let _ = trigger_reroute(client, base_url, user, pass).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -461,12 +460,10 @@ mod tests {
         let disk_pct = DISK_WATERMARK_PERCENT;
         let heap_pct = HEAP_PRESSURE_PERCENT;
         let pending = PENDING_TASKS_THRESHOLD;
-        let unassigned = UNASSIGNED_SHARDS_THRESHOLD;
 
         assert!(shard_limit < 1000 && shard_limit > 500);
         assert!(disk_pct > 50.0 && disk_pct < 100.0);
         assert!(heap_pct > 50.0 && heap_pct < 100.0);
         assert!(pending > 10);
-        assert!(unassigned > 0);
     }
 }
