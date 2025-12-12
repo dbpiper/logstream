@@ -10,13 +10,12 @@ use logstream::buffer::{
 use logstream::config::Config;
 use std::path::PathBuf;
 
-/// Create a test config with specified batch_size and max_in_flight.
 fn test_config(batch_size: usize, max_in_flight: usize) -> Config {
     Config {
-        log_group: "test-group".to_string(),
+        log_group: "test-group".into(),
         log_groups: vec![],
-        region: "us-east-1".to_string(),
-        index_prefix: "logs".to_string(),
+        region: "us-east-1".into(),
+        index_prefix: "logs".into(),
         batch_size,
         max_in_flight,
         poll_interval_secs: 5,

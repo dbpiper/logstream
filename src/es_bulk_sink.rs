@@ -1,4 +1,5 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -14,18 +15,18 @@ use crate::types::EnrichedEvent;
 
 #[derive(Clone, Debug)]
 pub struct EsBulkConfig {
-    pub url: String,
-    pub user: String,
-    pub pass: String,
-    pub batch_size: usize, // min batch
+    pub url: Arc<str>,
+    pub user: Arc<str>,
+    pub pass: Arc<str>,
+    pub batch_size: usize,
     pub max_batch_size: usize,
     pub timeout: Duration,
     pub gzip: bool,
-    pub index_prefix: String,
+    pub index_prefix: Arc<str>,
 }
 
 pub struct EsBulkSink {
-    cfg: EsBulkConfig,
+    cfg: Arc<EsBulkConfig>,
     client: Client,
     stress_tracker: Arc<StressTracker>,
 }
@@ -38,18 +39,16 @@ impl EsBulkSink {
             .gzip(cfg.gzip)
             .build()?;
         Ok(Self {
-            cfg,
+            cfg: Arc::new(cfg),
             client,
             stress_tracker: Arc::new(StressTracker::with_config(StressConfig::ES)),
         })
     }
 
-    /// Get the stress tracker for external monitoring.
     pub fn stress_tracker(&self) -> Arc<StressTracker> {
         self.stress_tracker.clone()
     }
 
-    /// Start with event router and adaptive rate control.
     pub fn start_adaptive(
         &self,
         mut event_router: crate::event_router::EventRouter,

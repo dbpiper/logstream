@@ -935,7 +935,7 @@ fn test_task_type_equality() {
 
 #[tokio::test]
 async fn test_group_scheduler_creation() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     assert_eq!(group_sched.log_group(), "test-log-group");
     let counts = group_sched.process_counts().await;
@@ -945,7 +945,7 @@ async fn test_group_scheduler_creation() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_realtime_tail() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let pid = group_sched.spawn_realtime_tail().await;
     assert!(pid > 0);
@@ -958,7 +958,7 @@ async fn test_group_scheduler_spawn_realtime_tail() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_reconcile() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let pid = group_sched.spawn_reconcile().await;
 
@@ -970,7 +970,7 @@ async fn test_group_scheduler_spawn_reconcile() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_full_history_reconcile() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let pid = group_sched.spawn_full_history_reconcile().await;
 
@@ -982,7 +982,7 @@ async fn test_group_scheduler_spawn_full_history_reconcile() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_conflict_reindex() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let pid = group_sched.spawn_conflict_reindex().await;
 
@@ -994,7 +994,7 @@ async fn test_group_scheduler_spawn_conflict_reindex() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_heal_day() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let pid = group_sched.spawn_heal_day(5).await;
 
@@ -1007,7 +1007,7 @@ async fn test_group_scheduler_spawn_heal_day() {
 
 #[tokio::test]
 async fn test_group_scheduler_spawn_backfill_day() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     // Day 0 should have REALTIME priority
     let pid0 = group_sched.spawn_backfill_day(0).await;
@@ -1029,7 +1029,7 @@ async fn test_group_scheduler_spawn_backfill_day() {
 
 #[tokio::test]
 async fn test_group_scheduler_create_backfill_queue() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     // Create queue with 100 days but only 8 max ready (4 concurrency * 2)
     let queue = group_sched.create_backfill_queue(100);
@@ -1049,7 +1049,7 @@ async fn test_group_scheduler_create_backfill_queue() {
 
 #[tokio::test]
 async fn test_group_scheduler_create_heal_queue() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     let queue = group_sched.create_heal_queue(5);
 
@@ -1069,7 +1069,7 @@ async fn test_group_scheduler_create_heal_queue() {
 
 #[tokio::test]
 async fn test_group_scheduler_list_daemons() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     // Spawn daemons
     group_sched.spawn_realtime_tail().await;
@@ -1090,7 +1090,7 @@ async fn test_group_scheduler_list_daemons() {
 
 #[tokio::test]
 async fn test_group_scheduler_list_batches() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     // Spawn daemons
     group_sched.spawn_realtime_tail().await;
@@ -1110,7 +1110,7 @@ async fn test_group_scheduler_list_batches() {
 
 #[tokio::test]
 async fn test_group_scheduler_shutdown_daemons() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 4);
 
     // Spawn daemons
     let tail_pid = group_sched.spawn_realtime_tail().await;
@@ -1149,7 +1149,7 @@ async fn test_group_scheduler_shutdown_daemons() {
 
 #[tokio::test]
 async fn test_group_scheduler_mixed_workload() {
-    let group_sched = GroupScheduler::new("test-log-group".to_string(), Resources::default(), 8);
+    let group_sched = GroupScheduler::new("test-log-group".into(), Resources::default(), 8);
 
     // Spawn daemon processes
     let tail_pid = group_sched.spawn_realtime_tail().await;
@@ -1210,7 +1210,7 @@ async fn test_group_scheduler_mixed_workload() {
 
 #[tokio::test]
 async fn test_group_scheduler_process_naming() {
-    let group_sched = GroupScheduler::new("my-app-logs".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("my-app-logs".into(), Resources::default(), 4);
 
     let tail_pid = group_sched.spawn_realtime_tail().await;
     let reconcile_pid = group_sched.spawn_reconcile().await;
@@ -1471,7 +1471,7 @@ async fn test_scheduler_empty_queue_then_spawn() {
 /// Test that BatchWorkQueue respects max_ready limit (like RLIMIT_NPROC).
 #[tokio::test]
 async fn test_batch_queue_respects_max_ready_limit() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 4);
 
     // Create queue with 100 days but only 8 max ready
     let queue = group_sched.create_backfill_queue(100);
@@ -1494,7 +1494,7 @@ async fn test_batch_queue_respects_max_ready_limit() {
 /// Test that completing a process spawns the next pending work.
 #[tokio::test]
 async fn test_batch_queue_spawns_on_complete() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 2);
 
     let queue = group_sched.create_backfill_queue(10);
     let initial_pids = queue.start().await;
@@ -1519,7 +1519,7 @@ async fn test_batch_queue_spawns_on_complete() {
 /// Test that queue correctly tracks completion.
 #[tokio::test]
 async fn test_batch_queue_tracks_completion() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 2);
 
     let queue = group_sched.create_backfill_queue(5);
     let initial_pids = queue.start().await;
@@ -1540,7 +1540,7 @@ async fn test_batch_queue_tracks_completion() {
 /// Test that queue completes when all work is done.
 #[tokio::test]
 async fn test_batch_queue_completes_all_work() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 2);
 
     // Small queue that fits entirely in max_ready
     let queue = group_sched.create_backfill_queue(3);
@@ -1562,7 +1562,7 @@ async fn test_batch_queue_completes_all_work() {
 /// Test that queue prioritizes higher priority work first.
 #[tokio::test]
 async fn test_batch_queue_prioritizes_work() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 2);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 2);
 
     // Create queue with 365 days - should prioritize recent days
     let queue = group_sched.create_backfill_queue(365);
@@ -1593,7 +1593,7 @@ async fn test_batch_queue_prioritizes_work() {
 /// Test that queue handles zero work correctly.
 #[tokio::test]
 async fn test_batch_queue_handles_zero_work() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 4);
 
     let queue = group_sched.create_backfill_queue(0);
 
@@ -1610,7 +1610,7 @@ async fn test_batch_queue_handles_zero_work() {
 async fn test_batch_queue_handles_large_day_counts() {
     use std::time::Instant;
 
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 8);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 8);
 
     let start = Instant::now();
 
@@ -1645,7 +1645,7 @@ async fn test_batch_queue_handles_large_day_counts() {
 /// Test concurrent completion and spawning.
 #[tokio::test]
 async fn test_batch_queue_concurrent_operations() {
-    let group_sched = GroupScheduler::new("test-group".to_string(), Resources::default(), 4);
+    let group_sched = GroupScheduler::new("test-group".into(), Resources::default(), 4);
 
     let queue = Arc::new(group_sched.create_backfill_queue(50));
     let initial_pids = queue.start().await;

@@ -13,7 +13,7 @@ use crate::types::LogEvent;
 
 #[derive(Clone, Debug)]
 pub struct TailConfig {
-    pub log_group: String,
+    pub log_group: Arc<str>,
     pub poll_interval: Duration,
     pub backoff_base: Duration,
     pub backoff_max: Duration,
@@ -98,20 +98,23 @@ impl CloudWatchTailer {
         let mut latest_ts = start_time;
 
         loop {
-            let mut req = self
-                .client
-                .filter_log_events()
-                .log_group_name(&self.cfg.log_group)
-                .start_time(start_time)
-                .limit(10_000);
-
-            if let Some(token) = &next_token {
-                req = req.next_token(token);
-            }
-
-            let resp = send_with_backoff(req, &self.stress_tracker)
-                .await
-                .context("filter_log_events")?;
+            let resp = send_with_backoff(
+                || {
+                    let mut req = self
+                        .client
+                        .filter_log_events()
+                        .log_group_name(&*self.cfg.log_group)
+                        .start_time(start_time)
+                        .limit(10_000);
+                    if let Some(token) = &next_token {
+                        req = req.next_token(token);
+                    }
+                    req
+                },
+                &self.stress_tracker,
+            )
+            .await
+            .context("filter_log_events")?;
 
             if let Some(events) = resp.events {
                 for e in events {
@@ -177,20 +180,20 @@ impl CloudWatchTailer {
                 let mut next_token: Option<String> = None;
                 let mut sent: usize = 0;
                 loop {
-                    let mut req = client
-                        .filter_log_events()
-                        .log_group_name(&log_group)
-                        .start_time(cs)
-                        .end_time(ce)
-                        .limit(10_000);
-                    if let Some(t) = &next_token {
-                        req = req.next_token(t);
-                    }
                     let resp = {
                         let mut attempt = 0u32;
                         loop {
                             attempt += 1;
-                            match req.clone().send().await {
+                            let mut req = client
+                                .filter_log_events()
+                                .log_group_name(&*log_group)
+                                .start_time(cs)
+                                .end_time(ce)
+                                .limit(10_000);
+                            if let Some(t) = &next_token {
+                                req = req.next_token(t);
+                            }
+                            match req.send().await {
                                 Ok(r) => {
                                     tracker.record_success();
                                     break Ok(r);
@@ -280,19 +283,24 @@ impl CloudWatchTailer {
         let mut first = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut req = self
-                .client
-                .filter_log_events()
-                .log_group_name(&self.cfg.log_group)
-                .start_time(start_ms)
-                .end_time(end_ms)
-                .limit(10_000);
-            if let Some(t) = &next_token {
-                req = req.next_token(t);
-            }
-            let resp = send_with_backoff(req, &self.stress_tracker)
-                .await
-                .context("filter_log_events sample first")?;
+            let resp = send_with_backoff(
+                || {
+                    let mut req = self
+                        .client
+                        .filter_log_events()
+                        .log_group_name(&*self.cfg.log_group)
+                        .start_time(start_ms)
+                        .end_time(end_ms)
+                        .limit(10_000);
+                    if let Some(t) = &next_token {
+                        req = req.next_token(t);
+                    }
+                    req
+                },
+                &self.stress_tracker,
+            )
+            .await
+            .context("filter_log_events sample first")?;
             if let Some(events) = resp.events {
                 for e in events {
                     if let (Some(id), Some(_ts)) = (e.event_id, e.timestamp) {
@@ -317,19 +325,24 @@ impl CloudWatchTailer {
         let mut last = Vec::new();
         let mut next_tail: Option<String> = None;
         loop {
-            let mut req = self
-                .client
-                .filter_log_events()
-                .log_group_name(&self.cfg.log_group)
-                .start_time(start_ms)
-                .end_time(end_ms)
-                .limit(10_000);
-            if let Some(t) = &next_tail {
-                req = req.next_token(t);
-            }
-            let resp = send_with_backoff(req, &self.stress_tracker)
-                .await
-                .context("filter_log_events sample last")?;
+            let resp = send_with_backoff(
+                || {
+                    let mut req = self
+                        .client
+                        .filter_log_events()
+                        .log_group_name(&*self.cfg.log_group)
+                        .start_time(start_ms)
+                        .end_time(end_ms)
+                        .limit(10_000);
+                    if let Some(t) = &next_tail {
+                        req = req.next_token(t);
+                    }
+                    req
+                },
+                &self.stress_tracker,
+            )
+            .await
+            .context("filter_log_events sample last")?;
             if let Some(events) = resp.events {
                 for e in events {
                     if let (Some(id), Some(_ts)) = (e.event_id, e.timestamp) {
@@ -357,19 +370,24 @@ impl CloudWatchTailer {
         let mut ids = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut req = self
-                .client
-                .filter_log_events()
-                .log_group_name(&self.cfg.log_group)
-                .start_time(start_ms)
-                .end_time(end_ms)
-                .limit(10_000);
-            if let Some(t) = &next_token {
-                req = req.next_token(t);
-            }
-            let resp = send_with_backoff(req, &self.stress_tracker)
-                .await
-                .context("filter_log_events sample window")?;
+            let resp = send_with_backoff(
+                || {
+                    let mut req = self
+                        .client
+                        .filter_log_events()
+                        .log_group_name(&*self.cfg.log_group)
+                        .start_time(start_ms)
+                        .end_time(end_ms)
+                        .limit(10_000);
+                    if let Some(t) = &next_token {
+                        req = req.next_token(t);
+                    }
+                    req
+                },
+                &self.stress_tracker,
+            )
+            .await
+            .context("filter_log_events sample window")?;
             if let Some(events) = resp.events {
                 for e in events {
                     if let (Some(id), Some(_ts)) = (e.event_id, e.timestamp) {
@@ -396,14 +414,17 @@ fn current_time_ms() -> i64 {
     now.as_millis() as i64
 }
 
-async fn send_with_backoff(
-    req: aws_sdk_cloudwatchlogs::operation::filter_log_events::builders::FilterLogEventsFluentBuilder,
+async fn send_with_backoff<F>(
+    build_req: F,
     stress_tracker: &StressTracker,
-) -> Result<aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsOutput> {
+) -> Result<aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsOutput>
+where
+    F: Fn() -> aws_sdk_cloudwatchlogs::operation::filter_log_events::builders::FilterLogEventsFluentBuilder,
+{
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match req.clone().send().await {
+        match build_req().send().await {
             Ok(resp) => {
                 stress_tracker.record_success();
                 return Ok(resp);

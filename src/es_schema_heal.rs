@@ -1,36 +1,37 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::time::Duration;
 use tracing::{info, warn};
 
-/// Detects and fixes Elasticsearch mapping drift using sampling-based binary search.
 #[derive(Clone)]
 pub struct SchemaHealer {
     client: Client,
-    base_url: String,
-    user: String,
-    pass: String,
+    base_url: Arc<str>,
+    user: Arc<str>,
+    pass: Arc<str>,
     timeout: Duration,
-    index_prefix: String,
+    index_prefix: Arc<str>,
 }
 
 impl SchemaHealer {
     pub fn new(
-        base_url: String,
-        user: String,
-        pass: String,
+        base_url: impl Into<Arc<str>>,
+        user: impl Into<Arc<str>>,
+        pass: impl Into<Arc<str>>,
         timeout: Duration,
-        index_prefix: String,
+        index_prefix: impl Into<Arc<str>>,
     ) -> Result<Self> {
         let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
             client,
-            base_url,
-            user,
-            pass,
+            base_url: base_url.into(),
+            user: user.into(),
+            pass: pass.into(),
             timeout,
-            index_prefix,
+            index_prefix: index_prefix.into(),
         })
     }
 

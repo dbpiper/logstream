@@ -5,16 +5,18 @@ use tokio::sync::Semaphore;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tracing::{info, warn};
 
+use std::sync::Arc;
+
 use crate::{
     cw_counts::CwCounter, cw_tail::CloudWatchTailer, enrich::enrich_event, es_counts::EsCounter,
-    event_router::EventSender, types::LogEvent,
+    event_router::EventSender, seasonal_stats::SeasonalStats, stress::StressTracker,
+    types::LogEvent,
 };
 
 const FULL_RESYNC_THRESHOLD_PCT: u64 = 5;
 const ES_STARTUP_WAIT_SECS: u64 = 30;
 const ES_STARTUP_MAX_ATTEMPTS: u32 = 20;
 const MAX_PARALLEL_DAYS: usize = 2;
-const FEASIBILITY_THRESHOLD_PCT: u64 = 10;
 
 #[derive(Clone)]
 pub struct ReconcileContext {
@@ -22,6 +24,8 @@ pub struct ReconcileContext {
     pub sink_tx: EventSender,
     pub es_counter: EsCounter,
     pub cw_counter: CwCounter,
+    pub cw_stress: Arc<StressTracker>,
+    pub seasonal_stats: Arc<SeasonalStats>,
 }
 
 #[derive(Clone, Copy)]
@@ -218,12 +222,6 @@ async fn almost_sure_sync(
 async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, buffer_cap: usize) {
     info!("reconcile safe_replace start={} end={}", start_ms, end_ms);
 
-    let es_count = ctx
-        .es_counter
-        .count_range(start_ms, end_ms)
-        .await
-        .unwrap_or(0);
-
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<LogEvent>(buffer_cap);
 
     let collector = tokio::spawn(async move {
@@ -258,10 +256,10 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
 
     let cw_count = events.len() as u64;
 
-    if !is_cw_response_feasible(ctx, start_ms, end_ms, es_count, cw_count).await {
+    if !is_cw_response_feasible(ctx, start_ms, end_ms, cw_count) {
         info!(
-            "reconcile CW response not feasible (cw={}, es={}), preserving ES for {}-{}",
-            cw_count, es_count, start_ms, end_ms
+            "reconcile CW response not feasible (cw={}), preserving data for {}-{}",
+            cw_count, start_ms, end_ms
         );
         return;
     }
@@ -288,61 +286,49 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     );
 }
 
-async fn is_cw_response_feasible(
+fn is_cw_response_feasible(
     ctx: &ReconcileContext,
     start_ms: i64,
     end_ms: i64,
-    es_count: u64,
     cw_count: u64,
 ) -> bool {
-    if cw_count > 0 && es_count == 0 {
-        return true;
-    }
-
-    if cw_count == 0 && es_count == 0 {
-        return true;
-    }
-
-    if cw_count == 0 && es_count > 0 {
-        return false;
-    }
-
     let range_ms = end_ms - start_ms;
-    let neighbor_range = range_ms;
+    let result = ctx
+        .seasonal_stats
+        .is_feasible(start_ms, range_ms, cw_count, &ctx.cw_stress);
 
-    let before_start = start_ms - neighbor_range;
-    let after_end = end_ms + neighbor_range;
-
-    let before_count = ctx
-        .cw_counter
-        .count_range(before_start, start_ms)
-        .await
-        .unwrap_or(0);
-    let after_count = ctx
-        .cw_counter
-        .count_range(end_ms, after_end)
-        .await
-        .unwrap_or(0);
-
-    let neighbor_total = before_count + after_count;
-
-    if neighbor_total == 0 {
-        return cw_count > 0 || es_count == 0;
+    match &result {
+        crate::seasonal_stats::FeasibilityResult::NoHistory => {
+            if cw_count > 0 || !ctx.cw_stress.is_stressed() {
+                ctx.seasonal_stats.record_verified(start_ms, cw_count);
+            }
+            true
+        }
+        crate::seasonal_stats::FeasibilityResult::Feasible {
+            expected,
+            stddev,
+            sigma_used,
+        } => {
+            info!(
+                "reconcile feasible: cw={} expected={:.0}±{:.0} ({}σ) for {}-{}",
+                cw_count, expected, stddev, sigma_used, start_ms, end_ms
+            );
+            ctx.seasonal_stats.record_verified(start_ms, cw_count);
+            true
+        }
+        crate::seasonal_stats::FeasibilityResult::Suspicious {
+            expected,
+            stddev,
+            deviation,
+            sigma_used,
+        } => {
+            warn!(
+                "reconcile suspicious: cw={} expected={:.0}±{:.0} dev={:.0} ({}σ) for {}-{}",
+                cw_count, expected, stddev, deviation, sigma_used, start_ms, end_ms
+            );
+            false
+        }
     }
-
-    let expected = neighbor_total / 2;
-    let threshold = (expected * FEASIBILITY_THRESHOLD_PCT) / 100;
-    let min_expected = threshold.max(1);
-
-    if cw_count < min_expected && es_count > cw_count * 2 {
-        warn!(
-            "reconcile feasibility check failed: cw={} < min_expected={} (neighbors={}, es={})",
-            cw_count, min_expected, neighbor_total, es_count
-        );
-        return false;
-    }
-
-    true
 }
 
 async fn process_day(

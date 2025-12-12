@@ -209,97 +209,106 @@ async fn test_fetch_then_replace_pattern_complete() {
     assert!(!es_preserved.load(Ordering::SeqCst));
 }
 
-fn is_feasible(cw_count: u64, es_count: u64, neighbor_total: u64) -> bool {
-    const FEASIBILITY_THRESHOLD_PCT: u64 = 10;
+use logstream::seasonal_stats::{FeasibilityResult, SeasonalStats};
+use logstream::stress::{StressConfig, StressTracker};
 
-    if cw_count > 0 && es_count == 0 {
-        return true;
+fn make_tracker_at_level(level: logstream::stress::StressLevel) -> StressTracker {
+    let tracker = StressTracker::with_config(StressConfig::CLOUDWATCH);
+    match level {
+        logstream::stress::StressLevel::Normal => {}
+        logstream::stress::StressLevel::Elevated => {
+            for _ in 0..5 {
+                tracker.record_failure();
+            }
+        }
+        logstream::stress::StressLevel::Critical => {
+            for _ in 0..15 {
+                tracker.record_failure();
+            }
+        }
     }
-    if cw_count == 0 && es_count == 0 {
-        return true;
+    tracker
+}
+
+#[test]
+fn test_seasonal_no_history_allows_data() {
+    let stats = SeasonalStats::new();
+    let tracker = make_tracker_at_level(logstream::stress::StressLevel::Normal);
+    let result = stats.is_feasible(1700000000000, 3_600_000, 100, &tracker);
+    assert!(result.is_feasible());
+}
+
+#[test]
+fn test_seasonal_learns_from_verified_data() {
+    let stats = SeasonalStats::new();
+    let ts = 1700000000000i64;
+
+    for i in 0..10 {
+        stats.record_verified(ts + i * 1000, 100);
     }
-    if cw_count == 0 && es_count > 0 {
-        return false;
+
+    assert!(stats.total_samples() >= 10);
+    assert!(stats.expected_range(ts).is_some());
+}
+
+#[test]
+fn test_seasonal_stress_affects_tolerance() {
+    let stats = SeasonalStats::new();
+    let ts = 1700000000000i64;
+
+    for i in 0..20 {
+        stats.record_verified(ts + i * 1000, 100);
     }
-    if neighbor_total == 0 {
-        return cw_count > 0 || es_count == 0;
+
+    let normal = make_tracker_at_level(logstream::stress::StressLevel::Normal);
+    let critical = make_tracker_at_level(logstream::stress::StressLevel::Critical);
+
+    let result_normal = stats.is_feasible(ts, 3_600_000, 100, &normal);
+    let result_critical = stats.is_feasible(ts, 3_600_000, 100, &critical);
+
+    assert!(result_normal.is_feasible());
+    assert!(result_critical.is_feasible());
+
+    if let FeasibilityResult::Feasible { sigma_used: s1, .. } = result_normal {
+        if let FeasibilityResult::Feasible { sigma_used: s2, .. } = result_critical {
+            assert!(s1 > s2);
+        }
+    }
+}
+
+#[test]
+fn test_seasonal_detects_suspicious_zero() {
+    let stats = SeasonalStats::new();
+    let ts = 1700000000000i64;
+
+    for i in 0..10 {
+        stats.record_verified(ts + i * 1000, 1000);
     }
 
-    let expected = neighbor_total / 2;
-    let threshold = (expected * FEASIBILITY_THRESHOLD_PCT) / 100;
-    let min_expected = threshold.max(1);
-
-    if cw_count < min_expected && es_count > cw_count * 2 {
-        return false;
-    }
-    true
+    let tracker = make_tracker_at_level(logstream::stress::StressLevel::Normal);
+    let result = stats.is_feasible(ts, 3_600_000, 0, &tracker);
+    assert!(!result.is_feasible());
 }
 
 #[test]
-fn test_feasibility_cw_has_data_es_empty() {
-    assert!(is_feasible(100, 0, 200));
-}
+fn test_feasibility_result_controls_recording() {
+    let feasible = FeasibilityResult::Feasible {
+        expected: 100.0,
+        stddev: 10.0,
+        sigma_used: 4.0,
+    };
+    assert!(feasible.should_record());
 
-#[test]
-fn test_feasibility_both_empty() {
-    assert!(is_feasible(0, 0, 0));
-    assert!(is_feasible(0, 0, 100));
-}
+    let suspicious = FeasibilityResult::Suspicious {
+        expected: 100.0,
+        stddev: 10.0,
+        deviation: 50.0,
+        sigma_used: 4.0,
+    };
+    assert!(!suspicious.should_record());
 
-#[test]
-fn test_feasibility_cw_empty_es_has_data() {
-    assert!(!is_feasible(0, 100, 200));
-    assert!(!is_feasible(0, 1000, 2000));
-}
-
-#[test]
-fn test_feasibility_cw_much_less_than_expected() {
-    assert!(!is_feasible(5, 1000, 2000));
-    assert!(!is_feasible(1, 500, 1000));
-}
-
-#[test]
-fn test_feasibility_cw_reasonable_compared_to_neighbors() {
-    assert!(is_feasible(100, 150, 200));
-    assert!(is_feasible(50, 60, 100));
-    assert!(is_feasible(1000, 1100, 2000));
-}
-
-#[test]
-fn test_feasibility_cw_slightly_less_than_es_ok() {
-    assert!(is_feasible(90, 100, 200));
-    assert!(is_feasible(80, 100, 200));
-}
-
-#[test]
-fn test_feasibility_no_neighbors_cw_has_data() {
-    assert!(is_feasible(100, 100, 0));
-    assert!(is_feasible(50, 100, 0));
-}
-
-#[test]
-fn test_feasibility_no_neighbors_cw_empty() {
-    assert!(!is_feasible(0, 100, 0));
-}
-
-#[test]
-fn test_feasibility_cw_more_than_es() {
-    assert!(is_feasible(200, 100, 200));
-    assert!(is_feasible(1000, 500, 800));
-}
-
-#[test]
-fn test_feasibility_edge_case_small_counts() {
-    assert!(is_feasible(1, 1, 2));
-    assert!(is_feasible(2, 3, 4));
-    assert!(!is_feasible(0, 5, 10));
-}
-
-#[test]
-fn test_feasibility_threshold_boundary() {
-    assert!(is_feasible(10, 100, 200));
-    assert!(is_feasible(11, 100, 200));
-    assert!(!is_feasible(4, 100, 200));
+    let no_history = FeasibilityResult::NoHistory;
+    assert!(!no_history.should_record());
 }
 
 #[tokio::test]

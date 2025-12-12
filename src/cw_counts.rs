@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use aws_sdk_cloudwatchlogs::Client;
 use tokio::time::{sleep, Duration};
@@ -5,11 +7,11 @@ use tokio::time::{sleep, Duration};
 #[derive(Clone)]
 pub struct CwCounter {
     client: Client,
-    log_group: String,
+    log_group: Arc<str>,
 }
 
 impl CwCounter {
-    pub fn new(client: Client, log_group: String) -> Self {
+    pub fn new(client: Client, log_group: Arc<str>) -> Self {
         Self { client, log_group }
     }
 
@@ -21,7 +23,7 @@ impl CwCounter {
         let start_resp = self
             .client
             .start_query()
-            .log_group_name(&self.log_group)
+            .log_group_name(&*self.log_group)
             .start_time(start)
             .end_time(end)
             .query_string(query)

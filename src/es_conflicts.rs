@@ -1,44 +1,36 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashSet;
-use std::time::Duration;
 use tracing::{info, warn};
 
+#[derive(Clone)]
 pub struct EsConflictResolver {
     client: Client,
-    base_url: String,
-    user: String,
-    pass: String,
-    index_prefix: String,
-}
-impl Clone for EsConflictResolver {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            base_url: self.base_url.clone(),
-            user: self.user.clone(),
-            pass: self.pass.clone(),
-            index_prefix: self.index_prefix.clone(),
-        }
-    }
+    base_url: Arc<str>,
+    user: Arc<str>,
+    pass: Arc<str>,
+    index_prefix: Arc<str>,
 }
 
 impl EsConflictResolver {
     pub fn new(
-        base_url: String,
-        user: String,
-        pass: String,
+        base_url: impl Into<Arc<str>>,
+        user: impl Into<Arc<str>>,
+        pass: impl Into<Arc<str>>,
         timeout: Duration,
-        index_prefix: String,
+        index_prefix: impl Into<Arc<str>>,
     ) -> Result<Self> {
         let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
             client,
-            base_url,
-            user,
-            pass,
-            index_prefix,
+            base_url: base_url.into(),
+            user: user.into(),
+            pass: pass.into(),
+            index_prefix: index_prefix.into(),
         })
     }
 

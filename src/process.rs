@@ -1004,17 +1004,13 @@ impl AggregateStats {
 /// Manages all processing tasks for a single log group.
 /// Wraps ProcessScheduler with higher-level task management.
 pub struct GroupScheduler {
-    /// Log group name.
-    log_group: String,
-    /// Underlying process scheduler.
+    log_group: Arc<str>,
     scheduler: Arc<ProcessScheduler>,
-    /// PIDs of daemon processes (for cleanup).
     daemon_pids: RwLock<Vec<u64>>,
 }
 
 impl GroupScheduler {
-    /// Create a new group scheduler.
-    pub fn new(log_group: String, resources: Resources, max_concurrency: usize) -> Arc<Self> {
+    pub fn new(log_group: Arc<str>, resources: Resources, max_concurrency: usize) -> Arc<Self> {
         Arc::new(Self {
             log_group,
             scheduler: ProcessScheduler::new(resources, max_concurrency, 100),

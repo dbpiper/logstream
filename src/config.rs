@@ -1,16 +1,16 @@
+use std::sync::Arc;
 use std::{env, fs, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use directories::ProjectDirs;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub log_group: String,
-    #[serde(default)]
-    pub log_groups: Vec<String>,
-    pub region: String,
-    pub index_prefix: String,
+    pub log_group: Arc<str>,
+    pub log_groups: Vec<Arc<str>>,
+    pub region: Arc<str>,
+    pub index_prefix: Arc<str>,
     pub batch_size: usize,
     pub max_in_flight: usize,
     pub poll_interval_secs: u64,
@@ -22,36 +22,79 @@ pub struct Config {
     pub backoff_max_ms: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawConfig {
+    log_group: String,
+    #[serde(default)]
+    log_groups: Vec<String>,
+    region: String,
+    index_prefix: String,
+    batch_size: usize,
+    max_in_flight: usize,
+    poll_interval_secs: u64,
+    reconcile_interval_secs: u64,
+    backfill_days: u32,
+    checkpoint_path: PathBuf,
+    http_timeout_secs: u64,
+    backoff_base_ms: u64,
+    backoff_max_ms: u64,
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        Self {
+            log_group: raw.log_group.into(),
+            log_groups: raw.log_groups.into_iter().map(Into::into).collect(),
+            region: raw.region.into(),
+            index_prefix: raw.index_prefix.into(),
+            batch_size: raw.batch_size,
+            max_in_flight: raw.max_in_flight,
+            poll_interval_secs: raw.poll_interval_secs,
+            reconcile_interval_secs: raw.reconcile_interval_secs,
+            backfill_days: raw.backfill_days,
+            checkpoint_path: raw.checkpoint_path,
+            http_timeout_secs: raw.http_timeout_secs,
+            backoff_base_ms: raw.backoff_base_ms,
+            backoff_max_ms: raw.backoff_max_ms,
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = if let Some(path) = path {
             let raw = fs::read_to_string(path)?;
-            toml::from_str::<Config>(&raw)?
+            Config::from(toml::from_str::<RawConfig>(&raw)?)
         } else {
-            // Fallback to default path if present
             let default_path = default_config_path();
             if default_path.exists() {
                 let raw = fs::read_to_string(&default_path)?;
-                toml::from_str::<Config>(&raw)?
+                Config::from(toml::from_str::<RawConfig>(&raw)?)
             } else {
                 Self::default_from_env()?
             }
         };
 
-        // Env overrides
-        maybe_env(&mut cfg.log_group, "LOG_GROUP");
+        if let Ok(v) = env::var("LOG_GROUP") {
+            cfg.log_group = v.into();
+        }
         if let Ok(groups) = env::var("LOG_GROUPS") {
-            let parsed: Vec<String> = groups
+            let parsed: Vec<Arc<str>> = groups
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
+                .map(Arc::from)
                 .collect();
             if !parsed.is_empty() {
                 cfg.log_groups = parsed;
             }
         }
-        maybe_env(&mut cfg.region, "AWS_REGION");
-        maybe_env(&mut cfg.index_prefix, "INDEX_PREFIX");
+        if let Ok(v) = env::var("AWS_REGION") {
+            cfg.region = v.into();
+        }
+        if let Ok(v) = env::var("INDEX_PREFIX") {
+            cfg.index_prefix = v.into();
+        }
         maybe_env_usize(&mut cfg.batch_size, "BATCH_SIZE");
         maybe_env_usize(&mut cfg.max_in_flight, "MAX_IN_FLIGHT");
         maybe_env_u64(&mut cfg.poll_interval_secs, "POLL_INTERVAL_SECS");
@@ -81,9 +124,11 @@ impl Config {
         let dirs = default_state_dir();
         let checkpoint_path = dirs.join("checkpoints.json");
         Ok(Self {
-            log_group: env_required("LOG_GROUP")?,
-            region: env_required("AWS_REGION")?,
-            index_prefix: env::var("INDEX_PREFIX").unwrap_or_else(|_| "logs".into()),
+            log_group: env_required("LOG_GROUP")?.into(),
+            region: env_required("AWS_REGION")?.into(),
+            index_prefix: env::var("INDEX_PREFIX")
+                .unwrap_or_else(|_| "logs".into())
+                .into(),
             batch_size: env_usize("BATCH_SIZE", 100),
             max_in_flight: env_usize("MAX_IN_FLIGHT", 2),
             poll_interval_secs: env_u64("POLL_INTERVAL_SECS", 15),
@@ -99,7 +144,7 @@ impl Config {
 }
 
 impl Config {
-    pub fn effective_log_groups(&self) -> Vec<String> {
+    pub fn effective_log_groups(&self) -> Vec<Arc<str>> {
         if !self.log_groups.is_empty() {
             self.log_groups.clone()
         } else {
@@ -107,7 +152,7 @@ impl Config {
         }
     }
 
-    pub fn with_log_group(&self, group: String, checkpoint_path: PathBuf) -> Self {
+    pub fn with_log_group(&self, group: Arc<str>, checkpoint_path: PathBuf) -> Self {
         let mut c = self.clone();
         c.log_group = group;
         c.checkpoint_path = checkpoint_path;
@@ -136,12 +181,6 @@ fn validate_required(cfg: &Config) -> Result<()> {
         anyhow::bail!("INDEX_PREFIX is required (set via env or config)");
     }
     Ok(())
-}
-
-fn maybe_env(val: &mut String, key: &str) {
-    if let Ok(v) = env::var(key) {
-        *val = v;
-    }
 }
 
 fn maybe_env_usize(val: &mut usize, key: &str) {

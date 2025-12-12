@@ -126,6 +126,10 @@ impl StressTracker {
         StressLevel::from(self.stress_level.load(Ordering::SeqCst))
     }
 
+    pub fn is_stressed(&self) -> bool {
+        self.stress_level() != StressLevel::Normal
+    }
+
     pub fn failure_streak(&self) -> u64 {
         self.failure_streak.load(Ordering::SeqCst)
     }

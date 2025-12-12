@@ -18,6 +18,7 @@ pub mod event_router;
 pub mod process;
 pub mod reconcile;
 pub mod runner;
+pub mod seasonal_stats;
 pub mod state;
 pub mod stress;
 pub mod types;

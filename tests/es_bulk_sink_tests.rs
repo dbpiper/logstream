@@ -55,14 +55,14 @@ fn test_resolve_index_empty_timestamp() {
 #[test]
 fn test_es_bulk_config_clone() {
     let cfg = EsBulkConfig {
-        url: "http://localhost:9200".to_string(),
-        user: "elastic".to_string(),
-        pass: "password".to_string(),
+        url: "http://localhost:9200".into(),
+        user: "elastic".into(),
+        pass: "password".into(),
         batch_size: 100,
         max_batch_size: 1000,
         timeout: Duration::from_secs(30),
         gzip: true,
-        index_prefix: "logs".to_string(),
+        index_prefix: "logs".into(),
     };
 
     let cloned = cfg.clone();
@@ -74,14 +74,14 @@ fn test_es_bulk_config_clone() {
 #[test]
 fn test_es_bulk_sink_new() {
     let cfg = EsBulkConfig {
-        url: "http://localhost:9200".to_string(),
-        user: "elastic".to_string(),
-        pass: "password".to_string(),
+        url: "http://localhost:9200".into(),
+        user: "elastic".into(),
+        pass: "password".into(),
         batch_size: 100,
         max_batch_size: 1000,
         timeout: Duration::from_secs(30),
         gzip: true,
-        index_prefix: "logs".to_string(),
+        index_prefix: "logs".into(),
     };
 
     let sink = EsBulkSink::new(cfg);

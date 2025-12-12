@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,6 +32,7 @@ use logstream::runner::{
     execute_reconcile_daemon, execute_tail_daemon, run_heal_days, GroupEnvConfig,
     ReconcileExecContext,
 };
+use logstream::seasonal_stats::SeasonalStats;
 use logstream::state::CheckpointState;
 use logstream::stress::{StressConfig, StressTracker};
 
@@ -59,10 +61,11 @@ async fn main() -> Result<()> {
     let (event_router, sender_factory) = create_event_router();
 
     let es_cfg = EsConfig::from_env();
-    let sink = create_bulk_sink(&cfg, &es_cfg, &index_prefix)?;
+    let sink = create_bulk_sink(&cfg, &es_cfg, index_prefix.clone())?;
     let es_stress_tracker = sink.stress_tracker();
     let cw_stress_tracker =
         std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
+    let seasonal_stats = std::sync::Arc::new(SeasonalStats::new());
     let adaptive_controller = adaptive::create_controller();
     info!(
         "adaptive controller: initial batch={} in_flight={}",
@@ -84,6 +87,7 @@ async fn main() -> Result<()> {
         let sender_factory = sender_factory.clone();
         let es_stress = es_stress_tracker.clone();
         let cw_stress = cw_stress_tracker.clone();
+        let stats = seasonal_stats.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(err) = run_group(
@@ -93,6 +97,7 @@ async fn main() -> Result<()> {
                 buffer_caps,
                 es_stress,
                 cw_stress,
+                stats,
             )
             .await
             {
@@ -112,9 +117,9 @@ async fn main() -> Result<()> {
 }
 
 struct EsConfig {
-    url: String,
-    user: String,
-    pass: String,
+    url: Arc<str>,
+    user: Arc<str>,
+    pass: Arc<str>,
     backfill_refresh: String,
     backfill_replicas: String,
 }
@@ -122,9 +127,15 @@ struct EsConfig {
 impl EsConfig {
     fn from_env() -> Self {
         Self {
-            url: std::env::var("ES_HOST").unwrap_or_else(|_| "http://localhost:9200".into()),
-            user: std::env::var("ES_USER").unwrap_or_else(|_| "elastic".into()),
-            pass: std::env::var("ES_PASS").unwrap_or_else(|_| "changeme".into()),
+            url: std::env::var("ES_HOST")
+                .unwrap_or_else(|_| "http://localhost:9200".into())
+                .into(),
+            user: std::env::var("ES_USER")
+                .unwrap_or_else(|_| "elastic".into())
+                .into(),
+            pass: std::env::var("ES_PASS")
+                .unwrap_or_else(|_| "changeme".into())
+                .into(),
             backfill_refresh: std::env::var("ES_BACKFILL_REFRESH_INTERVAL")
                 .unwrap_or_else(|_| "-1".into()),
             backfill_replicas: std::env::var("ES_BACKFILL_REPLICAS").unwrap_or_else(|_| "0".into()),
@@ -148,7 +159,7 @@ async fn create_aws_config(cfg: &Config) -> aws_config::SdkConfig {
 
     aws_config::defaults(BehaviorVersion::latest())
         .region(aws_sdk_cloudwatchlogs::config::Region::new(
-            cfg.region.clone(),
+            cfg.region.to_string(),
         ))
         .timeout_config(timeout_config)
         .load()
@@ -161,7 +172,7 @@ fn create_event_router() -> (EventRouter, EventSenderFactory) {
     (router, sender_factory)
 }
 
-fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: &str) -> Result<EsBulkSink> {
+fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: Arc<str>) -> Result<EsBulkSink> {
     let max_batch = std::env::var("BULK_MAX_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -175,7 +186,7 @@ fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: &str) -> Resu
         max_batch_size: max_batch,
         timeout: cfg.http_timeout(),
         gzip: true,
-        index_prefix: index_prefix.to_string(),
+        index_prefix,
     };
     EsBulkSink::new(sink_cfg)
 }
@@ -259,6 +270,7 @@ async fn run_group(
     buffer_caps: BufferCapacities,
     es_stress_tracker: std::sync::Arc<StressTracker>,
     cw_stress_tracker: std::sync::Arc<StressTracker>,
+    seasonal_stats: std::sync::Arc<SeasonalStats>,
 ) -> Result<()> {
     let resources = create_group_resources(&buffer_caps);
     let group_scheduler =
@@ -360,6 +372,8 @@ async fn run_group(
             es_counter: &es_counter,
             cw_counter: &cw_counter,
             buffer_caps: &buffer_caps,
+            cw_stress: cw_stress_tracker.clone(),
+            seasonal_stats: seasonal_stats.clone(),
         };
         Some(execute_reconcile_daemon(pid, ctx, group_scheduler.scheduler().clone()).await?)
     } else {
@@ -374,6 +388,8 @@ async fn run_group(
             es_counter: &es_counter,
             cw_counter: &cw_counter,
             buffer_caps: &buffer_caps,
+            cw_stress: cw_stress_tracker.clone(),
+            seasonal_stats: seasonal_stats.clone(),
         };
         Some(
             execute_full_history_daemon(

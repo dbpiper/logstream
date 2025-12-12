@@ -229,7 +229,6 @@ pub fn execute_tail_daemon(
     })
 }
 
-/// Context for executing reconcile daemons.
 pub struct ReconcileExecContext<'a> {
     pub cfg: &'a Config,
     pub aws_cfg: &'a aws_config::SdkConfig,
@@ -237,6 +236,8 @@ pub struct ReconcileExecContext<'a> {
     pub es_counter: &'a EsCounter,
     pub cw_counter: &'a CwCounter,
     pub buffer_caps: &'a BufferCapacities,
+    pub cw_stress: Arc<StressTracker>,
+    pub seasonal_stats: Arc<crate::seasonal_stats::SeasonalStats>,
 }
 
 /// Execute the reconcile loop daemon.
@@ -252,6 +253,8 @@ pub async fn execute_reconcile_daemon(
         sink_tx: ctx.sender_factory.at(Priority::HIGH),
         es_counter: ctx.es_counter.clone(),
         cw_counter: ctx.cw_counter.clone(),
+        cw_stress: ctx.cw_stress.clone(),
+        seasonal_stats: ctx.seasonal_stats.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -266,7 +269,6 @@ pub async fn execute_reconcile_daemon(
     }))
 }
 
-/// Execute the full history reconcile daemon.
 pub async fn execute_full_history_daemon(
     pid: u64,
     ctx: ReconcileExecContext<'_>,
@@ -279,6 +281,8 @@ pub async fn execute_full_history_daemon(
         sink_tx: ctx.sender_factory.at(Priority::NORMAL),
         es_counter: ctx.es_counter.clone(),
         cw_counter: ctx.cw_counter.clone(),
+        cw_stress: ctx.cw_stress.clone(),
+        seasonal_stats: ctx.seasonal_stats.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
