@@ -249,6 +249,16 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
         return;
     }
 
+    let event_count = events.len();
+
+    if event_count == 0 {
+        info!(
+            "reconcile CW returned empty for {}-{}, preserving ES data",
+            start_ms, end_ms
+        );
+        return;
+    }
+
     if let Err(err) = ctx.es_counter.delete_range(start_ms, end_ms).await {
         warn!(
             "reconcile ES delete failed: {err:?} for {}-{}",
@@ -256,7 +266,6 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
         );
     }
 
-    let event_count = events.len();
     for raw in events {
         if let Some(enriched) = enrich_event(raw, None) {
             if ctx.sink_tx.send(enriched).await.is_err() {

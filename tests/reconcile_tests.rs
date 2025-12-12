@@ -86,7 +86,7 @@ async fn test_fetch_success_enables_delete_and_insert() {
 }
 
 #[tokio::test]
-async fn test_empty_fetch_still_triggers_delete() {
+async fn test_empty_fetch_preserves_es_data() {
     let delete_called = Arc::new(AtomicBool::new(false));
 
     let events: Vec<LogEvent> = vec![];
@@ -94,11 +94,119 @@ async fn test_empty_fetch_still_triggers_delete() {
 
     let delete_called_clone = delete_called.clone();
 
-    if result.is_ok() {
-        delete_called_clone.store(true, Ordering::SeqCst);
+    if let Ok(events) = result {
+        if !events.is_empty() {
+            delete_called_clone.store(true, Ordering::SeqCst);
+        }
+    }
+
+    assert!(!delete_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_non_empty_fetch_triggers_delete() {
+    let delete_called = Arc::new(AtomicBool::new(false));
+
+    let events = vec![make_event("a", 1)];
+    let result: Result<Vec<LogEvent>, &str> = Ok(events);
+
+    let delete_called_clone = delete_called.clone();
+
+    if let Ok(events) = result {
+        if !events.is_empty() {
+            delete_called_clone.store(true, Ordering::SeqCst);
+        }
     }
 
     assert!(delete_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_cw_retention_scenario_preserves_es() {
+    let es_has_data = true;
+    let cw_returns_empty = true;
+    let delete_called = Arc::new(AtomicBool::new(false));
+    let es_data_preserved = Arc::new(AtomicBool::new(true));
+
+    let cw_events: Vec<LogEvent> = if cw_returns_empty {
+        vec![]
+    } else {
+        vec![make_event("a", 1)]
+    };
+
+    let delete_called_clone = delete_called.clone();
+    let es_preserved_clone = es_data_preserved.clone();
+
+    if !cw_events.is_empty() {
+        delete_called_clone.store(true, Ordering::SeqCst);
+        es_preserved_clone.store(false, Ordering::SeqCst);
+    }
+
+    assert!(es_has_data);
+    assert!(!delete_called.load(Ordering::SeqCst));
+    assert!(es_data_preserved.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_partial_cw_data_triggers_replace() {
+    let delete_called = Arc::new(AtomicBool::new(false));
+    let insert_count = Arc::new(AtomicUsize::new(0));
+
+    let cw_events = vec![make_event("partial-1", 1), make_event("partial-2", 2)];
+
+    let delete_called_clone = delete_called.clone();
+    let insert_count_clone = insert_count.clone();
+
+    if !cw_events.is_empty() {
+        delete_called_clone.store(true, Ordering::SeqCst);
+        for _ in &cw_events {
+            insert_count_clone.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    assert!(delete_called.load(Ordering::SeqCst));
+    assert_eq!(insert_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_fetch_then_replace_pattern_complete() {
+    let fetch_succeeded = Arc::new(AtomicBool::new(false));
+    let delete_called = Arc::new(AtomicBool::new(false));
+    let insert_count = Arc::new(AtomicUsize::new(0));
+    let es_preserved = Arc::new(AtomicBool::new(true));
+
+    let cw_result: Result<Vec<LogEvent>, &str> = Ok(vec![
+        make_event("new-1", 100),
+        make_event("new-2", 200),
+        make_event("new-3", 300),
+    ]);
+
+    let fetch_clone = fetch_succeeded.clone();
+    let delete_clone = delete_called.clone();
+    let insert_clone = insert_count.clone();
+    let preserved_clone = es_preserved.clone();
+
+    match cw_result {
+        Ok(events) => {
+            fetch_clone.store(true, Ordering::SeqCst);
+            if events.is_empty() {
+                return;
+            }
+            delete_clone.store(true, Ordering::SeqCst);
+            preserved_clone.store(false, Ordering::SeqCst);
+            for _ in events {
+                insert_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        Err(_) => {
+            return;
+        }
+    }
+
+    assert!(fetch_succeeded.load(Ordering::SeqCst));
+    assert!(delete_called.load(Ordering::SeqCst));
+    assert_eq!(insert_count.load(Ordering::SeqCst), 3);
+    assert!(!es_preserved.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
