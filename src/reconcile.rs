@@ -170,8 +170,7 @@ async fn almost_sure_sync(
         let max_count = es_count.max(cw_count);
 
         if max_count > 0 && (diff * 100 / max_count) >= FULL_RESYNC_THRESHOLD_PCT {
-            ctx.es_counter.delete_range(s, e).await.ok();
-            resync_range(ctx, s, e, sync.buffer_cap).await;
+            safe_replace_range(ctx, s, e, sync.buffer_cap).await;
             continue;
         }
 
@@ -208,31 +207,57 @@ async fn almost_sure_sync(
             continue;
         }
 
-        ctx.es_counter.delete_range(s, e).await.ok();
         let buf = sync.sample.saturating_mul(sync.resync_scale).max(1);
-        resync_range(ctx, s, e, buf).await;
+        safe_replace_range(ctx, s, e, buf).await;
     }
 
     Ok(())
 }
 
-async fn resync_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, buffer_cap: usize) {
+async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, buffer_cap: usize) {
+    info!("reconcile safe_replace start={} end={}", start_ms, end_ms);
+
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<LogEvent>(buffer_cap);
-    let sink_clone = ctx.sink_tx.clone();
-    info!(
-        "reconcile resync range start={} end={} buffer_cap={}",
-        start_ms, end_ms, buffer_cap
-    );
-    tokio::spawn(async move {
+
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
         while let Some(raw) = raw_rx.recv().await {
-            if let Some(enriched) = enrich_event(raw, None) {
-                if sink_clone.send(enriched).await.is_err() {
-                    break;
-                }
+            events.push(raw);
+        }
+        events
+    });
+
+    let fetch_result = ctx.tailer.fetch_range(start_ms, end_ms, &raw_tx).await;
+    drop(raw_tx);
+
+    let events = match collector.await {
+        Ok(events) => events,
+        Err(err) => {
+            warn!("reconcile collector failed: {err:?} for {}-{}", start_ms, end_ms);
+            return;
+        }
+    };
+
+    if let Err(err) = fetch_result {
+        warn!("reconcile CW fetch failed: {err:?} for {}-{}", start_ms, end_ms);
+        return;
+    }
+
+    if let Err(err) = ctx.es_counter.delete_range(start_ms, end_ms).await {
+        warn!("reconcile ES delete failed: {err:?} for {}-{}", start_ms, end_ms);
+    }
+
+    let event_count = events.len();
+    for raw in events {
+        if let Some(enriched) = enrich_event(raw, None) {
+            if ctx.sink_tx.send(enriched).await.is_err() {
+                warn!("reconcile sink closed for {}-{}", start_ms, end_ms);
+                break;
             }
         }
-    });
-    let _ = ctx.tailer.fetch_range(start_ms, end_ms, &raw_tx).await;
+    }
+
+    info!("reconcile complete: {} events for {}-{}", event_count, start_ms, end_ms);
 }
 
 async fn process_day(

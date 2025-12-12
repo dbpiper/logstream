@@ -19,4 +19,5 @@ pub mod process;
 pub mod reconcile;
 pub mod runner;
 pub mod state;
+pub mod stress;
 pub mod types;

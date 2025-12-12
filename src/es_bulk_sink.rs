@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adaptive::AdaptiveController;
-use crate::es_recovery::{self, ClusterStressTracker};
+use crate::stress::{StressConfig, StressLevel, StressTracker};
 use crate::types::EnrichedEvent;
 
 #[derive(Clone, Debug)]
@@ -27,7 +27,7 @@ pub struct EsBulkConfig {
 pub struct EsBulkSink {
     cfg: EsBulkConfig,
     client: Client,
-    stress_tracker: Arc<ClusterStressTracker>,
+    stress_tracker: Arc<StressTracker>,
 }
 
 impl EsBulkSink {
@@ -40,12 +40,12 @@ impl EsBulkSink {
         Ok(Self {
             cfg,
             client,
-            stress_tracker: Arc::new(ClusterStressTracker::new()),
+            stress_tracker: Arc::new(StressTracker::with_config(StressConfig::ES)),
         })
     }
 
     /// Get the stress tracker for external monitoring.
-    pub fn stress_tracker(&self) -> Arc<ClusterStressTracker> {
+    pub fn stress_tracker(&self) -> Arc<StressTracker> {
         self.stress_tracker.clone()
     }
 
@@ -75,10 +75,10 @@ impl EsBulkSink {
 
                 // Additional backoff if cluster is stressed
                 let stress_level = stress_tracker.stress_level();
-                if stress_level == es_recovery::StressLevel::Critical {
+                if stress_level == StressLevel::Critical {
                     // Critical stress - long pause to let ES recover
                     sleep(Duration::from_secs(10)).await;
-                } else if stress_level == es_recovery::StressLevel::Elevated {
+                } else if stress_level == StressLevel::Elevated {
                     // Elevated stress - shorter pause
                     sleep(Duration::from_secs(2)).await;
                 }
@@ -91,9 +91,9 @@ impl EsBulkSink {
 
                 // Drain more if available (up to batch size)
                 // But drain less if cluster is stressed
-                let effective_batch = if stress_level == es_recovery::StressLevel::Critical {
+                let effective_batch = if stress_level == StressLevel::Critical {
                     target_batch / 4 // 25% batch size when critical
-                } else if stress_level == es_recovery::StressLevel::Elevated {
+                } else if stress_level == StressLevel::Elevated {
                     target_batch / 2 // 50% batch size when elevated
                 } else {
                     target_batch
@@ -173,13 +173,13 @@ async fn send_bulk_adaptive_tracked(
     batch: &[EnrichedEvent],
     adaptive: Arc<AdaptiveController>,
     max_in_flight: usize,
-    stress_tracker: &ClusterStressTracker,
+    stress_tracker: &StressTracker,
 ) -> Result<()> {
     // Reduce concurrency if cluster is stressed
     let effective_in_flight = match stress_tracker.stress_level() {
-        es_recovery::StressLevel::Critical => 1, // Single request when critical
-        es_recovery::StressLevel::Elevated => (max_in_flight / 2).max(1),
-        es_recovery::StressLevel::Normal => max_in_flight,
+        StressLevel::Critical => 1, // Single request when critical
+        StressLevel::Elevated => (max_in_flight / 2).max(1),
+        StressLevel::Normal => max_in_flight,
     };
 
     let sem = Arc::new(Semaphore::new(effective_in_flight));

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 
 use crate::state::{CheckpointState, StreamCursor};
+use crate::stress::{StressConfig, StressTracker};
 use crate::types::LogEvent;
 
 #[derive(Clone, Debug)]
@@ -23,6 +25,7 @@ pub struct CloudWatchTailer {
     client: CwClient,
     checkpoint: CheckpointState,
     checkpoint_path: std::path::PathBuf,
+    stress_tracker: Arc<StressTracker>,
 }
 
 impl CloudWatchTailer {
@@ -37,7 +40,28 @@ impl CloudWatchTailer {
             client,
             checkpoint,
             checkpoint_path,
+            stress_tracker: Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH)),
         }
+    }
+
+    pub fn with_stress_tracker(
+        cfg: TailConfig,
+        client: CwClient,
+        checkpoint: CheckpointState,
+        checkpoint_path: std::path::PathBuf,
+        stress_tracker: Arc<StressTracker>,
+    ) -> Self {
+        Self {
+            cfg,
+            client,
+            checkpoint,
+            checkpoint_path,
+            stress_tracker,
+        }
+    }
+
+    pub fn stress_tracker(&self) -> Arc<StressTracker> {
+        self.stress_tracker.clone()
     }
 
     pub async fn run(&mut self, tx: mpsc::Sender<LogEvent>) -> Result<()> {
@@ -64,12 +88,11 @@ impl CloudWatchTailer {
     }
 
     async fn poll_once(&mut self, tx: &mpsc::Sender<LogEvent>) -> Result<()> {
-        // For simplicity, use a single global cursor keyed by log group
         let key = self.cfg.log_group.clone();
         let cursor = self.checkpoint.cursor_for(&key);
         let start_time = cursor
             .next_start_time_ms
-            .unwrap_or_else(|| current_time_ms() - 5 * 60 * 1000);
+            .unwrap_or_else(|| current_time_ms() - 60 * 60 * 1000);
 
         let mut next_token = cursor.next_token.clone();
         let mut latest_ts = start_time;
@@ -86,19 +109,19 @@ impl CloudWatchTailer {
                 req = req.next_token(token);
             }
 
-            let resp = send_with_backoff(req).await.context("filter_log_events")?;
+                let resp = send_with_backoff(req, &self.stress_tracker).await.context("filter_log_events")?;
 
             if let Some(events) = resp.events {
                 for e in events {
                     if let (Some(id), Some(ts), Some(msg)) = (e.event_id, e.timestamp, e.message) {
                         latest_ts = latest_ts.max(ts);
-                        let _ = tx
-                            .send(LogEvent {
-                                id,
-                                timestamp_ms: ts,
-                                message: msg,
-                            })
-                            .await;
+                        tx.send(LogEvent {
+                            id,
+                            timestamp_ms: ts,
+                            message: msg,
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("log channel closed"))?;
                     }
                 }
             }
@@ -110,7 +133,6 @@ impl CloudWatchTailer {
             }
         }
 
-        // Advance past latest to avoid duplicates
         let new_cursor = StreamCursor {
             next_token: None,
             next_start_time_ms: Some(latest_ts + 1),
@@ -121,14 +143,12 @@ impl CloudWatchTailer {
         Ok(())
     }
 
-    /// Fetch events in range [start_ms, end_ms] without modifying checkpoints.
     pub async fn fetch_range(
         &self,
         start_ms: i64,
         end_ms: i64,
         tx: &mpsc::Sender<LogEvent>,
     ) -> Result<usize> {
-        // Split into 16 chunks
         let range_ms = end_ms.saturating_sub(start_ms);
         let chunk_ms = (range_ms / 16).max(1);
         let mut chunks = Vec::new();
@@ -139,7 +159,6 @@ impl CloudWatchTailer {
             chunk_start = chunk_end;
         }
 
-        // Fetch chunks in parallel
         let permits = chunks.len().max(1);
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
         let mut handles = Vec::new();
@@ -149,6 +168,7 @@ impl CloudWatchTailer {
             let log_group = self.cfg.log_group.clone();
             let tx_clone = tx.clone();
             let sem = semaphore.clone();
+            let tracker = self.stress_tracker.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -164,23 +184,35 @@ impl CloudWatchTailer {
                     if let Some(t) = &next_token {
                         req = req.next_token(t);
                     }
-                    // Inline retry logic for spawned task
                     let resp = {
                         let mut attempt = 0u32;
                         loop {
                             attempt += 1;
                             match req.clone().send().await {
-                                Ok(r) => break Ok(r),
+                                Ok(r) => {
+                                    tracker.record_success();
+                                    break Ok(r);
+                                }
                                 Err(err) => {
                                     let msg = format!("{err:?}");
-                                    let is_retryable = msg.contains("ThrottlingException")
+                                    let is_throttle = msg.contains("ThrottlingException");
+                                    let is_retryable = is_throttle
                                         || msg.contains("ServiceUnavailable")
                                         || msg.contains("dispatch failure")
                                         || msg.contains("SendRequest");
+
+                                    if is_throttle {
+                                        tracker.record_failure();
+                                    }
+
                                     if is_retryable && attempt < 20 {
-                                        let backoff = std::time::Duration::from_millis(
-                                            500 * (attempt as u64).min(10),
-                                        );
+                                        let backoff = if is_throttle {
+                                            tracker.backoff_duration()
+                                        } else {
+                                            std::time::Duration::from_millis(
+                                                500 * (attempt as u64).min(10),
+                                            )
+                                        };
                                         tokio::time::sleep(backoff).await;
                                         continue;
                                     }
@@ -196,13 +228,17 @@ impl CloudWatchTailer {
                                     if let (Some(id), Some(ts), Some(msg)) =
                                         (e.event_id, e.timestamp, e.message)
                                     {
-                                        let _ = tx_clone
+                                        if tx_clone
                                             .send(LogEvent {
                                                 id,
                                                 timestamp_ms: ts,
                                                 message: msg,
                                             })
-                                            .await;
+                                            .await
+                                            .is_err()
+                                        {
+                                            return Err(anyhow::anyhow!("log channel closed"));
+                                        }
                                         sent += 1;
                                     }
                                 }
@@ -218,21 +254,21 @@ impl CloudWatchTailer {
                         }
                     }
                 }
-                sent
+                Ok(sent)
             }));
         }
 
         let mut total = 0usize;
         for h in handles {
             match h.await {
-                Ok(n) => total += n,
+                Ok(Ok(n)) => total += n,
+                Ok(Err(e)) => tracing::warn!("chunk failed: {e:?}"),
                 Err(e) => tracing::warn!("chunk task panicked: {e:?}"),
             }
         }
         Ok(total)
     }
 
-    /// Sample IDs from start and end of range.
     pub async fn sample_ids(
         &self,
         start_ms: i64,
@@ -241,7 +277,6 @@ impl CloudWatchTailer {
     ) -> Result<(Vec<String>, Vec<String>)> {
         let mut first = Vec::new();
         let mut next_token: Option<String> = None;
-        // First chunk
         loop {
             let mut req = self
                 .client
@@ -253,7 +288,7 @@ impl CloudWatchTailer {
             if let Some(t) = &next_token {
                 req = req.next_token(t);
             }
-            let resp = send_with_backoff(req)
+            let resp = send_with_backoff(req, &self.stress_tracker)
                 .await
                 .context("filter_log_events sample first")?;
             if let Some(events) = resp.events {
@@ -277,7 +312,6 @@ impl CloudWatchTailer {
             }
         }
 
-        // Last chunk: scan the window and retain only the last N seen
         let mut last = Vec::new();
         let mut next_tail: Option<String> = None;
         loop {
@@ -291,7 +325,7 @@ impl CloudWatchTailer {
             if let Some(t) = &next_tail {
                 req = req.next_token(t);
             }
-            let resp = send_with_backoff(req)
+            let resp = send_with_backoff(req, &self.stress_tracker)
                 .await
                 .context("filter_log_events sample last")?;
             if let Some(events) = resp.events {
@@ -312,7 +346,6 @@ impl CloudWatchTailer {
         Ok((first, last))
     }
 
-    /// Sample IDs within a time window.
     pub async fn sample_ids_window(
         &self,
         start_ms: i64,
@@ -332,7 +365,7 @@ impl CloudWatchTailer {
             if let Some(t) = &next_token {
                 req = req.next_token(t);
             }
-            let resp = send_with_backoff(req)
+            let resp = send_with_backoff(req, &self.stress_tracker)
                 .await
                 .context("filter_log_events sample window")?;
             if let Some(events) = resp.events {
@@ -361,26 +394,41 @@ fn current_time_ms() -> i64 {
     now.as_millis() as i64
 }
 
-/// Fetch a single time chunk sequentially with pagination
 async fn send_with_backoff(
     req: aws_sdk_cloudwatchlogs::operation::filter_log_events::builders::FilterLogEventsFluentBuilder,
+    stress_tracker: &StressTracker,
 ) -> Result<aws_sdk_cloudwatchlogs::operation::filter_log_events::FilterLogEventsOutput> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match req.clone().send().await {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => {
+                stress_tracker.record_success();
+                return Ok(resp);
+            }
             Err(err) => {
                 let msg = format!("{err:?}");
-                let is_retryable = msg.contains("ThrottlingException")
+                let is_throttle = msg.contains("ThrottlingException");
+                let is_retryable = is_throttle
                     || msg.contains("ServiceUnavailable")
                     || msg.contains("dispatch failure")
                     || msg.contains("SendRequest");
+
+                if is_throttle {
+                    stress_tracker.record_failure();
+                }
+
                 if is_retryable && attempt < 20 {
-                    let backoff = Duration::from_millis(500 * (attempt as u64).min(10));
+                    let backoff = if is_throttle {
+                        stress_tracker.backoff_duration()
+                    } else {
+                        Duration::from_millis(500 * (attempt as u64).min(10))
+                    };
                     warn!(
-                        "CW throttled/retryable attempt={}: retrying in {:?}",
-                        attempt, backoff
+                        "CW throttled/retryable attempt={}: retrying in {:?} (stress={:?})",
+                        attempt,
+                        backoff,
+                        stress_tracker.stress_level()
                     );
                     sleep(backoff).await;
                     continue;

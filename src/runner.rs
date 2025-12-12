@@ -1,6 +1,3 @@
-//! Group runner - orchestrates all processing for a log group.
-//! Uses OS-style process scheduler to manage daemons and batch tasks.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,18 +12,13 @@ use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
 use crate::es_conflicts::EsConflictResolver;
 use crate::es_counts::EsCounter;
-use crate::es_recovery::ClusterStressTracker;
 use crate::event_router::{EventSender, EventSenderFactory};
 use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources, WorkerPool};
 use crate::reconcile;
 use crate::state::CheckpointState;
+use crate::stress::StressTracker;
 use crate::types::LogEvent;
 
-// ============================================================================
-// Types
-// ============================================================================
-
-/// Context for running a log group.
 pub struct GroupContext {
     pub cfg: Config,
     pub aws_cfg: aws_config::SdkConfig,
@@ -34,7 +26,6 @@ pub struct GroupContext {
     pub buffer_caps: BufferCapacities,
 }
 
-/// Configuration extracted from environment for a group.
 pub struct GroupEnvConfig {
     pub es_url: String,
     pub es_user: String,
@@ -45,7 +36,6 @@ pub struct GroupEnvConfig {
 }
 
 impl GroupEnvConfig {
-    /// Load configuration from environment.
     pub fn from_env(backfill_days: u32) -> Self {
         let disable_conflict_reindex = std::env::var("DISABLE_CONFLICT_REINDEX")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -75,7 +65,6 @@ impl GroupEnvConfig {
     }
 }
 
-/// Handle collection for cleanup on shutdown.
 pub struct ProcessHandles {
     pub tail: Option<tokio::task::JoinHandle<()>>,
     pub reconcile: Option<tokio::task::JoinHandle<()>>,
@@ -86,7 +75,6 @@ pub struct ProcessHandles {
 }
 
 impl ProcessHandles {
-    /// Create empty handles.
     pub fn empty() -> Self {
         Self {
             tail: None,
@@ -98,7 +86,6 @@ impl ProcessHandles {
         }
     }
 
-    /// Abort all handles.
     pub fn abort_all(&self) {
         if let Some(h) = &self.tail {
             h.abort();
@@ -310,21 +297,22 @@ pub async fn execute_full_history_daemon(
 // Heal Execution
 // ============================================================================
 
-/// Heal concurrency - same as backfill for simplicity.
-const HEAL_CONCURRENCY: usize = 4;
+/// Heal concurrency - keep low to avoid CloudWatch API throttling.
+const HEAL_CONCURRENCY: usize = 2;
 
 /// Execute heal days with demand-driven spawning (Linux-style).
 ///
 /// Like run_backfill_days, this uses a BatchWorkQueue to only spawn
 /// max_ready processes at a time, avoiding memory exhaustion.
-/// Pauses workers when cluster is under stress.
+/// Pauses workers when ES or CW is under stress.
 pub async fn run_heal_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     heal_days: u32,
     buffer_caps: BufferCapacities,
-    stress_tracker: Option<Arc<ClusterStressTracker>>,
+    es_stress_tracker: Option<Arc<StressTracker>>,
+    cw_stress_tracker: Option<Arc<StressTracker>>,
 ) {
     if heal_days == 0 {
         return;
@@ -365,15 +353,26 @@ pub async fn run_heal_days(
     let aws_cfg_arc = Arc::new(aws_cfg.clone());
     let sender_factory_arc = Arc::new(sender_factory.clone());
 
-    // Create priority-aware pause check function based on cluster stress
+    // Create priority-aware pause check function based on ES + CW stress
     // Heal work is IDLE priority so it pauses most aggressively
+    // Checks both ES and CW stress - pauses if EITHER is stressed
     let pause_check = {
-        let tracker = stress_tracker.clone();
+        let es_tracker = es_stress_tracker.clone();
+        let cw_tracker = cw_stress_tracker.clone();
         move |priority: u8| -> Option<Duration> {
-            let Some(tracker) = &tracker else {
-                return None;
-            };
-            tracker.should_pause_for_priority(priority)
+            // Check ES stress first
+            if let Some(ref es) = es_tracker {
+                if let Some(duration) = es.should_pause_for_priority(priority) {
+                    return Some(duration);
+                }
+            }
+            // Check CW stress
+            if let Some(ref cw) = cw_tracker {
+                if let Some(duration) = cw.should_pause_for_priority(priority) {
+                    return Some(duration);
+                }
+            }
+            None
         }
     };
 

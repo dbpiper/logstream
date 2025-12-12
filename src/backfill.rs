@@ -1,6 +1,3 @@
-//! Backfill logic for historical log ingestion.
-//! Processes multiple days concurrently with priority-based scheduling.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,17 +9,14 @@ use crate::buffer::BufferCapacities;
 use crate::config::Config;
 use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
-use crate::es_recovery::ClusterStressTracker;
 use crate::event_router::EventSenderFactory;
 use crate::process::{GroupScheduler, Priority, Resources, WorkerPool};
 use crate::state::CheckpointState;
+use crate::stress::StressTracker;
 use crate::types::LogEvent;
 
-/// Maximum concurrent day backfills per log group.
-pub const BACKFILL_CONCURRENCY: usize = 8;
+pub const BACKFILL_CONCURRENCY: usize = 2;
 
-/// Calculate the time range for a given day offset.
-/// Returns (start_ms, end_ms) for the day.
 pub fn day_range_ms(day_offset: u32) -> (i64, i64) {
     let day = Utc::now().date_naive() - ChronoDuration::days(day_offset as i64);
 
@@ -39,7 +33,6 @@ pub fn day_range_ms(day_offset: u32) -> (i64, i64) {
     (start, end)
 }
 
-/// Calculate throughput in events per second.
 pub fn calculate_eps(event_count: usize, elapsed_ms: u128) -> u128 {
     if elapsed_ms > 0 {
         event_count as u128 * 1000 / elapsed_ms
@@ -48,7 +41,6 @@ pub fn calculate_eps(event_count: usize, elapsed_ms: u128) -> u128 {
     }
 }
 
-/// Validate backfill configuration.
 pub fn validate_backfill_config(
     backfill_days: u32,
     concurrency: usize,
@@ -62,23 +54,14 @@ pub fn validate_backfill_config(
     Ok(())
 }
 
-// ============================================================================
-// Backfill Execution
-// ============================================================================
-
-/// Statistics from a backfill run.
 #[derive(Debug, Clone, Default)]
 pub struct BackfillStats {
-    /// Total events processed.
     pub total_events: usize,
-    /// Total CPU time used.
     pub total_cpu_time: Duration,
-    /// Number of processes completed.
     pub processes_completed: usize,
 }
 
 impl BackfillStats {
-    /// Calculate events per second.
     pub fn events_per_second(&self) -> f64 {
         if self.total_cpu_time.as_secs_f64() > 0.0 {
             self.total_events as f64 / self.total_cpu_time.as_secs_f64()
@@ -88,25 +71,18 @@ impl BackfillStats {
     }
 }
 
-/// OS-style process scheduler for backfill with demand-driven spawning.
-///
-/// Like Linux's process management:
-/// - Only keeps max_ready processes in the ready queue (like RLIMIT_NPROC)
-/// - Spawns new processes as workers complete work (like fork after wait)
-/// - Prioritizes recent days over older days (like nice values)
-/// - Pauses workers when cluster is under stress
 pub async fn run_backfill_days(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     buffer_caps: BufferCapacities,
-    stress_tracker: Option<Arc<ClusterStressTracker>>,
+    es_stress_tracker: Option<Arc<StressTracker>>,
+    cw_stress_tracker: Option<Arc<StressTracker>>,
 ) -> Result<BackfillStats> {
     if cfg.backfill_days == 0 {
         return Ok(BackfillStats::default());
     }
 
-    // Create OS-style process scheduler with group scheduler
     let resources = Resources {
         cw_api_quota: 100,
         es_bulk_capacity: buffer_caps.backfill_raw,
@@ -115,8 +91,6 @@ pub async fn run_backfill_days(
     let group_scheduler =
         GroupScheduler::new(cfg.log_group.clone(), resources, BACKFILL_CONCURRENCY);
 
-    // Create demand-driven work queue (Linux-style RLIMIT_NPROC)
-    // Only spawns max_ready processes at a time, spawning more as workers complete
     let work_queue = Arc::new(group_scheduler.create_backfill_queue(cfg.backfill_days));
 
     tracing::info!(
@@ -127,7 +101,6 @@ pub async fn run_backfill_days(
         BACKFILL_CONCURRENCY * 2
     );
 
-    // Start the queue - spawns initial batch of processes (like init)
     let initial_pids = work_queue.start().await;
     tracing::info!(
         "backfill: spawned {} initial processes (demand-driven, {} pending)",
@@ -135,7 +108,6 @@ pub async fn run_backfill_days(
         work_queue.pending_count().await
     );
 
-    // Create worker pool with OS thread mapping
     let worker_pool = WorkerPool::new(group_scheduler.scheduler().clone(), BACKFILL_CONCURRENCY);
     tracing::info!(
         "backfill: worker pool with {} workers (optimal={})",
@@ -143,25 +115,28 @@ pub async fn run_backfill_days(
         WorkerPool::optimal_worker_count()
     );
 
-    // Capture context for worker tasks
     let cfg_arc = Arc::new(cfg.clone());
     let aws_cfg_arc = Arc::new(aws_cfg.clone());
     let sender_factory_arc = Arc::new(sender_factory.clone());
 
-    // Create priority-aware pause check function based on cluster stress
-    // Lower priority work (old backfill days) pauses more aggressively
     let pause_check = {
-        let tracker = stress_tracker.clone();
+        let es_tracker = es_stress_tracker.clone();
+        let cw_tracker = cw_stress_tracker.clone();
         move |priority: u8| -> Option<Duration> {
-            let Some(tracker) = &tracker else {
-                return None;
-            };
-            tracker.should_pause_for_priority(priority)
+            if let Some(ref es) = es_tracker {
+                if let Some(duration) = es.should_pause_for_priority(priority) {
+                    return Some(duration);
+                }
+            }
+            if let Some(ref cw) = cw_tracker {
+                if let Some(duration) = cw.should_pause_for_priority(priority) {
+                    return Some(duration);
+                }
+            }
+            None
         }
     };
 
-    // Spawn workers with demand-driven task factory and stress-aware pausing
-    // Workers complete() on the queue, which spawns the next pending work
     let worker_handles = worker_pool.spawn_workers_with_pause(
         work_queue.clone(),
         {
@@ -188,7 +163,6 @@ pub async fn run_backfill_days(
         pause_check,
     );
 
-    // Wait for all workers to complete and collect stats
     let mut stats = BackfillStats::default();
     for handle in worker_handles {
         if let Ok(worker_stats) = handle.await {
@@ -205,7 +179,6 @@ pub async fn run_backfill_days(
         }
     }
 
-    // Log final stats
     let counts = group_scheduler.process_counts().await;
     tracing::info!(
         "backfill complete: {} events in {:?} ({:.2} eps), {} processes terminated",
@@ -218,7 +191,6 @@ pub async fn run_backfill_days(
     Ok(stats)
 }
 
-/// Execute backfill for a single day.
 pub async fn execute_backfill_day(
     cfg: &Config,
     aws_cfg: &aws_config::SdkConfig,
@@ -229,7 +201,6 @@ pub async fn execute_backfill_day(
 ) -> usize {
     let (start_ms, end_ms) = day_range_ms(day_offset);
 
-    // Create tailer for this day
     let tailer = match create_tailer_for_day(cfg, aws_cfg).await {
         Ok(t) => t,
         Err(err) => {
@@ -281,7 +252,6 @@ pub async fn execute_backfill_day(
     sent
 }
 
-/// Create a tailer for backfill day processing.
 async fn create_tailer_for_day(
     cfg: &Config,
     aws_cfg: &aws_config::SdkConfig,

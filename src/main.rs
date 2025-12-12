@@ -1,5 +1,3 @@
-//! Logstream entry point - CloudWatch to Elasticsearch log streaming.
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +15,7 @@ use logstream::checkpoint::checkpoint_path_for;
 use logstream::config::Config;
 use logstream::cw_counts::CwCounter;
 use logstream::cw_tail::{CloudWatchTailer, TailConfig};
+use logstream::stress::{StressConfig, StressTracker};
 use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
 use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
@@ -34,10 +33,6 @@ use logstream::runner::{
     ReconcileExecContext,
 };
 use logstream::state::CheckpointState;
-
-// ============================================================================
-// Main Entry Point
-// ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,7 +60,8 @@ async fn main() -> Result<()> {
 
     let es_cfg = EsConfig::from_env();
     let sink = create_bulk_sink(&cfg, &es_cfg, &index_prefix)?;
-    let stress_tracker = sink.stress_tracker();
+    let es_stress_tracker = sink.stress_tracker();
+    let cw_stress_tracker = std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
     let adaptive_controller = adaptive::create_controller();
     info!(
         "adaptive controller: initial batch={} in_flight={}",
@@ -74,16 +70,9 @@ async fn main() -> Result<()> {
     );
     sink.start_adaptive(event_router, adaptive_controller.clone());
 
-    // Index hygiene
     run_index_hygiene(&es_cfg, &index_prefix).await;
-
-    // Schema healing
     run_schema_healing(&es_cfg, &cfg, &index_prefix).await;
-
-    // Recovery checks
     run_recovery_checks(&es_cfg, &cfg, &index_prefix).await;
-
-    // Spawn group handlers
     let groups = cfg.effective_log_groups();
     let mut handles = Vec::new();
 
@@ -92,7 +81,8 @@ async fn main() -> Result<()> {
         let group_cfg = cfg.with_log_group(group.clone(), group_checkpoint.clone());
         let aws_cfg = aws_cfg.clone();
         let sender_factory = sender_factory.clone();
-        let stress_tracker = stress_tracker.clone();
+        let es_stress = es_stress_tracker.clone();
+        let cw_stress = cw_stress_tracker.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(err) = run_group(
@@ -100,7 +90,8 @@ async fn main() -> Result<()> {
                 aws_cfg,
                 sender_factory,
                 buffer_caps,
-                stress_tracker,
+                es_stress,
+                cw_stress,
             )
             .await
             {
@@ -119,11 +110,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// Configuration Types
-// ============================================================================
-
-/// Elasticsearch configuration from environment.
 struct EsConfig {
     url: String,
     user: String,
@@ -144,10 +130,6 @@ impl EsConfig {
         }
     }
 }
-
-// ============================================================================
-// Initialization Functions
-// ============================================================================
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -196,10 +178,6 @@ fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: &str) -> Resu
     };
     EsBulkSink::new(sink_cfg)
 }
-
-// ============================================================================
-// Startup Operations
-// ============================================================================
 
 async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
     let default_index = format!("{}-default", index_prefix);
@@ -273,16 +251,13 @@ async fn run_recovery_checks(es_cfg: &EsConfig, cfg: &Config, index_prefix: &str
     }
 }
 
-// ============================================================================
-// Group Runner
-// ============================================================================
-
 async fn run_group(
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
     buffer_caps: BufferCapacities,
-    stress_tracker: std::sync::Arc<crate::es_recovery::ClusterStressTracker>,
+    es_stress_tracker: std::sync::Arc<StressTracker>,
+    cw_stress_tracker: std::sync::Arc<StressTracker>,
 ) -> Result<()> {
     let resources = create_group_resources(&buffer_caps);
     let group_scheduler =
@@ -294,7 +269,7 @@ async fn run_group(
 
     let env_cfg = GroupEnvConfig::from_env(cfg.backfill_days);
 
-    let tailer = CloudWatchTailer::new(
+    let tailer = CloudWatchTailer::with_stress_tracker(
         TailConfig {
             log_group: cfg.log_group.clone(),
             poll_interval: Duration::from_secs(cfg.poll_interval_secs),
@@ -304,6 +279,7 @@ async fn run_group(
         cw_client,
         checkpoint,
         cfg.checkpoint_path.clone(),
+        cw_stress_tracker.clone(),
     );
 
     let es_counter = EsCounter::new(
@@ -331,14 +307,13 @@ async fn run_group(
         "run_group: process scheduler initialized"
     );
 
-    // Spawn daemon processes
     let tail_pid = group_scheduler.spawn_realtime_tail().await;
     let reconcile_pid = if !env_cfg.disable_reconcile {
         Some(group_scheduler.spawn_reconcile().await)
     } else {
         None
     };
-    let full_history_pid = if !env_cfg.disable_reconcile && cfg.backfill_days == 0 {
+    let full_history_pid = if !env_cfg.disable_reconcile {
         Some(group_scheduler.spawn_full_history_reconcile().await)
     } else {
         None
@@ -359,7 +334,6 @@ async fn run_group(
         "run_group: daemons spawned, batch work will be demand-driven"
     );
 
-    // Execute conflict daemon
     let conflict_handle = conflict_pid.map(|pid| {
         execute_conflict_daemon(
             pid,
@@ -368,7 +342,6 @@ async fn run_group(
         )
     });
 
-    // Execute tail daemon
     let tail_sink = sender_factory.at(Priority::CRITICAL);
     let mut tail_handle = execute_tail_daemon(
         tail_pid,
@@ -378,7 +351,6 @@ async fn run_group(
         group_scheduler.scheduler().clone(),
     );
 
-    // Execute reconcile daemon
     let reconcile_handle = if let Some(pid) = reconcile_pid {
         let ctx = ReconcileExecContext {
             cfg: &cfg,
@@ -393,7 +365,6 @@ async fn run_group(
         None
     };
 
-    // Execute full history reconcile daemon
     let reconcile_full_handle = if let Some(pid) = full_history_pid {
         let ctx = ReconcileExecContext {
             cfg: &cfg,
@@ -416,12 +387,12 @@ async fn run_group(
         None
     };
 
-    // Execute heal batch (demand-driven spawning)
     let heal_handle = if env_cfg.heal_days > 0 {
         let cfg_for_heal = cfg.clone();
         let aws_cfg_for_heal = aws_cfg.clone();
         let sender_factory_for_heal = sender_factory.clone();
-        let stress_tracker_for_heal = stress_tracker.clone();
+        let es_stress_for_heal = es_stress_tracker.clone();
+        let cw_stress_for_heal = cw_stress_tracker.clone();
         Some(tokio::spawn(async move {
             run_heal_days(
                 cfg_for_heal,
@@ -429,7 +400,8 @@ async fn run_group(
                 sender_factory_for_heal,
                 env_cfg.heal_days,
                 buffer_caps,
-                Some(stress_tracker_for_heal),
+                Some(es_stress_for_heal),
+                Some(cw_stress_for_heal),
             )
             .await
         }))
@@ -437,19 +409,21 @@ async fn run_group(
         None
     };
 
-    // Execute backfill batch
     let log_group_for_backfill = cfg.log_group.clone();
     let log_group_for_exit = cfg.log_group.clone();
     let backfill_handle = if cfg.backfill_days > 0 {
         let cfg_for_backfill = cfg.clone();
         let aws_cfg_for_backfill = aws_cfg.clone();
+        let es_stress_for_backfill = es_stress_tracker.clone();
+        let cw_stress_for_backfill = cw_stress_tracker.clone();
         Some(tokio::spawn(async move {
             match run_backfill_days(
                 cfg_for_backfill,
                 aws_cfg_for_backfill,
                 sender_factory.clone(),
                 buffer_caps,
-                Some(stress_tracker),
+                Some(es_stress_for_backfill),
+                Some(cw_stress_for_backfill),
             )
             .await
             {
@@ -468,14 +442,12 @@ async fn run_group(
         None
     };
 
-    // Wait for tail to exit
     tokio::select! {
         _ = &mut tail_handle => {
             info!("tailer exited for group {}", log_group_for_exit);
         }
     }
 
-    // Shutdown
     group_scheduler.shutdown_daemons().await;
     let final_counts = group_scheduler.process_counts().await;
     info!(
@@ -484,7 +456,6 @@ async fn run_group(
         "run_group: shutting down"
     );
 
-    // Abort handles
     if let Some(h) = reconcile_handle {
         h.abort();
     }
