@@ -567,7 +567,22 @@ fn value_to_field_type(value: &Value) -> FieldType {
                 FieldType::String
             }
         }
-        Value::Array(_) => FieldType::Array,
+        Value::Array(arr) => {
+            // ES treats arrays transparently - look at element type
+            // An array of strings is stored as a string field in ES
+            if let Some(first) = arr.iter().find(|v| !v.is_null()) {
+                match first {
+                    Value::String(_) => FieldType::String,
+                    Value::Number(_) => FieldType::Number,
+                    Value::Bool(_) => FieldType::Boolean,
+                    Value::Object(_) => FieldType::Object,
+                    Value::Array(_) => FieldType::Array, // nested array
+                    Value::Null => FieldType::Unknown,
+                }
+            } else {
+                FieldType::Unknown // empty array
+            }
+        }
         Value::Object(_) => FieldType::Object,
     }
 }
@@ -591,5 +606,19 @@ fn types_compatible(es_type: &FieldType, data_type: &FieldType) -> bool {
         return true;
     }
 
+    // ES treats arrays transparently - a String field can hold ["a", "b"] or "a"
+    // So Array is compatible with the element type
+    if *data_type == FieldType::Array {
+        // Array data is compatible with String (arrays of strings), Number, etc.
+        // ES doesn't distinguish array vs single value in mapping
+        return matches!(
+            es_type,
+            FieldType::String | FieldType::Number | FieldType::Boolean | FieldType::Date
+        );
+    }
+
+    // The critical incompatibility: Object vs primitive
+    // This is what causes "tried to parse field as object, but found a concrete value"
+    // Only flag Object vs non-Object mismatches
     false
 }

@@ -101,6 +101,31 @@ mod field_type_analysis {
         ];
         assert_eq!(analyze_field_type(&samples), FieldType::String);
     }
+
+    #[test]
+    fn test_array_of_strings_is_string() {
+        // ES treats arrays transparently - ["a", "b"] in a keyword field
+        let samples = vec![json!(["hello", "world"]), json!(["test"])];
+        assert_eq!(analyze_field_type(&samples), FieldType::String);
+    }
+
+    #[test]
+    fn test_array_of_numbers_is_number() {
+        let samples = vec![json!([1, 2, 3]), json!([4, 5])];
+        assert_eq!(analyze_field_type(&samples), FieldType::Number);
+    }
+
+    #[test]
+    fn test_array_of_objects_is_object() {
+        let samples = vec![json!([{"a": 1}]), json!([{"b": 2}])];
+        assert_eq!(analyze_field_type(&samples), FieldType::Object);
+    }
+
+    #[test]
+    fn test_empty_array_is_unknown() {
+        let samples = vec![json!([])];
+        assert_eq!(analyze_field_type(&samples), FieldType::Unknown);
+    }
 }
 
 mod system_index_detection {

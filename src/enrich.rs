@@ -69,7 +69,8 @@ fn try_parse_and_normalize(s: &str) -> Result<Option<Value>> {
 }
 
 fn normalize_value(v: &mut Value, depth: usize) {
-    const MAX_DEPTH: usize = 20;
+    const MAX_DEPTH: usize = 10;
+    const FLATTEN_DEPTH: usize = 6;
     const INT_MAX: i64 = 2_147_483_647;
 
     if depth > MAX_DEPTH {
@@ -96,6 +97,11 @@ fn normalize_value(v: &mut Value, depth: usize) {
                         normalize_value(&mut child, depth + 1);
                         map.insert(renamed, child);
                     } else if has_type_conflict(&child, &clean_key) {
+                        // Field pattern suggests it should be a primitive
+                        let stringified = flatten_to_string(&child);
+                        map.insert(clean_key, stringified);
+                    } else if depth >= FLATTEN_DEPTH && matches!(child, Value::Object(_)) {
+                        // Deep nesting: flatten objects to prevent mapping conflicts
                         let stringified = flatten_to_string(&child);
                         map.insert(clean_key, stringified);
                     } else {
@@ -159,12 +165,23 @@ fn is_reserved_field(key: &str) -> bool {
 fn has_type_conflict(value: &Value, key: &str) -> bool {
     let key_lower = key.to_lowercase();
 
-    // Only handle the most common problematic keys that are almost always primitives
-    // but sometimes appear as objects in logs
+    // Keys that are almost always primitives but sometimes come as objects/arrays
     let always_primitive_keys = ["id", "type", "status", "code", "version"];
-
     if always_primitive_keys.contains(&key_lower.as_str()) {
         return matches!(value, Value::Object(_) | Value::Array(_));
+    }
+
+    // Only flatten objects for the date pattern checks (not arrays)
+    if !matches!(value, Value::Object(_)) {
+        return false;
+    }
+
+    // Date/time fields ending with common suffixes - should be strings, not objects
+    let date_suffixes = ["at", "date", "time", "timestamp", "datetime"];
+    for suffix in &date_suffixes {
+        if key_lower.ends_with(suffix) && key_lower.len() > suffix.len() {
+            return true;
+        }
     }
 
     false
