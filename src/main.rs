@@ -21,7 +21,6 @@ use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
 use logstream::es_index::{
     apply_backfill_settings, cleanup_problematic_indices, drop_index_if_exists,
-    ensure_index_template, update_existing_indices_field_limit,
 };
 use logstream::es_recovery;
 use logstream::es_schema_heal::SchemaHealer;
@@ -206,19 +205,6 @@ fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: Arc<str>) -> 
 }
 
 async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
-    if let Err(err) =
-        ensure_index_template(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix).await
-    {
-        tracing::warn!("failed to ensure index template: {err:?}");
-    }
-
-    if let Err(err) =
-        update_existing_indices_field_limit(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix)
-            .await
-    {
-        tracing::warn!("failed to update existing indices field limit: {err:?}");
-    }
-
     let default_index = format!("{}-default", index_prefix);
     if let Err(err) =
         drop_index_if_exists(&es_cfg.url, &es_cfg.user, &es_cfg.pass, &default_index).await

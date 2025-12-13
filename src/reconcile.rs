@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Semaphore;
 use tokio::time::{interval, sleep, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use std::sync::Arc;
 
@@ -463,25 +463,130 @@ async fn execute_full_replace(
     events: Vec<LogEvent>,
     cw_count: u64,
 ) {
-    if let Err(err) = ctx.es_counter.delete_range(start_ms, end_ms).await {
-        warn!(
-            "reconcile ES delete failed: {err:?} for {}-{}",
-            start_ms, end_ms
-        );
-    }
+    // CRITICAL: Collect IDs we're about to ingest BEFORE sending
+    // We do NOT delete first - that causes data loss if ingestion fails
+    let cw_ids: std::collections::HashSet<String> = events.iter().map(|e| e.id.clone()).collect();
+    let cw_id_count = cw_ids.len();
 
+    debug!(
+        "reconcile safe_replace: starting for {}-{} with {} CW events ({} unique IDs)",
+        start_ms,
+        end_ms,
+        events.len(),
+        cw_id_count
+    );
+
+    // Upsert all events first (safe - won't lose data)
+    let mut ingested = 0usize;
+    let mut enrich_failures = 0usize;
     for raw in events {
         if let Some(enriched) = enrich_event(raw, None) {
             if ctx.sink_tx.send(enriched).await.is_err() {
-                warn!("reconcile sink closed for {}-{}", start_ms, end_ms);
+                warn!(
+                    "reconcile safe_replace: sink closed after {} ingested for {}-{}",
+                    ingested, start_ms, end_ms
+                );
                 break;
             }
+            ingested += 1;
+        } else {
+            enrich_failures += 1;
         }
     }
 
+    if enrich_failures > 0 {
+        warn!(
+            "reconcile safe_replace: {} events failed enrichment for {}-{}",
+            enrich_failures, start_ms, end_ms
+        );
+    }
+
+    // Only delete orphaned events (in ES but not in CW) after successful upserts
+    if ingested > 0 {
+        match ctx.es_counter.get_ids_in_range(start_ms, end_ms).await {
+            Ok(es_ids) => {
+                let es_id_count = es_ids.len();
+                let es_id_set: std::collections::HashSet<String> = es_ids.into_iter().collect();
+
+                // Find orphans (in ES but not in CW)
+                let orphan_ids: Vec<String> = es_id_set
+                    .iter()
+                    .filter(|id| !cw_ids.contains(*id))
+                    .cloned()
+                    .collect();
+
+                // Find missing (in CW but not in ES) - for debugging
+                let missing_from_es: Vec<&String> = cw_ids
+                    .iter()
+                    .filter(|id| !es_id_set.contains(*id))
+                    .collect();
+
+                if !missing_from_es.is_empty() {
+                    info!(
+                        "reconcile safe_replace: {} events in CW but not in ES for {}-{} (will be added)",
+                        missing_from_es.len(),
+                        start_ms,
+                        end_ms
+                    );
+                    if missing_from_es.len() <= 20 {
+                        for id in &missing_from_es {
+                            debug!("reconcile safe_replace: missing event ID: {}", id);
+                        }
+                    } else {
+                        debug!(
+                            "reconcile safe_replace: first 20 missing IDs: {:?}",
+                            &missing_from_es[..20]
+                        );
+                    }
+                }
+
+                debug!(
+                    "reconcile safe_replace: ES has {} IDs, CW has {}, orphans={}, missing={}",
+                    es_id_count,
+                    cw_id_count,
+                    orphan_ids.len(),
+                    missing_from_es.len()
+                );
+
+                if !orphan_ids.is_empty() {
+                    info!(
+                        "reconcile safe_replace: deleting {} orphan events (in ES but not CW) for {}-{}",
+                        orphan_ids.len(),
+                        start_ms,
+                        end_ms
+                    );
+                    if orphan_ids.len() <= 20 {
+                        for id in &orphan_ids {
+                            debug!("reconcile safe_replace: orphan event ID: {}", id);
+                        }
+                    }
+                    if let Err(err) = ctx.es_counter.delete_ids(&orphan_ids).await {
+                        warn!(
+                            "reconcile safe_replace: delete orphans failed: {err:?} ({} orphans) for {}-{}",
+                            orphan_ids.len(),
+                            start_ms,
+                            end_ms
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "reconcile safe_replace: failed to get ES IDs for orphan check: {err:?} for {}-{}",
+                    start_ms, end_ms
+                );
+            }
+        }
+    } else {
+        warn!(
+            "reconcile safe_replace: zero events ingested (of {} CW events) for {}-{}, skipping orphan check",
+            cw_count, start_ms, end_ms
+        );
+    }
+
     info!(
-        "reconcile complete (full replace): {} events for {}-{}",
-        cw_count, start_ms, end_ms
+        "reconcile safe_replace: complete - ingested={} cw_count={} for {}-{}",
+        ingested, cw_count, start_ms, end_ms
     );
 }
 
@@ -530,14 +635,36 @@ async fn execute_integrity_aware_ingest(
 }
 
 async fn upsert_events(ctx: &ReconcileContext, events: Vec<LogEvent>) {
+    let total = events.len();
+    let mut ingested = 0usize;
+    let mut enrich_failures = 0usize;
+
     for raw in events {
         if let Some(enriched) = enrich_event(raw, None) {
             if ctx.sink_tx.send(enriched).await.is_err() {
-                warn!("reconcile upsert: sink closed");
+                warn!(
+                    "reconcile upsert: sink closed after {}/{} events",
+                    ingested, total
+                );
                 break;
             }
+            ingested += 1;
+        } else {
+            enrich_failures += 1;
         }
     }
+
+    if enrich_failures > 0 {
+        warn!(
+            "reconcile upsert: {} of {} events failed enrichment",
+            enrich_failures, total
+        );
+    }
+
+    debug!(
+        "reconcile upsert: completed {}/{} events (enrich_failures={})",
+        ingested, total, enrich_failures
+    );
 }
 
 async fn execute_live_learn_upsert(

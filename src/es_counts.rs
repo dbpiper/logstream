@@ -244,4 +244,115 @@ impl EsCounter {
         }
         Ok(ids)
     }
+
+    /// Get all event IDs in a time range (for orphan detection).
+    pub async fn get_ids_in_range(&self, start_ms: i64, end_ms: i64) -> Result<Vec<String>> {
+        let mut all_ids = Vec::new();
+        let mut search_after: Option<(i64, String)> = None;
+        const BATCH_SIZE: usize = 5000;
+
+        loop {
+            let url = format!("{}/{}-*/_search", self.base_url, self.index_prefix);
+            let mut body = serde_json::json!({
+                "size": BATCH_SIZE,
+                "sort": [
+                    { "@timestamp": { "order": "asc" } },
+                    { "event.id": { "order": "asc" } }
+                ],
+                "_source": ["event.id"],
+                "query": {
+                    "range": {
+                        "@timestamp": {
+                            "gte": start_ms,
+                            "lte": end_ms,
+                            "format": "epoch_millis"
+                        }
+                    }
+                }
+            });
+
+            if let Some((ts, id)) = &search_after {
+                body["search_after"] = serde_json::json!([ts, id]);
+            }
+
+            let resp = self
+                .client
+                .post(&url)
+                .basic_auth(&self.user, Some(&self.pass))
+                .json(&body)
+                .send()
+                .await
+                .context("es get_ids_in_range request")?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!("es get_ids_in_range status {}", resp.status());
+            }
+
+            let parsed: serde_json::Value =
+                resp.json().await.context("es get_ids_in_range parse")?;
+            let hits = parsed["hits"]["hits"].as_array();
+
+            let Some(hits) = hits else {
+                break;
+            };
+
+            if hits.is_empty() {
+                break;
+            }
+
+            for hit in hits {
+                if let Some(id) = hit["_source"]["event"]["id"].as_str() {
+                    all_ids.push(id.to_string());
+                }
+                // Update search_after for pagination
+                if let Some(sort) = hit["sort"].as_array() {
+                    if sort.len() >= 2 {
+                        let ts = sort[0].as_i64().unwrap_or(0);
+                        let id_val = sort[1].as_str().unwrap_or("").to_string();
+                        search_after = Some((ts, id_val));
+                    }
+                }
+            }
+
+            if hits.len() < BATCH_SIZE {
+                break;
+            }
+        }
+
+        Ok(all_ids)
+    }
+
+    /// Delete specific event IDs (for orphan cleanup).
+    pub async fn delete_ids(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/{}-*/_delete_by_query?conflicts=proceed",
+            self.base_url, self.index_prefix
+        );
+        let body = serde_json::json!({
+            "query": {
+                "terms": {
+                    "event.id": ids
+                }
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .basic_auth(&self.user, Some(&self.pass))
+            .json(&body)
+            .send()
+            .await
+            .context("es delete_ids request")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("es delete_ids status {}", resp.status());
+        }
+
+        Ok(())
+    }
 }

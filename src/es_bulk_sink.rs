@@ -119,7 +119,7 @@ impl EsBulkSink {
                         &batch,
                         adaptive.clone(),
                         max_in_flight,
-                        &stress_tracker,
+                        stress_tracker.clone(),
                     )
                     .await;
 
@@ -155,6 +155,7 @@ impl EsBulkSink {
                     &cfg.pass,
                     &cfg.index_prefix,
                     &buf,
+                    &stress_tracker,
                 )
                 .await;
             }
@@ -175,7 +176,7 @@ async fn send_bulk_adaptive_tracked(
     batch: &[EnrichedEvent],
     adaptive: Arc<AdaptiveController>,
     max_in_flight: usize,
-    stress_tracker: &StressTracker,
+    stress_tracker: Arc<StressTracker>,
 ) -> Result<()> {
     // Reduce concurrency if cluster is stressed
     let effective_in_flight = match stress_tracker.stress_level() {
@@ -199,11 +200,21 @@ async fn send_bulk_adaptive_tracked(
         let index_prefix = cfg.index_prefix.clone();
         let chunk_vec: Vec<EnrichedEvent> = chunk.to_vec();
         let adaptive_clone = adaptive.clone();
+        let stress_clone = stress_tracker.clone();
 
         handles.push(tokio::spawn(async move {
             let _p = permit;
             let started = std::time::Instant::now();
-            let res = send_bulk_tracked(&c, &url, &user, &pass, &index_prefix, &chunk_vec).await;
+            let res = send_bulk_tracked(
+                &c,
+                &url,
+                &user,
+                &pass,
+                &index_prefix,
+                &chunk_vec,
+                &stress_clone,
+            )
+            .await;
             let latency = started.elapsed().as_millis() as u64;
 
             // Record chunk latency for fine-grained adaptation
@@ -267,12 +278,20 @@ pub enum FailureKind {
     Retryable,
     /// Document has too many fields for the index field limit.
     FieldLimitExceeded,
+    /// Cluster has hit shard limit - must wait for capacity.
+    ShardLimitExceeded,
     /// Unknown or unrecoverable error.
     Other,
 }
 
 /// Classify a bulk item error into a failure kind.
 pub fn classify_error(error: &BulkItemError) -> FailureKind {
+    // Shard limit - cluster is at max capacity, must wait
+    if error.error_type == "validation_exception"
+        && error.reason.contains("maximum normal shards open")
+    {
+        return FailureKind::ShardLimitExceeded;
+    }
     if error.error_type == "document_parsing_exception"
         && error.reason.contains("Limit of total fields")
     {
@@ -312,6 +331,7 @@ async fn send_bulk_tracked(
     pass: &str,
     index_prefix: &str,
     batch: &[EnrichedEvent],
+    stress_tracker: &StressTracker,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -320,7 +340,7 @@ async fn send_bulk_tracked(
     let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
     let mut current_batch: Vec<EnrichedEvent> = batch.to_vec();
 
-    for attempt in 1..=5u64 {
+    for attempt in 1..=10u64 {
         let body = build_bulk_body(&current_batch, index_prefix)?;
 
         let send_result = client
@@ -350,6 +370,7 @@ async fn send_bulk_tracked(
                 let mut mapping_indices: HashSet<usize> = HashSet::new();
                 let mut retryable_indices: HashSet<usize> = HashSet::new();
                 let mut field_limit_indices: HashSet<usize> = HashSet::new();
+                let mut shard_limit_hit = false;
                 let mut version_conflict_count = 0usize;
                 let mut other_count = 0usize;
                 let mut other_failures: Vec<(usize, String, String)> = Vec::new();
@@ -373,6 +394,9 @@ async fn send_bulk_tracked(
                         FailureKind::FieldLimitExceeded => {
                             field_limit_indices.insert(item.index);
                         }
+                        FailureKind::ShardLimitExceeded => {
+                            shard_limit_hit = true;
+                        }
                         FailureKind::Other => {
                             other_count += 1;
                             other_failures.push((
@@ -388,6 +412,21 @@ async fn send_bulk_tracked(
                         }
                     }
                 }
+
+                // Handle shard limit - cluster-wide issue, wait and retry ALL docs
+                if shard_limit_hit {
+                    stress_tracker.record_failure();
+                    let backoff = stress_tracker.backoff_duration();
+                    warn!(
+                        "es bulk: shard limit exceeded, recording stress and waiting {:?} (attempt {}/10)",
+                        backoff, attempt
+                    );
+                    sleep(backoff).await;
+                    continue; // Retry entire batch
+                }
+
+                // Record success to decay stress if no shard issues
+                stress_tracker.record_success();
 
                 if version_conflict_count > 0 {
                     info!(
@@ -497,6 +536,9 @@ async fn send_bulk_tracked(
                                 if let Some(ref mut parsed) = ev.parsed {
                                     reduce_fields_to_limit(parsed);
                                 }
+                                if !ev.message.is_string() {
+                                    ev.message = serde_json::Value::String(ev.message.to_string());
+                                }
                             }
                             Some(ev)
                         } else {
@@ -534,7 +576,7 @@ async fn send_bulk_tracked(
 
     if !current_batch.is_empty() {
         warn!(
-            "es bulk: {} docs failed after retries, stringifying all parsed fields",
+            "es bulk: {} docs failed after retries, stringifying all fields",
             current_batch.len()
         );
         for ev in &mut current_batch {
@@ -542,16 +584,33 @@ async fn send_bulk_tracked(
                 .parsed
                 .take()
                 .map(|v| serde_json::Value::String(v.to_string()));
+            if !ev.message.is_string() {
+                ev.message = serde_json::Value::String(ev.message.to_string());
+            }
         }
 
         let body = build_bulk_body(&current_batch, index_prefix)?;
-        let _ = client
+        match client
             .post(&url)
             .basic_auth(user, Some(pass))
             .header("Content-Type", "application/x-ndjson")
             .body(body)
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    "es bulk: final fallback ingested {} docs",
+                    current_batch.len()
+                );
+            }
+            Ok(resp) => {
+                warn!("es bulk: final fallback failed status={}", resp.status());
+            }
+            Err(e) => {
+                warn!("es bulk: final fallback failed: {}", e);
+            }
+        }
     }
 
     Ok(())
@@ -559,11 +618,38 @@ async fn send_bulk_tracked(
 
 const FIELD_LIMIT_TARGET: usize = 900;
 
+/// Count ES fields correctly: ES counts unique field PATHS, not every nested object.
+/// Arrays don't multiply field count - identical keys across array elements = 1 field.
+/// e.g. `{"items": [{"x": 1}, {"x": 2}]}` = 1 field (items.x), not 2.
 fn count_fields(value: &serde_json::Value) -> usize {
+    let mut paths = std::collections::HashSet::new();
+    collect_field_paths(value, String::new(), &mut paths);
+    paths.len()
+}
+
+fn collect_field_paths(
+    value: &serde_json::Value,
+    prefix: String,
+    paths: &mut std::collections::HashSet<String>,
+) {
     match value {
-        serde_json::Value::Object(map) => map.len() + map.values().map(count_fields).sum::<usize>(),
-        serde_json::Value::Array(arr) => arr.iter().map(count_fields).sum(),
-        _ => 0,
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                paths.insert(path.clone());
+                collect_field_paths(child, path, paths);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                collect_field_paths(child, prefix.clone(), paths);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -575,22 +661,41 @@ fn max_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-fn count_fields_at_depth(value: &serde_json::Value, target_depth: usize, current: usize) -> usize {
+/// Count fields if we were to flatten at target_depth.
+/// Uses unique path counting like ES does.
+fn count_fields_at_depth(value: &serde_json::Value, target_depth: usize, _current: usize) -> usize {
+    let mut paths = std::collections::HashSet::new();
+    collect_paths_at_depth(value, String::new(), 0, target_depth, &mut paths);
+    paths.len()
+}
+
+fn collect_paths_at_depth(
+    value: &serde_json::Value,
+    prefix: String,
+    current_depth: usize,
+    target_depth: usize,
+    paths: &mut std::collections::HashSet<String>,
+) {
     match value {
-        serde_json::Value::Object(map) if current < target_depth => {
-            map.len()
-                + map
-                    .values()
-                    .map(|v| count_fields_at_depth(v, target_depth, current + 1))
-                    .sum::<usize>()
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", prefix, key)
+                };
+                paths.insert(path.clone());
+                if current_depth + 1 < target_depth {
+                    collect_paths_at_depth(child, path, current_depth + 1, target_depth, paths);
+                }
+            }
         }
-        serde_json::Value::Array(arr) if current < target_depth => arr
-            .iter()
-            .map(|v| count_fields_at_depth(v, target_depth, current + 1))
-            .sum(),
-        serde_json::Value::Object(map) => map.len(),
-        serde_json::Value::Array(arr) => arr.len(),
-        _ => 0,
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                collect_paths_at_depth(child, prefix.clone(), current_depth, target_depth, paths);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -292,6 +292,45 @@ mod failure_classification_tests {
         );
         assert_eq!(classify_error(&err), FailureKind::FieldLimitExceeded);
     }
+
+    #[test]
+    fn test_shard_limit_is_shard_limit_exceeded() {
+        let err = make_error(
+            "validation_exception",
+            "Validation Failed: 1: this action would add [2] shards, but this cluster currently has [1000]/[1000] maximum normal shards open",
+        );
+        assert_eq!(classify_error(&err), FailureKind::ShardLimitExceeded);
+    }
+
+    #[test]
+    fn test_shard_limit_real_world_error() {
+        let err = make_error(
+            "validation_exception",
+            "Validation Failed: 1: this action would add [2] shards, but this cluster currently has [1000]/[1000] maximum normal shards open; for more information, see https://www.elastic.co/docs/deploy-manage/production-guidance",
+        );
+        assert_eq!(classify_error(&err), FailureKind::ShardLimitExceeded);
+    }
+
+    #[test]
+    fn test_validation_exception_without_shard_limit_is_other() {
+        let err = make_error(
+            "validation_exception",
+            "Validation Failed: 1: some other validation error",
+        );
+        assert_eq!(classify_error(&err), FailureKind::Other);
+    }
+
+    #[test]
+    fn test_shard_limit_is_not_retryable() {
+        let err = make_error(
+            "validation_exception",
+            "this action would add [2] shards, but this cluster currently has [1000]/[1000] maximum normal shards open",
+        );
+        let kind = classify_error(&err);
+        assert_eq!(kind, FailureKind::ShardLimitExceeded);
+        assert_ne!(kind, FailureKind::Retryable);
+        assert_ne!(kind, FailureKind::Other);
+    }
 }
 
 mod failure_kind_behavior_tests {
@@ -321,6 +360,10 @@ mod failure_kind_behavior_tests {
             FailureKind::FieldLimitExceeded,
             FailureKind::FieldLimitExceeded
         );
+        assert_eq!(
+            FailureKind::ShardLimitExceeded,
+            FailureKind::ShardLimitExceeded
+        );
         assert_eq!(FailureKind::Other, FailureKind::Other);
     }
 
@@ -329,16 +372,27 @@ mod failure_kind_behavior_tests {
         assert_ne!(FailureKind::Mapping, FailureKind::VersionConflict);
         assert_ne!(FailureKind::Mapping, FailureKind::Retryable);
         assert_ne!(FailureKind::Mapping, FailureKind::FieldLimitExceeded);
+        assert_ne!(FailureKind::Mapping, FailureKind::ShardLimitExceeded);
         assert_ne!(FailureKind::Mapping, FailureKind::Other);
         assert_ne!(FailureKind::VersionConflict, FailureKind::Retryable);
         assert_ne!(
             FailureKind::VersionConflict,
             FailureKind::FieldLimitExceeded
         );
+        assert_ne!(
+            FailureKind::VersionConflict,
+            FailureKind::ShardLimitExceeded
+        );
         assert_ne!(FailureKind::VersionConflict, FailureKind::Other);
         assert_ne!(FailureKind::Retryable, FailureKind::FieldLimitExceeded);
+        assert_ne!(FailureKind::Retryable, FailureKind::ShardLimitExceeded);
         assert_ne!(FailureKind::Retryable, FailureKind::Other);
+        assert_ne!(
+            FailureKind::FieldLimitExceeded,
+            FailureKind::ShardLimitExceeded
+        );
         assert_ne!(FailureKind::FieldLimitExceeded, FailureKind::Other);
+        assert_ne!(FailureKind::ShardLimitExceeded, FailureKind::Other);
     }
 
     #[test]
@@ -348,6 +402,7 @@ mod failure_kind_behavior_tests {
             FailureKind::VersionConflict,
             FailureKind::Retryable,
             FailureKind::FieldLimitExceeded,
+            FailureKind::ShardLimitExceeded,
             FailureKind::Other,
         ];
         for (i, a) in variants.iter().enumerate() {
@@ -564,14 +619,35 @@ mod fallback_event_tests {
 mod field_limit_reduction_tests {
     use logstream::es_bulk_sink::reduce_fields_to_limit;
     use serde_json::json;
+    use std::collections::HashSet;
 
+    /// Count ES fields correctly: ES counts unique field PATHS.
+    /// Arrays don't multiply field count - identical keys across array elements = 1 field.
     fn count_fields(value: &serde_json::Value) -> usize {
+        let mut paths = HashSet::new();
+        collect_field_paths(value, String::new(), &mut paths);
+        paths.len()
+    }
+
+    fn collect_field_paths(value: &serde_json::Value, prefix: String, paths: &mut HashSet<String>) {
         match value {
             serde_json::Value::Object(map) => {
-                map.len() + map.values().map(count_fields).sum::<usize>()
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{}.{}", prefix, key)
+                    };
+                    paths.insert(path.clone());
+                    collect_field_paths(child, path, paths);
+                }
             }
-            serde_json::Value::Array(arr) => arr.iter().map(count_fields).sum(),
-            _ => 0,
+            serde_json::Value::Array(arr) => {
+                for child in arr {
+                    collect_field_paths(child, prefix.clone(), paths);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -864,13 +940,15 @@ mod field_limit_reduction_tests {
 
     #[test]
     fn test_array_with_many_objects() {
-        let items: Vec<_> = (0..300)
+        // ES counts UNIQUE field paths. Arrays with identical structures = same paths.
+        // So we need UNIQUE field names in each array element to exceed the limit.
+        let items: Vec<_> = (0..500)
             .map(|i| {
-                json!({
-                    "id": i,
-                    "name": format!("item_{}", i),
-                    "nested": { "data": { "value": i * 2, "extra": "more" } }
-                })
+                // Each item has unique field names to create unique paths
+                let mut obj = serde_json::Map::new();
+                obj.insert(format!("unique_field_{}", i), json!(i));
+                obj.insert(format!("nested_{}", i), json!({ "inner": i }));
+                serde_json::Value::Object(obj)
             })
             .collect();
         let mut value = json!({ "items": items });
