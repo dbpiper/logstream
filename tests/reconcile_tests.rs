@@ -882,7 +882,6 @@ mod schema_healing_tests {
             "elastic".to_string(),
             "password".to_string(),
             Duration::from_secs(30),
-            "logs".to_string(),
         );
 
         // Converting to Option<SchemaHealer> should work

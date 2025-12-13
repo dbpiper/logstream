@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     sink.start_heap_monitor(adaptive_controller.clone());
 
     run_index_hygiene(&es_cfg, &index_prefix).await;
-    run_schema_healing(&es_cfg, &cfg, &index_prefix).await;
+    run_schema_healing(&es_cfg, &cfg).await;
     run_recovery_checks(&es_cfg, &cfg, &index_prefix).await;
     let groups = cfg.effective_log_groups();
     let mut handles = Vec::new();
@@ -240,13 +240,12 @@ async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
     }
 }
 
-async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config, index_prefix: &str) {
+async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config) {
     let schema_healer = match SchemaHealer::new(
         es_cfg.url.clone(),
         es_cfg.user.clone(),
         es_cfg.pass.clone(),
         cfg.http_timeout(),
-        index_prefix.to_string(),
     ) {
         Ok(h) => h,
         Err(err) => {

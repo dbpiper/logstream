@@ -259,7 +259,6 @@ pub async fn execute_reconcile_daemon(
         ctx.es_user.to_string(),
         ctx.es_pass.to_string(),
         Duration::from_secs(60),
-        ctx.index_prefix.to_string(),
     )
     .ok();
 
@@ -298,7 +297,6 @@ pub async fn execute_full_history_daemon(
         ctx.es_user.to_string(),
         ctx.es_pass.to_string(),
         Duration::from_secs(60),
-        ctx.index_prefix.to_string(),
     )
     .ok();
 
