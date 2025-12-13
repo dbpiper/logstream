@@ -47,7 +47,9 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy
-        run: cargo clippy --all-targets --features testing -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features testing -- -D warnings
 
   test:
     name: Test
@@ -71,7 +73,9 @@ jobs:
         run: cargo build --release
 
       - name: Test
-        run: cargo test --release --features testing
+        run: |
+          cargo test --release
+          cargo test --release --features testing
 
   # Gate job that all checks must pass
   ci-pass:

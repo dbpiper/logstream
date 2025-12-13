@@ -265,12 +265,19 @@ pub enum FailureKind {
     VersionConflict,
     /// Transient error that can be retried (circuit breaker, timeout, etc).
     Retryable,
+    /// Document has too many fields for the index field limit.
+    FieldLimitExceeded,
     /// Unknown or unrecoverable error.
     Other,
 }
 
 /// Classify a bulk item error into a failure kind.
 pub fn classify_error(error: &BulkItemError) -> FailureKind {
+    if error.error_type == "document_parsing_exception"
+        && error.reason.contains("Limit of total fields")
+    {
+        return FailureKind::FieldLimitExceeded;
+    }
     let is_mapping = matches!(
         error.error_type.as_str(),
         "mapper_parsing_exception"
@@ -342,8 +349,10 @@ async fn send_bulk_tracked(
 
                 let mut mapping_indices: HashSet<usize> = HashSet::new();
                 let mut retryable_indices: HashSet<usize> = HashSet::new();
+                let mut field_limit_indices: HashSet<usize> = HashSet::new();
                 let mut version_conflict_count = 0usize;
                 let mut other_count = 0usize;
+                let mut other_failures: Vec<(usize, String, String)> = Vec::new();
 
                 for item in &failed_items {
                     match item.kind {
@@ -361,8 +370,16 @@ async fn send_bulk_tracked(
                                 &item.reason[..item.reason.len().min(200)]
                             );
                         }
+                        FailureKind::FieldLimitExceeded => {
+                            field_limit_indices.insert(item.index);
+                        }
                         FailureKind::Other => {
                             other_count += 1;
+                            other_failures.push((
+                                item.index,
+                                item.error_type.clone(),
+                                item.reason.clone(),
+                            ));
                             warn!(
                                 "es bulk unknown failure: type={} reason={}",
                                 item.error_type,
@@ -379,18 +396,15 @@ async fn send_bulk_tracked(
                     );
                 }
 
-                let mut other_failures: Vec<(usize, String, String)> = Vec::new();
-                for item in &failed_items {
-                    if item.kind == FailureKind::Other {
-                        other_failures.push((
-                            item.index,
-                            item.error_type.clone(),
-                            item.reason.clone(),
-                        ));
-                    }
+                if !field_limit_indices.is_empty() {
+                    warn!(
+                        "es bulk: {} docs exceeded field limit, stringifying parsed fields (attempt {})",
+                        field_limit_indices.len(),
+                        attempt
+                    );
                 }
 
-                if !other_failures.is_empty() && attempt == 5 {
+                if !other_failures.is_empty() {
                     warn!(
                         "es bulk: {} docs with unrecoverable errors, ingesting as raw with error info",
                         other_failures.len()
@@ -407,22 +421,37 @@ async fn send_bulk_tracked(
                     if !fallback_docs.is_empty() {
                         let fallback_body = build_bulk_body(&fallback_docs, index_prefix).ok();
                         if let Some(body) = fallback_body {
-                            let _ = client
+                            let resp = client
                                 .post(&url)
                                 .basic_auth(user, Some(pass))
                                 .header("Content-Type", "application/x-ndjson")
                                 .body(body)
                                 .send()
                                 .await;
-                            info!(
-                                "es bulk: ingested {} fallback docs with raw message",
-                                fallback_docs.len()
-                            );
+                            match resp {
+                                Ok(r) if r.status().is_success() => {
+                                    info!(
+                                        "es bulk: ingested {} fallback docs with raw message",
+                                        fallback_docs.len()
+                                    );
+                                }
+                                Ok(r) => {
+                                    warn!(
+                                        "es bulk: fallback ingestion failed status={}",
+                                        r.status()
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("es bulk: fallback ingestion failed: {}", e);
+                                }
+                            }
                         }
                     }
                 }
 
-                let needs_retry = !mapping_indices.is_empty() || !retryable_indices.is_empty();
+                let needs_retry = !mapping_indices.is_empty()
+                    || !retryable_indices.is_empty()
+                    || !field_limit_indices.is_empty();
                 if !needs_retry {
                     info!(
                         "es bulk sent batch={} (version_conflicts={} other={})",
@@ -449,8 +478,11 @@ async fn send_bulk_tracked(
                     );
                 }
 
-                let retry_indices: HashSet<usize> =
-                    mapping_indices.union(&retryable_indices).copied().collect();
+                let retry_indices: HashSet<usize> = mapping_indices
+                    .union(&retryable_indices)
+                    .copied()
+                    .chain(field_limit_indices.iter().copied())
+                    .collect();
                 current_batch = current_batch
                     .into_iter()
                     .enumerate()
@@ -459,6 +491,11 @@ async fn send_bulk_tracked(
                             if mapping_indices.contains(&i) {
                                 if let Some(ref mut parsed) = ev.parsed {
                                     normalize_for_es(parsed);
+                                }
+                            }
+                            if field_limit_indices.contains(&i) {
+                                if let Some(ref mut parsed) = ev.parsed {
+                                    reduce_fields_to_limit(parsed);
                                 }
                             }
                             Some(ev)
@@ -518,6 +555,231 @@ async fn send_bulk_tracked(
     }
 
     Ok(())
+}
+
+const FIELD_LIMIT_TARGET: usize = 900;
+
+fn count_fields(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => map.len() + map.values().map(count_fields).sum::<usize>(),
+        serde_json::Value::Array(arr) => arr.iter().map(count_fields).sum(),
+        _ => 0,
+    }
+}
+
+fn max_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(max_depth).max().unwrap_or(0),
+        serde_json::Value::Array(arr) => 1 + arr.iter().map(max_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn count_fields_at_depth(value: &serde_json::Value, target_depth: usize, current: usize) -> usize {
+    match value {
+        serde_json::Value::Object(map) if current < target_depth => {
+            map.len()
+                + map
+                    .values()
+                    .map(|v| count_fields_at_depth(v, target_depth, current + 1))
+                    .sum::<usize>()
+        }
+        serde_json::Value::Array(arr) if current < target_depth => arr
+            .iter()
+            .map(|v| count_fields_at_depth(v, target_depth, current + 1))
+            .sum(),
+        serde_json::Value::Object(map) => map.len(),
+        serde_json::Value::Array(arr) => arr.len(),
+        _ => 0,
+    }
+}
+
+fn flatten_at_depth(value: &mut serde_json::Value, target_depth: usize, current_depth: usize) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                if current_depth + 1 >= target_depth {
+                    match v {
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            *v = serde_json::Value::String(v.to_string());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    flatten_at_depth(v, target_depth, current_depth + 1);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                if current_depth + 1 >= target_depth {
+                    match v {
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            *v = serde_json::Value::String(v.to_string());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    flatten_at_depth(v, target_depth, current_depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn binary_search_optimal_depth(value: &serde_json::Value) -> usize {
+    let depth = max_depth(value);
+    if depth <= 1 {
+        return 0;
+    }
+
+    let mut lo = 1usize;
+    let mut hi = depth;
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let fields = count_fields_at_depth(value, mid, 0);
+        if fields <= FIELD_LIMIT_TARGET {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    lo
+}
+
+/// Reduce a JSON value to fit within the ES field limit using binary search.
+/// Preserves maximum structure by finding the optimal depth to flatten at.
+pub fn reduce_fields_to_limit(value: &mut serde_json::Value) {
+    if count_fields(value) <= FIELD_LIMIT_TARGET {
+        return;
+    }
+
+    let optimal_depth = binary_search_optimal_depth(value);
+
+    if optimal_depth == 0 {
+        *value = serde_json::Value::String(value.to_string());
+        return;
+    }
+
+    flatten_at_depth(value, optimal_depth, 0);
+
+    if count_fields(value) > FIELD_LIMIT_TARGET {
+        stringify_largest_children(value);
+    }
+}
+
+fn stringify_largest_children(value: &mut serde_json::Value) {
+    loop {
+        let current_count = count_fields(value);
+        if current_count <= FIELD_LIMIT_TARGET {
+            return;
+        }
+
+        let path = find_largest_subtree(value);
+        if path.is_empty() {
+            *value = serde_json::Value::String(value.to_string());
+            return;
+        }
+
+        stringify_at_path(value, &path);
+    }
+}
+
+fn find_largest_subtree(value: &serde_json::Value) -> Vec<String> {
+    fn recurse(
+        value: &serde_json::Value,
+        path: &mut Vec<String>,
+        best_path: &mut Vec<String>,
+        best_count: &mut usize,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, v) in map {
+                    let child_count = count_fields(v);
+                    if child_count > *best_count
+                        && matches!(
+                            v,
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                        )
+                    {
+                        *best_count = child_count;
+                        path.push(key.clone());
+                        *best_path = path.clone();
+                        path.pop();
+                    }
+                    path.push(key.clone());
+                    recurse(v, path, best_path, best_count);
+                    path.pop();
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    let child_count = count_fields(v);
+                    let key = format!("[{}]", i);
+                    if child_count > *best_count
+                        && matches!(
+                            v,
+                            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+                        )
+                    {
+                        *best_count = child_count;
+                        path.push(key.clone());
+                        *best_path = path.clone();
+                        path.pop();
+                    }
+                    path.push(key);
+                    recurse(v, path, best_path, best_count);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut path = Vec::new();
+    let mut best_path = Vec::new();
+    let mut best_count = 0usize;
+    recurse(value, &mut path, &mut best_path, &mut best_count);
+    best_path
+}
+
+fn stringify_at_path(value: &mut serde_json::Value, path: &[String]) {
+    if path.is_empty() {
+        return;
+    }
+
+    let mut current = value;
+    for (i, key) in path.iter().enumerate() {
+        let is_last = i == path.len() - 1;
+
+        if key.starts_with('[') && key.ends_with(']') {
+            let idx: usize = key[1..key.len() - 1].parse().unwrap_or(0);
+            if let serde_json::Value::Array(arr) = current {
+                if is_last {
+                    if let Some(v) = arr.get_mut(idx) {
+                        *v = serde_json::Value::String(v.to_string());
+                    }
+                    return;
+                }
+                current = arr.get_mut(idx).unwrap();
+            } else {
+                return;
+            }
+        } else if let serde_json::Value::Object(map) = current {
+            if is_last {
+                if let Some(v) = map.get_mut(key) {
+                    *v = serde_json::Value::String(v.to_string());
+                }
+                return;
+            }
+            current = map.get_mut(key).unwrap();
+        } else {
+            return;
+        }
+    }
 }
 
 fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str) -> Result<String> {

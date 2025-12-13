@@ -35,32 +35,22 @@ impl SchemaHealer {
         })
     }
 
-    /// Get base URL (for testing).
-    #[cfg(feature = "testing")]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    /// Get user (for testing).
-    #[cfg(feature = "testing")]
     pub fn user(&self) -> &str {
         &self.user
     }
 
-    /// Get password (for testing).
-    #[cfg(feature = "testing")]
     pub fn pass(&self) -> &str {
         &self.pass
     }
 
-    /// Get timeout (for testing).
-    #[cfg(feature = "testing")]
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    /// Get index prefix (for testing).
-    #[cfg(feature = "testing")]
     pub fn index_prefix(&self) -> &str {
         &self.index_prefix
     }
