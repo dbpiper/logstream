@@ -1070,7 +1070,10 @@ mod schema_healing_tests {
     #[test]
     fn test_schema_heal_uses_binary_search_for_drift_detection() {
         // Binary search should be used to efficiently find drift boundary
-        fn binary_search_drift_boundary(indices: &[&str], is_drifted: impl Fn(&str) -> bool) -> usize {
+        fn binary_search_drift_boundary(
+            indices: &[&str],
+            is_drifted: impl Fn(&str) -> bool,
+        ) -> usize {
             if indices.is_empty() {
                 return 0;
             }

@@ -470,18 +470,24 @@ impl SchemaHealer {
 
     /// Analyze mapping conflicts and fix them by deleting indices with wrong mappings.
     /// Returns the list of indices that were deleted and need re-population.
-    pub async fn fix_mapping_conflicts(&self, conflicts: &[MappingConflictInfo]) -> Result<Vec<String>> {
+    pub async fn fix_mapping_conflicts(
+        &self,
+        conflicts: &[MappingConflictInfo],
+    ) -> Result<Vec<String>> {
         if conflicts.is_empty() {
             return Ok(vec![]);
         }
 
         // Group conflicts by index
-        let mut indices_to_fix: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut indices_to_fix: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for conflict in conflicts {
             // Analyze the data to determine what the correct type should be
             let correct_type = analyze_field_type(&conflict.sample_values);
-            let current_type = self.get_field_type(&conflict.index, &conflict.field_path).await;
+            let current_type = self
+                .get_field_type(&conflict.index, &conflict.field_path)
+                .await;
 
             info!(
                 "schema_heal: field {} in {} - current={:?} correct={:?} (from {} samples)",
@@ -508,7 +514,10 @@ impl SchemaHealer {
         // Delete indices with wrong mappings
         let mut deleted = Vec::new();
         for index in &indices_to_fix {
-            info!("schema_heal: deleting index {} to fix mapping conflicts", index);
+            info!(
+                "schema_heal: deleting index {} to fix mapping conflicts",
+                index
+            );
             if let Err(err) = self.delete_index(index).await {
                 warn!("schema_heal: failed to delete {}: {err:?}", index);
             } else {
@@ -546,7 +555,10 @@ impl SchemaHealer {
         // Response is like: {"index": {"mappings": {"field.path": {"mapping": {"fieldname": {"type": "text"}}}}}}
         let field_name = field_path.split('.').next_back()?;
         let type_str = body
-            .pointer(&format!("/{}/mappings/{}/mapping/{}/type", index, field_path, field_name))
+            .pointer(&format!(
+                "/{}/mappings/{}/mapping/{}/type",
+                index, field_path, field_name
+            ))
             .and_then(|v| v.as_str());
 
         type_str.map(|t| match t {
@@ -587,7 +599,8 @@ pub fn analyze_field_type(samples: &[Value]) -> FieldType {
         return FieldType::Unknown;
     }
 
-    let mut type_counts: std::collections::HashMap<FieldType, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<FieldType, usize> =
+        std::collections::HashMap::new();
 
     for value in samples {
         let ft = value_to_field_type(value);
