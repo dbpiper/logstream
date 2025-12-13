@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         adaptive_controller.max_in_flight()
     );
     sink.start_adaptive(event_router, adaptive_controller.clone());
+    sink.start_heap_monitor(adaptive_controller.clone());
 
     run_index_hygiene(&es_cfg, &index_prefix).await;
     run_schema_healing(&es_cfg, &cfg, &index_prefix).await;

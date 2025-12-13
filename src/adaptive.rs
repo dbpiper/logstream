@@ -2,12 +2,21 @@
 //! Monitors ES health and dynamically adjusts ingestion behavior.
 //! Uses TCP-style congestion control: probe capacity, back off on congestion.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+/// Heap usage threshold (85%) - start backing off
+const HEAP_PRESSURE_THRESHOLD: f64 = 0.85;
+/// Heap critical threshold (95%) - emergency backoff
+const HEAP_CRITICAL_THRESHOLD: f64 = 0.95;
+/// CPU usage threshold (80%) - start backing off
+const CPU_PRESSURE_THRESHOLD: f64 = 0.80;
+/// CPU critical threshold (95%) - emergency backoff
+const CPU_CRITICAL_THRESHOLD: f64 = 0.95;
 
 /// Adaptive controller state.
 #[derive(Debug)]
@@ -28,6 +37,8 @@ pub struct AdaptiveController {
     config: AdaptiveConfig,
     /// Last adjustment time.
     last_adjust: RwLock<Instant>,
+    /// External pressure flag (set by health monitor).
+    external_pressure: AtomicBool,
 }
 
 /// Configuration for adaptive behavior.
@@ -92,6 +103,7 @@ impl AdaptiveController {
             fast_count: AtomicUsize::new(0),
             config,
             last_adjust: RwLock::new(Instant::now()),
+            external_pressure: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +124,110 @@ impl AdaptiveController {
 
     pub async fn latencies(&self) -> Vec<u64> {
         self.latencies.read().await.clone()
+    }
+
+    /// Check if under external pressure (e.g., ES heap/CPU pressure).
+    pub fn is_under_pressure(&self) -> bool {
+        self.external_pressure.load(Ordering::Relaxed)
+    }
+
+    /// Set external pressure flag based on heap usage and trigger backoff.
+    pub async fn set_heap_pressure(&self, heap_percent: f64) {
+        if heap_percent >= HEAP_CRITICAL_THRESHOLD {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            warn!(
+                "adaptive: ES heap CRITICAL at {:.1}% - emergency backoff",
+                heap_percent * 100.0
+            );
+            self.emergency_backoff().await;
+        } else if heap_percent >= HEAP_PRESSURE_THRESHOLD {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            info!(
+                "adaptive: ES heap pressure at {:.1}% - backing off",
+                heap_percent * 100.0
+            );
+            self.pressure_backoff().await;
+        } else {
+            // Don't clear pressure here - let set_es_pressure handle it
+        }
+    }
+
+    /// Set external pressure flag based on CPU usage and trigger backoff.
+    pub async fn set_cpu_pressure(&self, cpu_percent: f64) {
+        if cpu_percent >= CPU_CRITICAL_THRESHOLD {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            warn!(
+                "adaptive: ES CPU CRITICAL at {:.1}% - emergency backoff",
+                cpu_percent * 100.0
+            );
+            self.emergency_backoff().await;
+        } else if cpu_percent >= CPU_PRESSURE_THRESHOLD {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            info!(
+                "adaptive: ES CPU pressure at {:.1}% - backing off",
+                cpu_percent * 100.0
+            );
+            self.pressure_backoff().await;
+        }
+        // Don't clear pressure here - let set_es_pressure handle it
+    }
+
+    /// Set ES pressure based on both heap and CPU metrics.
+    /// Only clears pressure when BOTH are below thresholds.
+    pub async fn set_es_pressure(&self, heap_percent: f64, cpu_percent: f64) {
+        let heap_pressure = heap_percent >= HEAP_PRESSURE_THRESHOLD;
+        let cpu_pressure = cpu_percent >= CPU_PRESSURE_THRESHOLD;
+        let heap_critical = heap_percent >= HEAP_CRITICAL_THRESHOLD;
+        let cpu_critical = cpu_percent >= CPU_CRITICAL_THRESHOLD;
+
+        if heap_critical || cpu_critical {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            warn!(
+                "adaptive: ES CRITICAL heap={:.1}% cpu={:.1}% - emergency backoff",
+                heap_percent * 100.0,
+                cpu_percent * 100.0
+            );
+            self.emergency_backoff().await;
+        } else if heap_pressure || cpu_pressure {
+            self.external_pressure.store(true, Ordering::Relaxed);
+            info!(
+                "adaptive: ES pressure heap={:.1}% cpu={:.1}% - backing off",
+                heap_percent * 100.0,
+                cpu_percent * 100.0
+            );
+            self.pressure_backoff().await;
+        } else {
+            // Clear pressure only if both metrics are healthy
+            if self.external_pressure.swap(false, Ordering::Relaxed) {
+                info!(
+                    "adaptive: ES recovered heap={:.1}% cpu={:.1}% - pressure cleared",
+                    heap_percent * 100.0,
+                    cpu_percent * 100.0
+                );
+            }
+        }
+    }
+
+    /// Moderate backoff for heap pressure (less aggressive than emergency).
+    async fn pressure_backoff(&self) {
+        let batch = self.batch_size.load(Ordering::Relaxed);
+        let in_flight = self.max_in_flight.load(Ordering::Relaxed);
+
+        // Reduce by 25%
+        let new_batch = (batch * 3 / 4).max(self.config.min_batch_size);
+        let new_in_flight = (in_flight * 3 / 4).max(self.config.min_in_flight);
+
+        // Add moderate delay
+        let current_delay = self.delay_ms.load(Ordering::Relaxed);
+        let new_delay = (current_delay + 200).min(2000);
+
+        self.batch_size.store(new_batch, Ordering::Relaxed);
+        self.max_in_flight.store(new_in_flight, Ordering::Relaxed);
+        self.delay_ms.store(new_delay, Ordering::Relaxed);
+
+        // Reset fast counter to prevent speedup while under pressure
+        self.fast_count.store(0, Ordering::Relaxed);
+        *self.last_adjust.write().await = Instant::now();
     }
 
     /// Record a bulk response and adjust parameters.
@@ -219,8 +335,10 @@ impl AdaptiveController {
             self.slow_count.store(0, Ordering::Relaxed);
             *self.last_adjust.write().await = Instant::now();
         }
-        // Speed up if consistently fast
-        else if fast >= self.config.fast_threshold && avg_latency < self.config.target_latency_ms
+        // Speed up if consistently fast AND not under external pressure
+        else if fast >= self.config.fast_threshold
+            && avg_latency < self.config.target_latency_ms
+            && !self.external_pressure.load(Ordering::Relaxed)
         {
             let new_batch = (batch * 5 / 4).min(self.config.max_batch_size);
             let new_in_flight = (in_flight + 1).min(self.config.max_in_flight);

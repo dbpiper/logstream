@@ -561,3 +561,197 @@ async fn test_gradual_speedup_on_underload() {
         final_throughput
     );
 }
+
+mod heap_pressure_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_no_pressure_initially() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        assert!(!ctrl.is_under_pressure());
+    }
+
+    #[tokio::test]
+    async fn test_heap_pressure_triggers_backoff() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // 85% heap = pressure threshold
+        ctrl.set_heap_pressure(0.85).await;
+
+        assert!(ctrl.is_under_pressure());
+        assert!(ctrl.batch_size() < initial_batch);
+    }
+
+    #[tokio::test]
+    async fn test_critical_heap_triggers_emergency() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // 95% heap = critical threshold
+        ctrl.set_heap_pressure(0.95).await;
+
+        assert!(ctrl.is_under_pressure());
+        // Emergency backoff halves batch size
+        assert!(ctrl.batch_size() <= initial_batch / 2);
+        assert!(ctrl.delay() > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_heap_recovery_clears_pressure() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+
+        // Set pressure via combined method
+        ctrl.set_es_pressure(0.90, 0.50).await;
+        assert!(ctrl.is_under_pressure());
+
+        // Recover (both heap and CPU must be healthy)
+        ctrl.set_es_pressure(0.50, 0.50).await;
+        assert!(!ctrl.is_under_pressure());
+    }
+
+    #[tokio::test]
+    async fn test_no_speedup_under_pressure() {
+        let config = AdaptiveConfig {
+            adjust_interval: Duration::ZERO,
+            fast_threshold: 3,
+            ..AdaptiveConfig::default()
+        };
+        let ctrl = AdaptiveController::new(config);
+
+        // Set pressure
+        ctrl.set_heap_pressure(0.87).await;
+        let batch_after_pressure = ctrl.batch_size();
+
+        // Try to speed up with fast latencies
+        for _ in 0..10 {
+            ctrl.record_latency(50, true).await;
+        }
+
+        // Should NOT speed up because we're under pressure
+        assert!(
+            ctrl.batch_size() <= batch_after_pressure,
+            "should not speed up under pressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progressive_pressure_response() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // 80% - no pressure yet
+        ctrl.set_heap_pressure(0.80).await;
+        assert!(!ctrl.is_under_pressure());
+        assert_eq!(ctrl.batch_size(), initial_batch);
+
+        // 86% - pressure, moderate backoff
+        ctrl.set_heap_pressure(0.86).await;
+        assert!(ctrl.is_under_pressure());
+        let moderate_batch = ctrl.batch_size();
+        assert!(moderate_batch < initial_batch);
+
+        // 96% - critical, emergency backoff
+        ctrl.set_heap_pressure(0.96).await;
+        assert!(ctrl.batch_size() < moderate_batch);
+    }
+
+    #[tokio::test]
+    async fn test_heap_pressure_adds_delay() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        assert_eq!(ctrl.delay(), Duration::ZERO);
+
+        ctrl.set_heap_pressure(0.87).await;
+        assert!(ctrl.delay() > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_heap_pressure_values() {
+        // Test boundary conditions
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+
+        // Just below threshold
+        ctrl.set_heap_pressure(0.849).await;
+        assert!(!ctrl.is_under_pressure());
+
+        // At threshold
+        ctrl.set_heap_pressure(0.85).await;
+        assert!(ctrl.is_under_pressure());
+    }
+
+    #[tokio::test]
+    async fn test_cpu_pressure_triggers_backoff() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // 80% CPU = pressure threshold
+        ctrl.set_cpu_pressure(0.80).await;
+
+        assert!(ctrl.is_under_pressure());
+        assert!(ctrl.batch_size() < initial_batch);
+    }
+
+    #[tokio::test]
+    async fn test_critical_cpu_triggers_emergency() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // 95% CPU = critical threshold
+        ctrl.set_cpu_pressure(0.95).await;
+
+        assert!(ctrl.is_under_pressure());
+        assert!(ctrl.batch_size() <= initial_batch / 2);
+    }
+
+    #[tokio::test]
+    async fn test_combined_pressure_requires_both_healthy() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+
+        // Both under pressure
+        ctrl.set_es_pressure(0.90, 0.85).await;
+        assert!(ctrl.is_under_pressure());
+
+        // Heap recovers but CPU still high
+        ctrl.set_es_pressure(0.50, 0.85).await;
+        assert!(ctrl.is_under_pressure());
+
+        // CPU recovers but heap still high
+        ctrl.set_es_pressure(0.90, 0.50).await;
+        assert!(ctrl.is_under_pressure());
+
+        // Both recover - pressure should clear
+        ctrl.set_es_pressure(0.50, 0.50).await;
+        assert!(!ctrl.is_under_pressure());
+    }
+
+    #[tokio::test]
+    async fn test_combined_critical_triggers_emergency() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // CPU critical alone should trigger emergency
+        ctrl.set_es_pressure(0.50, 0.96).await;
+        assert!(ctrl.batch_size() <= initial_batch / 2);
+
+        // Reset
+        let ctrl2 = AdaptiveController::new(AdaptiveConfig::default());
+
+        // Heap critical alone should trigger emergency
+        ctrl2.set_es_pressure(0.96, 0.50).await;
+        assert!(ctrl2.batch_size() <= initial_batch / 2);
+    }
+
+    #[tokio::test]
+    async fn test_combined_moderate_triggers_backoff() {
+        let ctrl = AdaptiveController::new(AdaptiveConfig::default());
+        let initial_batch = ctrl.batch_size();
+
+        // Heap moderate pressure (below critical)
+        ctrl.set_es_pressure(0.87, 0.50).await;
+
+        assert!(ctrl.is_under_pressure());
+        // Should be moderate backoff, not emergency
+        assert!(ctrl.batch_size() < initial_batch);
+        assert!(ctrl.batch_size() > initial_batch / 2);
+    }
+}

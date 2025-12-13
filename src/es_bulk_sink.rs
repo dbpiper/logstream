@@ -52,6 +52,35 @@ impl EsBulkSink {
         self.stress_tracker.clone()
     }
 
+    /// Spawn a background task that monitors ES heap and CPU usage.
+    pub fn start_heap_monitor(&self, adaptive: Arc<AdaptiveController>) {
+        let client = self.client.clone();
+        let url = self.cfg.url.clone();
+        let user = self.cfg.user.clone();
+        let pass = self.cfg.pass.clone();
+
+        tokio::spawn(async move {
+            let check_interval = Duration::from_secs(10);
+
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                match check_es_resources(&client, &url, &user, &pass).await {
+                    Ok(stats) => {
+                        adaptive
+                            .set_es_pressure(stats.heap_percent, stats.cpu_percent)
+                            .await;
+                    }
+                    Err(err) => {
+                        // If we can't check resources, assume pressure to be safe
+                        warn!("es resource monitor: failed to check: {err:?}");
+                        adaptive.set_es_pressure(0.90, 0.90).await;
+                    }
+                }
+            }
+        });
+    }
+
     pub fn start_adaptive(
         &self,
         mut event_router: crate::event_router::EventRouter,
@@ -1007,4 +1036,75 @@ pub fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
         return format!("{}-{}", index_prefix, date);
     }
     format!("{}-default", index_prefix)
+}
+
+/// ES resource usage stats
+struct EsResourceStats {
+    heap_percent: f64,
+    cpu_percent: f64,
+}
+
+/// Check ES heap and CPU usage by querying /_nodes/stats.
+/// Returns heap and CPU usage as fractions (0.0 to 1.0).
+async fn check_es_resources(
+    client: &Client,
+    base_url: &str,
+    user: &str,
+    pass: &str,
+) -> Result<EsResourceStats> {
+    let url = format!("{}/_nodes/stats/jvm,os", base_url.trim_end_matches('/'));
+
+    let resp = client
+        .get(&url)
+        .basic_auth(user, Some(pass))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("ES stats request failed: {}", resp.status());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+
+    let mut max_heap_percent = 0.0f64;
+    let mut max_cpu_percent = 0.0f64;
+
+    if let Some(nodes) = body.get("nodes").and_then(|n| n.as_object()) {
+        for (_node_id, node_stats) in nodes {
+            // Check JVM heap
+            if let Some(jvm) = node_stats.get("jvm") {
+                if let Some(mem) = jvm.get("mem") {
+                    let used = mem
+                        .get("heap_used_in_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let max = mem
+                        .get("heap_max_in_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1);
+
+                    if max > 0 {
+                        let percent = used as f64 / max as f64;
+                        max_heap_percent = max_heap_percent.max(percent);
+                    }
+                }
+            }
+
+            // Check OS CPU
+            if let Some(os) = node_stats.get("os") {
+                if let Some(cpu) = os.get("cpu") {
+                    // ES returns cpu.percent as an integer 0-100
+                    let cpu_pct = cpu.get("percent").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let percent = cpu_pct as f64 / 100.0;
+                    max_cpu_percent = max_cpu_percent.max(percent);
+                }
+            }
+        }
+    }
+
+    Ok(EsResourceStats {
+        heap_percent: max_heap_percent,
+        cpu_percent: max_cpu_percent,
+    })
 }
