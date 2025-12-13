@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-/// Heap usage threshold (85%) - start backing off
-const HEAP_PRESSURE_THRESHOLD: f64 = 0.85;
-/// Heap critical threshold (95%) - emergency backoff
-const HEAP_CRITICAL_THRESHOLD: f64 = 0.95;
-/// CPU usage threshold (80%) - start backing off
-const CPU_PRESSURE_THRESHOLD: f64 = 0.80;
-/// CPU critical threshold (95%) - emergency backoff
-const CPU_CRITICAL_THRESHOLD: f64 = 0.95;
+/// Heap usage threshold (70%) - start backing off
+const HEAP_PRESSURE_THRESHOLD: f64 = 0.70;
+/// Heap critical threshold (85%) - emergency backoff
+const HEAP_CRITICAL_THRESHOLD: f64 = 0.85;
+/// CPU usage threshold (70%) - start backing off
+const CPU_PRESSURE_THRESHOLD: f64 = 0.70;
+/// CPU critical threshold (90%) - emergency backoff
+const CPU_CRITICAL_THRESHOLD: f64 = 0.90;
 
 /// Adaptive controller state.
 #[derive(Debug)]

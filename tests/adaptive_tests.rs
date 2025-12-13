@@ -576,8 +576,8 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // 85% heap = pressure threshold
-        ctrl.set_heap_pressure(0.85).await;
+        // 70% heap = pressure threshold
+        ctrl.set_heap_pressure(0.70).await;
 
         assert!(ctrl.is_under_pressure());
         assert!(ctrl.batch_size() < initial_batch);
@@ -588,8 +588,8 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // 95% heap = critical threshold
-        ctrl.set_heap_pressure(0.95).await;
+        // 85% heap = critical threshold
+        ctrl.set_heap_pressure(0.85).await;
 
         assert!(ctrl.is_under_pressure());
         // Emergency backoff halves batch size
@@ -601,8 +601,8 @@ mod heap_pressure_tests {
     async fn test_heap_recovery_clears_pressure() {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
 
-        // Set pressure via combined method
-        ctrl.set_es_pressure(0.90, 0.50).await;
+        // Set pressure via combined method (70% is threshold now)
+        ctrl.set_es_pressure(0.75, 0.50).await;
         assert!(ctrl.is_under_pressure());
 
         // Recover (both heap and CPU must be healthy)
@@ -619,8 +619,8 @@ mod heap_pressure_tests {
         };
         let ctrl = AdaptiveController::new(config);
 
-        // Set pressure
-        ctrl.set_heap_pressure(0.87).await;
+        // Set pressure (70% is threshold now)
+        ctrl.set_heap_pressure(0.72).await;
         let batch_after_pressure = ctrl.batch_size();
 
         // Try to speed up with fast latencies
@@ -640,19 +640,19 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // 80% - no pressure yet
-        ctrl.set_heap_pressure(0.80).await;
+        // 65% - no pressure yet (below 70% threshold)
+        ctrl.set_heap_pressure(0.65).await;
         assert!(!ctrl.is_under_pressure());
         assert_eq!(ctrl.batch_size(), initial_batch);
 
-        // 86% - pressure, moderate backoff
-        ctrl.set_heap_pressure(0.86).await;
+        // 75% - pressure, moderate backoff
+        ctrl.set_heap_pressure(0.75).await;
         assert!(ctrl.is_under_pressure());
         let moderate_batch = ctrl.batch_size();
         assert!(moderate_batch < initial_batch);
 
-        // 96% - critical, emergency backoff
-        ctrl.set_heap_pressure(0.96).await;
+        // 90% - critical, emergency backoff
+        ctrl.set_heap_pressure(0.90).await;
         assert!(ctrl.batch_size() < moderate_batch);
     }
 
@@ -661,7 +661,7 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         assert_eq!(ctrl.delay(), Duration::ZERO);
 
-        ctrl.set_heap_pressure(0.87).await;
+        ctrl.set_heap_pressure(0.72).await;
         assert!(ctrl.delay() > Duration::ZERO);
     }
 
@@ -670,12 +670,12 @@ mod heap_pressure_tests {
         // Test boundary conditions
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
 
-        // Just below threshold
-        ctrl.set_heap_pressure(0.849).await;
+        // Just below threshold (70%)
+        ctrl.set_heap_pressure(0.699).await;
         assert!(!ctrl.is_under_pressure());
 
         // At threshold
-        ctrl.set_heap_pressure(0.85).await;
+        ctrl.set_heap_pressure(0.70).await;
         assert!(ctrl.is_under_pressure());
     }
 
@@ -684,8 +684,8 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // 80% CPU = pressure threshold
-        ctrl.set_cpu_pressure(0.80).await;
+        // 70% CPU = pressure threshold
+        ctrl.set_cpu_pressure(0.70).await;
 
         assert!(ctrl.is_under_pressure());
         assert!(ctrl.batch_size() < initial_batch);
@@ -696,8 +696,8 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // 95% CPU = critical threshold
-        ctrl.set_cpu_pressure(0.95).await;
+        // 90% CPU = critical threshold
+        ctrl.set_cpu_pressure(0.90).await;
 
         assert!(ctrl.is_under_pressure());
         assert!(ctrl.batch_size() <= initial_batch / 2);
@@ -707,16 +707,16 @@ mod heap_pressure_tests {
     async fn test_combined_pressure_requires_both_healthy() {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
 
-        // Both under pressure
-        ctrl.set_es_pressure(0.90, 0.85).await;
+        // Both under pressure (70% thresholds)
+        ctrl.set_es_pressure(0.75, 0.75).await;
         assert!(ctrl.is_under_pressure());
 
         // Heap recovers but CPU still high
-        ctrl.set_es_pressure(0.50, 0.85).await;
+        ctrl.set_es_pressure(0.50, 0.75).await;
         assert!(ctrl.is_under_pressure());
 
         // CPU recovers but heap still high
-        ctrl.set_es_pressure(0.90, 0.50).await;
+        ctrl.set_es_pressure(0.75, 0.50).await;
         assert!(ctrl.is_under_pressure());
 
         // Both recover - pressure should clear
@@ -729,15 +729,15 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // CPU critical alone should trigger emergency
-        ctrl.set_es_pressure(0.50, 0.96).await;
+        // CPU critical alone should trigger emergency (90%)
+        ctrl.set_es_pressure(0.50, 0.92).await;
         assert!(ctrl.batch_size() <= initial_batch / 2);
 
         // Reset
         let ctrl2 = AdaptiveController::new(AdaptiveConfig::default());
 
-        // Heap critical alone should trigger emergency
-        ctrl2.set_es_pressure(0.96, 0.50).await;
+        // Heap critical alone should trigger emergency (85%)
+        ctrl2.set_es_pressure(0.88, 0.50).await;
         assert!(ctrl2.batch_size() <= initial_batch / 2);
     }
 
@@ -746,8 +746,8 @@ mod heap_pressure_tests {
         let ctrl = AdaptiveController::new(AdaptiveConfig::default());
         let initial_batch = ctrl.batch_size();
 
-        // Heap moderate pressure (below critical)
-        ctrl.set_es_pressure(0.87, 0.50).await;
+        // Heap moderate pressure (75% - above 70% but below 85% critical)
+        ctrl.set_es_pressure(0.75, 0.50).await;
 
         assert!(ctrl.is_under_pressure());
         // Should be moderate backoff, not emergency

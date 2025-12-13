@@ -60,21 +60,29 @@ impl EsBulkSink {
         let pass = self.cfg.pass.clone();
 
         tokio::spawn(async move {
-            let check_interval = Duration::from_secs(10);
+            // Check every 5 seconds for faster response to pressure
+            let check_interval = Duration::from_secs(5);
 
             loop {
                 tokio::time::sleep(check_interval).await;
 
                 match check_es_resources(&client, &url, &user, &pass).await {
                     Ok(stats) => {
+                        // Log every check so we can see what's happening
+                        info!(
+                            "es monitor: heap={:.1}% cpu={:.1}% breaker={:.1}%",
+                            stats.heap_percent * 100.0,
+                            stats.cpu_percent * 100.0,
+                            stats.circuit_breaker_percent * 100.0
+                        );
                         adaptive
                             .set_es_pressure(stats.heap_percent, stats.cpu_percent)
                             .await;
                     }
                     Err(err) => {
-                        // If we can't check resources, assume pressure to be safe
+                        // If we can't check resources, assume high pressure to be safe
                         warn!("es resource monitor: failed to check: {err:?}");
-                        adaptive.set_es_pressure(0.90, 0.90).await;
+                        adaptive.set_es_pressure(0.95, 0.95).await;
                     }
                 }
             }
@@ -1042,17 +1050,21 @@ pub fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
 struct EsResourceStats {
     heap_percent: f64,
     cpu_percent: f64,
+    circuit_breaker_percent: f64,
 }
 
-/// Check ES heap and CPU usage by querying /_nodes/stats.
-/// Returns heap and CPU usage as fractions (0.0 to 1.0).
+/// Check ES heap, CPU, and circuit breaker usage.
+/// Returns resource usage as fractions (0.0 to 1.0).
 async fn check_es_resources(
     client: &Client,
     base_url: &str,
     user: &str,
     pass: &str,
 ) -> Result<EsResourceStats> {
-    let url = format!("{}/_nodes/stats/jvm,os", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/_nodes/stats/jvm,os,breaker",
+        base_url.trim_end_matches('/')
+    );
 
     let resp = client
         .get(&url)
@@ -1069,6 +1081,7 @@ async fn check_es_resources(
 
     let mut max_heap_percent = 0.0f64;
     let mut max_cpu_percent = 0.0f64;
+    let mut max_breaker_percent = 0.0f64;
 
     if let Some(nodes) = body.get("nodes").and_then(|n| n.as_object()) {
         for (_node_id, node_stats) in nodes {
@@ -1094,17 +1107,39 @@ async fn check_es_resources(
             // Check OS CPU
             if let Some(os) = node_stats.get("os") {
                 if let Some(cpu) = os.get("cpu") {
-                    // ES returns cpu.percent as an integer 0-100
                     let cpu_pct = cpu.get("percent").and_then(|v| v.as_u64()).unwrap_or(0);
                     let percent = cpu_pct as f64 / 100.0;
                     max_cpu_percent = max_cpu_percent.max(percent);
                 }
             }
+
+            // Check parent circuit breaker (most important for memory pressure)
+            if let Some(breakers) = node_stats.get("breakers") {
+                if let Some(parent) = breakers.get("parent") {
+                    let used = parent
+                        .get("estimated_size_in_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let limit = parent
+                        .get("limit_size_in_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1);
+
+                    if limit > 0 {
+                        let percent = used as f64 / limit as f64;
+                        max_breaker_percent = max_breaker_percent.max(percent);
+                    }
+                }
+            }
         }
     }
 
+    // Use the HIGHER of heap or circuit breaker as the memory pressure indicator
+    let effective_memory = max_heap_percent.max(max_breaker_percent);
+
     Ok(EsResourceStats {
-        heap_percent: max_heap_percent,
+        heap_percent: effective_memory,
         cpu_percent: max_cpu_percent,
+        circuit_breaker_percent: max_breaker_percent,
     })
 }
