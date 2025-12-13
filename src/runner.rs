@@ -12,6 +12,7 @@ use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
 use crate::es_conflicts::EsConflictResolver;
 use crate::es_counts::EsCounter;
+use crate::es_schema_heal::SchemaHealer;
 use crate::event_router::{EventSender, EventSenderFactory};
 use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources, WorkerPool};
 use crate::reconcile;
@@ -238,6 +239,10 @@ pub struct ReconcileExecContext<'a> {
     pub buffer_caps: &'a BufferCapacities,
     pub cw_stress: Arc<StressTracker>,
     pub seasonal_stats: Arc<crate::seasonal_stats::SeasonalStats>,
+    pub es_url: &'a str,
+    pub es_user: &'a str,
+    pub es_pass: &'a str,
+    pub index_prefix: &'a str,
 }
 
 /// Execute the reconcile loop daemon.
@@ -247,6 +252,17 @@ pub async fn execute_reconcile_daemon(
     scheduler: Arc<ProcessScheduler>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let replay_window = Duration::from_secs(10 * 24 * 60 * 60);
+
+    // Create schema healer for automatic mapping conflict resolution
+    let schema_healer = SchemaHealer::new(
+        ctx.es_url.to_string(),
+        ctx.es_user.to_string(),
+        ctx.es_pass.to_string(),
+        Duration::from_secs(60),
+        ctx.index_prefix.to_string(),
+    )
+    .ok();
+
     let reconcile_ctx = reconcile::ReconcileContext {
         tailer: create_tailer_for_reconcile(ctx.cfg, ctx.cfg.checkpoint_path.clone(), ctx.aws_cfg)
             .await?,
@@ -255,6 +271,7 @@ pub async fn execute_reconcile_daemon(
         cw_counter: ctx.cw_counter.clone(),
         cw_stress: ctx.cw_stress.clone(),
         seasonal_stats: ctx.seasonal_stats.clone(),
+        schema_healer,
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -275,6 +292,16 @@ pub async fn execute_full_history_daemon(
     backfill_days: u32,
     scheduler: Arc<ProcessScheduler>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    // Create schema healer for automatic mapping conflict resolution
+    let schema_healer = SchemaHealer::new(
+        ctx.es_url.to_string(),
+        ctx.es_user.to_string(),
+        ctx.es_pass.to_string(),
+        Duration::from_secs(60),
+        ctx.index_prefix.to_string(),
+    )
+    .ok();
+
     let reconcile_ctx = reconcile::ReconcileContext {
         tailer: create_tailer_for_reconcile(ctx.cfg, ctx.cfg.checkpoint_path.clone(), ctx.aws_cfg)
             .await?,
@@ -283,6 +310,7 @@ pub async fn execute_full_history_daemon(
         cw_counter: ctx.cw_counter.clone(),
         cw_stress: ctx.cw_stress.clone(),
         seasonal_stats: ctx.seasonal_stats.clone(),
+        schema_healer,
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),

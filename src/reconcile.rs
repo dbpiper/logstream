@@ -12,6 +12,7 @@ use crate::{
     cw_tail::CloudWatchTailer,
     enrich::enrich_event,
     es_counts::EsCounter,
+    es_schema_heal::SchemaHealer,
     event_router::EventSender,
     seasonal_stats::{validate_event_integrity, Confidence, DataIntegrity, SeasonalStats},
     stress::StressTracker,
@@ -31,6 +32,7 @@ pub struct ReconcileContext {
     pub cw_counter: CwCounter,
     pub cw_stress: Arc<StressTracker>,
     pub seasonal_stats: Arc<SeasonalStats>,
+    pub schema_healer: Option<SchemaHealer>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +93,10 @@ pub async fn run_reconcile_loop(ctx: ReconcileContext, params: ReconcileParams) 
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+
+        // Run schema healing before each reconciliation cycle
+        run_schema_healing(&ctx).await;
+
         let now_ms = current_time_ms();
         let start_ms = now_ms.saturating_sub(params.replay_window.as_millis() as i64);
         let range_ms = now_ms.saturating_sub(start_ms);
@@ -106,12 +112,38 @@ pub async fn run_reconcile_loop(ctx: ReconcileContext, params: ReconcileParams) 
     }
 }
 
+/// Run schema healing to detect and fix mapping drift
+async fn run_schema_healing(ctx: &ReconcileContext) {
+    let Some(ref healer) = ctx.schema_healer else {
+        return;
+    };
+
+    match healer.heal().await {
+        Ok(fixed) if fixed > 0 => {
+            info!(
+                "reconcile schema_heal: fixed {} indices with mapping drift",
+                fixed
+            );
+        }
+        Ok(_) => {
+            debug!("reconcile schema_heal: all indices have correct mappings");
+        }
+        Err(err) => {
+            warn!("reconcile schema_heal: error: {err:?}");
+        }
+    }
+}
+
 pub async fn run_full_history(ctx: ReconcileContext, params: ReconcileParams, backfill_days: u32) {
     wait_for_es_ready(&ctx.es_counter).await;
     let mut ticker = interval(params.period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
+
+        // Run schema healing before each reconciliation cycle
+        run_schema_healing(&ctx).await;
+
         info!(
             "full_history reconcile tick backfill_days={} period_secs={}",
             backfill_days,

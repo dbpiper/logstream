@@ -278,3 +278,92 @@ fn test_normalize_infinity_becomes_null() {
     normalize_for_es(&mut val);
     assert!(val["num"].is_null());
 }
+
+#[test]
+fn test_flatten_all_objects_stringifies_nested() {
+    use logstream::enrich::flatten_all_objects;
+    use serde_json::json;
+
+    // flatten_all_objects should stringify ALL nested objects
+    let mut val = json!({
+        "user": {
+            "profile": {"name": "test", "age": 30}
+        },
+        "simple": "value"
+    });
+    flatten_all_objects(&mut val);
+
+    // Top-level object remains, but nested "profile" is stringified
+    assert!(val["user"].is_object());
+    assert!(val["user"]["profile"].is_string());
+    assert!(val["simple"].is_string());
+}
+
+#[test]
+fn test_flatten_all_objects_handles_arrays_of_objects() {
+    use logstream::enrich::flatten_all_objects;
+    use serde_json::json;
+
+    let mut val = json!({
+        "items": [
+            {"id": 1, "name": "a"},
+            {"id": 2, "name": "b"}
+        ]
+    });
+    flatten_all_objects(&mut val);
+
+    // Arrays containing objects should be stringified
+    assert!(val["items"].is_string());
+}
+
+#[test]
+fn test_flatten_all_objects_preserves_primitive_arrays() {
+    use logstream::enrich::flatten_all_objects;
+    use serde_json::json;
+
+    let mut val = json!({
+        "tags": ["a", "b", "c"],
+        "numbers": [1, 2, 3]
+    });
+    flatten_all_objects(&mut val);
+
+    // Arrays of primitives should remain as arrays
+    assert!(val["tags"].is_array());
+    assert!(val["numbers"].is_array());
+}
+
+#[test]
+fn test_normalize_keeps_nested_objects_initially() {
+    use logstream::enrich::normalize_for_es;
+    use serde_json::json;
+
+    // normalize_for_es should keep nested objects (less aggressive)
+    // flatten_all_objects is used on retry after mapping errors
+    let mut val = json!({"userProfile": {"name": "test", "age": 30}});
+    normalize_for_es(&mut val);
+    assert!(val["userprofile"].is_object());
+
+    let mut val = json!({"settings": {"enabled": true}});
+    normalize_for_es(&mut val);
+    assert!(val["settings"].is_object());
+}
+
+#[test]
+fn test_known_problematic_keys_stringified() {
+    use logstream::enrich::normalize_for_es;
+    use serde_json::json;
+
+    // These keys (id, type, status, code, version) should always be primitives
+    // If they're objects, they get stringified
+    let mut val = json!({"id": {"nested": "object"}});
+    normalize_for_es(&mut val);
+    assert!(val["id"].is_string());
+
+    let mut val = json!({"type": {"kind": "something"}});
+    normalize_for_es(&mut val);
+    assert!(val["type"].is_string());
+
+    let mut val = json!({"status": ["pending", "active"]});
+    normalize_for_es(&mut val);
+    assert!(val["status"].is_string());
+}

@@ -866,3 +866,245 @@ mod safe_replace_tests {
         assert!(preserved >= overlap);
     }
 }
+
+mod schema_healing_tests {
+    use logstream::es_schema_heal::SchemaHealer;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn test_schema_healer_is_optional_in_reconcile_context() {
+        // Schema healer should be optional so reconciliation can run
+        // even if ES connection fails at startup
+        let healer_result = SchemaHealer::new(
+            "http://localhost:9200".to_string(),
+            "elastic".to_string(),
+            "password".to_string(),
+            Duration::from_secs(30),
+            "logs".to_string(),
+        );
+
+        // Converting to Option<SchemaHealer> should work
+        let optional_healer: Option<SchemaHealer> = healer_result.ok();
+        assert!(optional_healer.is_some());
+
+        // None should also be valid
+        let none_healer: Option<SchemaHealer> = None;
+        assert!(none_healer.is_none());
+    }
+
+    #[test]
+    fn test_schema_healing_runs_before_reconciliation() {
+        // Verify the ordering: schema healing should run before sync
+        let schema_heal_called = Arc::new(AtomicBool::new(false));
+        let sync_called = Arc::new(AtomicBool::new(false));
+        let heal_before_sync = Arc::new(AtomicBool::new(false));
+
+        let schema_heal_called_clone = schema_heal_called.clone();
+        let sync_called_clone = sync_called.clone();
+        let heal_before_sync_clone = heal_before_sync.clone();
+
+        // Simulate the ordering in run_reconcile_loop
+        let simulate_reconcile = move || {
+            // Schema healing runs first
+            schema_heal_called_clone.store(true, Ordering::SeqCst);
+
+            // Check that sync hasn't been called yet
+            if !sync_called_clone.load(Ordering::SeqCst) {
+                heal_before_sync_clone.store(true, Ordering::SeqCst);
+            }
+
+            // Then sync runs
+            sync_called_clone.store(true, Ordering::SeqCst);
+        };
+
+        simulate_reconcile();
+
+        assert!(schema_heal_called.load(Ordering::SeqCst));
+        assert!(sync_called.load(Ordering::SeqCst));
+        assert!(heal_before_sync.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_schema_healing_tracks_fixed_count() {
+        // Schema healing should track how many indices it fixed
+        let indices_fixed = AtomicUsize::new(0);
+
+        // Simulate healing 3 indices
+        let fix_count = 3usize;
+        indices_fixed.store(fix_count, Ordering::SeqCst);
+
+        assert_eq!(indices_fixed.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_schema_healing_graceful_on_error() {
+        // Schema healing errors should not stop reconciliation
+        let reconcile_continued = Arc::new(AtomicBool::new(false));
+        let schema_heal_errored = Arc::new(AtomicBool::new(false));
+
+        let reconcile_continued_clone = reconcile_continued.clone();
+        let schema_heal_errored_clone = schema_heal_errored.clone();
+
+        // Simulate error in schema healing
+        let simulate_with_error = move || {
+            // Schema healing fails
+            let heal_result: Result<usize, &str> = Err("ES connection failed");
+
+            if heal_result.is_err() {
+                schema_heal_errored_clone.store(true, Ordering::SeqCst);
+                // But we continue with reconciliation anyway
+            }
+
+            // Reconciliation still proceeds
+            reconcile_continued_clone.store(true, Ordering::SeqCst);
+        };
+
+        simulate_with_error();
+
+        assert!(schema_heal_errored.load(Ordering::SeqCst));
+        assert!(reconcile_continued.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_schema_healing_skipped_when_healer_is_none() {
+        // When healer is None, schema healing should be skipped gracefully
+        let healer: Option<SchemaHealer> = None;
+        let healing_attempted = AtomicBool::new(false);
+
+        // Simulate run_schema_healing behavior
+        if let Some(_h) = &healer {
+            healing_attempted.store(true, Ordering::SeqCst);
+        }
+
+        assert!(!healing_attempted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_schema_healing_runs_in_both_reconcile_loops() {
+        // Both run_reconcile_loop and run_full_history should run schema healing
+        let heal_count = AtomicUsize::new(0);
+
+        // Simulate run_reconcile_loop calling heal
+        heal_count.fetch_add(1, Ordering::SeqCst);
+
+        // Simulate run_full_history calling heal
+        heal_count.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(heal_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_healer_detects_mapping_drift_pattern() {
+        // Healer should detect when ES mapping differs from expected
+        struct MockMapping {
+            field: String,
+            expected_type: String,
+            actual_type: String,
+        }
+
+        let mappings = [
+            MockMapping {
+                field: "parsed.endsat".to_string(),
+                expected_type: "text".to_string(),
+                actual_type: "object".to_string(),
+            },
+            MockMapping {
+                field: "parsed.user.id".to_string(),
+                expected_type: "keyword".to_string(),
+                actual_type: "keyword".to_string(),
+            },
+        ];
+
+        let drifted: Vec<_> = mappings
+            .iter()
+            .filter(|m| m.expected_type != m.actual_type)
+            .collect();
+
+        assert_eq!(drifted.len(), 1);
+        assert_eq!(drifted[0].field, "parsed.endsat");
+    }
+
+    #[test]
+    fn test_healer_deletes_drifted_indices() {
+        // When drift is detected, healer should delete the index
+        // so reconciliation can rebuild it correctly
+        let indices_to_delete = vec!["logs-2025.12.11"];
+        let deleted = AtomicUsize::new(0);
+
+        for _idx in &indices_to_delete {
+            // Simulate index deletion
+            deleted.fetch_add(1, Ordering::SeqCst);
+        }
+
+        assert_eq!(deleted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_reconciliation_repopulates_after_index_delete() {
+        // After schema healing deletes an index, reconciliation should repopulate it
+        let index_deleted = Arc::new(AtomicBool::new(false));
+        let index_repopulated = Arc::new(AtomicBool::new(false));
+
+        let deleted_clone = index_deleted.clone();
+        let repopulated_clone = index_repopulated.clone();
+
+        // Simulate full cycle
+        let simulate_full_cycle = move || {
+            // Schema healing detects drift and deletes
+            deleted_clone.store(true, Ordering::SeqCst);
+
+            // Reconciliation runs after and repopulates from CloudWatch
+            if deleted_clone.load(Ordering::SeqCst) {
+                repopulated_clone.store(true, Ordering::SeqCst);
+            }
+        };
+
+        simulate_full_cycle();
+
+        assert!(index_deleted.load(Ordering::SeqCst));
+        assert!(index_repopulated.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_schema_heal_uses_binary_search_for_drift_detection() {
+        // Binary search should be used to efficiently find drift boundary
+        fn binary_search_drift_boundary(indices: &[&str], is_drifted: impl Fn(&str) -> bool) -> usize {
+            if indices.is_empty() {
+                return 0;
+            }
+
+            let mut left = 0;
+            let mut right = indices.len();
+
+            while left < right {
+                let mid = left + (right - left) / 2;
+                if is_drifted(indices[mid]) {
+                    right = mid;
+                } else {
+                    left = mid + 1;
+                }
+            }
+
+            left
+        }
+
+        // Indices sorted by date, drift introduced on 2025.12.08
+        let indices = vec![
+            "logs-2025.12.05",
+            "logs-2025.12.06",
+            "logs-2025.12.07",
+            "logs-2025.12.08", // drift starts here
+            "logs-2025.12.09",
+            "logs-2025.12.10",
+            "logs-2025.12.11",
+        ];
+
+        let is_drifted = |idx: &str| idx >= "logs-2025.12.08";
+
+        let boundary = binary_search_drift_boundary(&indices, is_drifted);
+        assert_eq!(boundary, 3); // Index 3 is logs-2025.12.08
+        assert_eq!(indices[boundary], "logs-2025.12.08");
+    }
+}

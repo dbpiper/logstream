@@ -467,4 +467,178 @@ impl SchemaHealer {
         }
         Ok(())
     }
+
+    /// Analyze mapping conflicts and fix them by deleting indices with wrong mappings.
+    /// Returns the list of indices that were deleted and need re-population.
+    pub async fn fix_mapping_conflicts(&self, conflicts: &[MappingConflictInfo]) -> Result<Vec<String>> {
+        if conflicts.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Group conflicts by index
+        let mut indices_to_fix: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for conflict in conflicts {
+            // Analyze the data to determine what the correct type should be
+            let correct_type = analyze_field_type(&conflict.sample_values);
+            let current_type = self.get_field_type(&conflict.index, &conflict.field_path).await;
+
+            info!(
+                "schema_heal: field {} in {} - current={:?} correct={:?} (from {} samples)",
+                conflict.field_path,
+                conflict.index,
+                current_type,
+                correct_type,
+                conflict.sample_values.len()
+            );
+
+            // If the current ES type doesn't match what the data actually is,
+            // mark this index for deletion and re-creation
+            if let Some(current) = current_type {
+                if !types_compatible(&current, &correct_type) {
+                    warn!(
+                        "schema_heal: index {} has wrong mapping for {}: ES has {:?}, data is {:?}",
+                        conflict.index, conflict.field_path, current, correct_type
+                    );
+                    indices_to_fix.insert(conflict.index.clone());
+                }
+            }
+        }
+
+        // Delete indices with wrong mappings
+        let mut deleted = Vec::new();
+        for index in &indices_to_fix {
+            info!("schema_heal: deleting index {} to fix mapping conflicts", index);
+            if let Err(err) = self.delete_index(index).await {
+                warn!("schema_heal: failed to delete {}: {err:?}", index);
+            } else {
+                deleted.push(index.clone());
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    /// Get the ES mapping type for a specific field path
+    async fn get_field_type(&self, index: &str, field_path: &str) -> Option<FieldType> {
+        let url = format!(
+            "{}/{}/_mapping/field/{}",
+            self.base_url.trim_end_matches('/'),
+            index,
+            field_path
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.user, Some(&self.pass))
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let body: Value = resp.json().await.ok()?;
+
+        // Navigate to the mapping type
+        // Response is like: {"index": {"mappings": {"field.path": {"mapping": {"fieldname": {"type": "text"}}}}}}
+        let field_name = field_path.split('.').next_back()?;
+        let type_str = body
+            .pointer(&format!("/{}/mappings/{}/mapping/{}/type", index, field_path, field_name))
+            .and_then(|v| v.as_str());
+
+        type_str.map(|t| match t {
+            "object" | "nested" => FieldType::Object,
+            "text" | "keyword" => FieldType::String,
+            "long" | "integer" | "short" | "byte" | "double" | "float" => FieldType::Number,
+            "boolean" => FieldType::Boolean,
+            "date" => FieldType::Date,
+            _ => FieldType::Unknown,
+        })
+    }
+}
+
+/// Information about a mapping conflict
+#[derive(Debug, Clone)]
+pub struct MappingConflictInfo {
+    pub index: String,
+    pub field_path: String,
+    pub sample_values: Vec<Value>,
+}
+
+/// Field type classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldType {
+    Object,
+    String,
+    Number,
+    Boolean,
+    Date,
+    Array,
+    Null,
+    Unknown,
+}
+
+/// Analyze a sample of values to determine the dominant type
+pub fn analyze_field_type(samples: &[Value]) -> FieldType {
+    if samples.is_empty() {
+        return FieldType::Unknown;
+    }
+
+    let mut type_counts: std::collections::HashMap<FieldType, usize> = std::collections::HashMap::new();
+
+    for value in samples {
+        let ft = value_to_field_type(value);
+        *type_counts.entry(ft).or_default() += 1;
+    }
+
+    // Find the most common type (excluding null)
+    type_counts
+        .iter()
+        .filter(|(t, _)| **t != FieldType::Null)
+        .max_by_key(|(_, count)| *count)
+        .map(|(t, _)| *t)
+        .unwrap_or(FieldType::Unknown)
+}
+
+fn value_to_field_type(value: &Value) -> FieldType {
+    match value {
+        Value::Null => FieldType::Null,
+        Value::Bool(_) => FieldType::Boolean,
+        Value::Number(_) => FieldType::Number,
+        Value::String(s) => {
+            // Check if it looks like a date
+            if s.contains('T') && (s.contains('-') || s.contains(':')) {
+                FieldType::Date
+            } else {
+                FieldType::String
+            }
+        }
+        Value::Array(_) => FieldType::Array,
+        Value::Object(_) => FieldType::Object,
+    }
+}
+
+/// Check if two types are compatible (can coexist in same field)
+fn types_compatible(es_type: &FieldType, data_type: &FieldType) -> bool {
+    if es_type == data_type {
+        return true;
+    }
+
+    // String and Date are compatible (dates are often stored as strings)
+    if matches!(
+        (es_type, data_type),
+        (FieldType::String, FieldType::Date) | (FieldType::Date, FieldType::String)
+    ) {
+        return true;
+    }
+
+    // Number types can coexist
+    if *es_type == FieldType::Number && *data_type == FieldType::Number {
+        return true;
+    }
+
+    false
 }

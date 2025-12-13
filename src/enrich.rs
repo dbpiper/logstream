@@ -157,13 +157,63 @@ fn is_reserved_field(key: &str) -> bool {
 }
 
 fn has_type_conflict(value: &Value, key: &str) -> bool {
-    let problematic_keys = [
-        "id", "type", "status", "code", "version", "count", "size", "time", "duration",
-    ];
-    if !problematic_keys.contains(&key) {
-        return false;
+    let key_lower = key.to_lowercase();
+
+    // Only handle the most common problematic keys that are almost always primitives
+    // but sometimes appear as objects in logs
+    let always_primitive_keys = ["id", "type", "status", "code", "version"];
+
+    if always_primitive_keys.contains(&key_lower.as_str()) {
+        return matches!(value, Value::Object(_) | Value::Array(_));
     }
-    matches!(value, Value::Object(_) | Value::Array(_))
+
+    false
+}
+
+/// Aggressively flatten ALL nested objects to strings.
+/// Use this on retry after a mapping error - it's the nuclear option.
+pub fn flatten_all_objects(value: &mut Value) {
+    flatten_objects_recursive(value, 0);
+}
+
+fn flatten_objects_recursive(v: &mut Value, depth: usize) {
+    match v {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if let Some(mut child) = map.remove(&k) {
+                    let clean_key = sanitize_key(&k);
+                    if clean_key.is_empty() {
+                        continue;
+                    }
+
+                    // At depth > 0, stringify any nested objects
+                    if depth > 0 && matches!(child, Value::Object(_)) {
+                        map.insert(clean_key, flatten_to_string(&child));
+                    } else if matches!(child, Value::Array(_)) {
+                        // Stringify arrays of objects
+                        if let Value::Array(ref arr) = child {
+                            if arr.iter().any(|x| matches!(x, Value::Object(_))) {
+                                map.insert(clean_key, flatten_to_string(&child));
+                                continue;
+                            }
+                        }
+                        flatten_objects_recursive(&mut child, depth + 1);
+                        map.insert(clean_key, child);
+                    } else {
+                        flatten_objects_recursive(&mut child, depth + 1);
+                        map.insert(clean_key, child);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                flatten_objects_recursive(child, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_homogeneous_array(arr: &[Value]) -> bool {

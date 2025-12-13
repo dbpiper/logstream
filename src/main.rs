@@ -387,6 +387,10 @@ async fn run_group(
             buffer_caps: &buffer_caps,
             cw_stress: cw_stress_tracker.clone(),
             seasonal_stats: seasonal_stats.clone(),
+            es_url: &env_cfg.es_url,
+            es_user: &env_cfg.es_user,
+            es_pass: &env_cfg.es_pass,
+            index_prefix: &cfg.index_prefix,
         };
         Some(execute_reconcile_daemon(pid, ctx, group_scheduler.scheduler().clone()).await?)
     } else {
@@ -403,6 +407,10 @@ async fn run_group(
             buffer_caps: &buffer_caps,
             cw_stress: cw_stress_tracker.clone(),
             seasonal_stats: seasonal_stats.clone(),
+            es_url: &env_cfg.es_url,
+            es_user: &env_cfg.es_user,
+            es_pass: &env_cfg.es_pass,
+            index_prefix: &cfg.index_prefix,
         };
         Some(
             execute_full_history_daemon(

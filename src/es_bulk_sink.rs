@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adaptive::AdaptiveController;
-use crate::enrich::normalize_for_es;
+use crate::enrich::flatten_all_objects;
 use crate::stress::{StressConfig, StressLevel, StressTracker};
 use crate::types::EnrichedEvent;
 
@@ -529,7 +529,7 @@ async fn send_bulk_tracked(
                         if retry_indices.contains(&i) {
                             if mapping_indices.contains(&i) {
                                 if let Some(ref mut parsed) = ev.parsed {
-                                    normalize_for_es(parsed);
+                                    flatten_all_objects(parsed);
                                 }
                             }
                             if field_limit_indices.contains(&i) {
