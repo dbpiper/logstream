@@ -753,8 +753,8 @@ mod safe_replace_tests {
 
     #[tokio::test]
     async fn test_safe_replace_zero_ingestion_skips_orphan_delete() {
-        let es_ids = vec!["existing1".to_string(), "existing2".to_string()];
-        let cw_events: Vec<LogEvent> = vec![]; // Empty CW response
+        let es_ids = ["existing1".to_string(), "existing2".to_string()];
+        let cw_events: [LogEvent; 0] = []; // Empty CW response
 
         let ingested = 0usize;
         let delete_orphans_called = Arc::new(AtomicBool::new(false));
@@ -765,8 +765,8 @@ mod safe_replace_tests {
         }
 
         assert!(!delete_orphans_called.load(Ordering::SeqCst));
-        assert!(cw_events.is_empty());
-        assert!(!es_ids.is_empty());
+        assert_eq!(cw_events.len(), 0);
+        assert_eq!(es_ids.len(), 2);
     }
 
     #[tokio::test]
