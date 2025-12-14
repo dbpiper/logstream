@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::adaptive::AdaptiveController;
-use crate::enrich::flatten_all_objects;
+use crate::enrich::{flatten_all_objects, sanitize_log_group_name};
 use crate::stress::{StressConfig, StressLevel, StressTracker};
 use crate::types::EnrichedEvent;
 
@@ -925,17 +925,18 @@ fn stringify_at_path(value: &mut serde_json::Value, path: &[String]) {
 }
 
 fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str) -> Result<String> {
-    let mut body = String::with_capacity(batch.len() * 256);
+    let mut body = String::with_capacity(batch.len() * 512);
     for ev in batch {
         let id = &ev.event.id;
-        let idx = resolve_index(ev, index_prefix);
-        body.push_str("{\"index\":{\"_index\":\"");
-        body.push_str(&idx);
-        body.push_str("\",\"_id\":\"");
-        body.push_str(id);
-        body.push_str("\"}}\n");
-        body.push_str(&serde_json::to_string(&ev)?);
-        body.push('\n');
+        for idx in resolve_indices(ev, index_prefix) {
+            body.push_str("{\"index\":{\"_index\":\"");
+            body.push_str(&idx);
+            body.push_str("\",\"_id\":\"");
+            body.push_str(id);
+            body.push_str("\"}}\n");
+            body.push_str(&serde_json::to_string(&ev)?);
+            body.push('\n');
+        }
     }
     Ok(body)
 }
@@ -971,6 +972,7 @@ pub fn create_fallback_event(
     EnrichedEvent {
         timestamp: original.timestamp.clone(),
         event: original.event.clone(),
+        log_group: original.log_group.clone(),
         message: original.message.clone(),
         parsed: Some(fallback_parsed),
         target_index: original.target_index.clone(),
@@ -1035,15 +1037,26 @@ fn parse_failed_items(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<FailedIte
         .collect()
 }
 
-pub fn resolve_index(ev: &EnrichedEvent, index_prefix: &str) -> String {
+pub fn resolve_indices(ev: &EnrichedEvent, index_prefix: &str) -> Vec<String> {
+    let mut indices = Vec::new();
     if let Some(idx) = ev.target_index.as_ref() {
-        return idx.clone();
+        indices.push(idx.clone());
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&ev.timestamp) {
-        let date = dt.with_timezone(&Utc).format("%Y.%m.%d").to_string();
-        return format!("{}-{}", index_prefix, date);
+    let parsed_date = DateTime::parse_from_rfc3339(&ev.timestamp)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc).format("%Y.%m.%d").to_string());
+    if let Some(date) = parsed_date.as_ref() {
+        let slug = sanitize_log_group_name(&ev.log_group);
+        indices.push(format!("{index_prefix}-{slug}-{date}"));
     }
-    format!("{}-default", index_prefix)
+    if indices.is_empty() {
+        indices.push(format!("{}-default", index_prefix));
+    }
+    let mut seen = HashSet::new();
+    indices
+        .into_iter()
+        .filter(|idx| seen.insert(idx.clone()))
+        .collect()
 }
 
 /// ES resource usage stats

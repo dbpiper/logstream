@@ -8,6 +8,7 @@ fn test_event(id: &str) -> EnrichedEvent {
     EnrichedEvent {
         timestamp: "2025-12-12T00:00:00Z".to_string(),
         event: EventMeta { id: id.to_string() },
+        log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("test".to_string()),
         parsed: None,
         target_index: None,

@@ -9,8 +9,7 @@ use tempfile::tempdir;
 
 fn sample_config_toml() -> &'static str {
     r#"
-log_group = "/ecs/test-service"
-log_groups = []
+log_groups = ["/ecs/test-service"]
 region = "us-east-1"
 index_prefix = "logs"
 batch_size = 1000
@@ -45,7 +44,7 @@ fn test_load_from_file() {
 fn test_effective_log_groups_single() {
     let cfg = Config {
         log_group: "/ecs/main".into(),
-        log_groups: vec![],
+        log_groups: vec!["/ecs/main".into()],
         region: "us-east-1".into(),
         index_prefix: "logs".into(),
         batch_size: 100,
@@ -115,7 +114,7 @@ fn test_with_log_group() {
 fn test_http_timeout() {
     let cfg = Config {
         log_group: "/ecs/test".into(),
-        log_groups: vec![],
+        log_groups: vec!["/ecs/test".into()],
         region: "us-east-1".into(),
         index_prefix: "logs".into(),
         batch_size: 100,

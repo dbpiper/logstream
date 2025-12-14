@@ -33,6 +33,8 @@ pub struct ReconcileContext {
     pub cw_stress: Arc<StressTracker>,
     pub seasonal_stats: Arc<SeasonalStats>,
     pub schema_healer: Option<SchemaHealer>,
+    pub log_group: Arc<str>,
+    pub index_prefix: Arc<str>,
 }
 
 #[derive(Clone, Copy)]
@@ -512,7 +514,9 @@ async fn execute_full_replace(
     let mut ingested = 0usize;
     let mut enrich_failures = 0usize;
     for raw in events {
-        if let Some(enriched) = enrich_event(raw, None) {
+        if let Some(enriched) =
+            enrich_event(raw, ctx.log_group.as_ref(), ctx.index_prefix.as_ref(), None)
+        {
             if ctx.sink_tx.send(enriched).await.is_err() {
                 warn!(
                     "reconcile safe_replace: sink closed after {} ingested for {}-{}",
@@ -672,7 +676,9 @@ async fn upsert_events(ctx: &ReconcileContext, events: Vec<LogEvent>) {
     let mut enrich_failures = 0usize;
 
     for raw in events {
-        if let Some(enriched) = enrich_event(raw, None) {
+        if let Some(enriched) =
+            enrich_event(raw, ctx.log_group.as_ref(), ctx.index_prefix.as_ref(), None)
+        {
             if ctx.sink_tx.send(enriched).await.is_err() {
                 warn!(
                     "reconcile upsert: sink closed after {}/{} events",

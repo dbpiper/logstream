@@ -21,7 +21,7 @@ A drop-in replacement for Logstash + Filebeat with lower resource usage and simp
 docker pull ghcr.io/dbpiper/logstream:latest
 
 docker run --rm \
-  -e LOG_GROUP=/aws/lambda/my-function \
+  -e LOG_GROUPS=/aws/lambda/my-function \
   -e AWS_REGION=us-east-1 \
   -e AWS_ACCESS_KEY_ID=... \
   -e AWS_SECRET_ACCESS_KEY=... \
@@ -45,8 +45,7 @@ Configuration via `config.toml` or environment variables:
 
 | Variable                  | Description                        | Default                   |
 | ------------------------- | ---------------------------------- | ------------------------- |
-| `LOG_GROUP`               | CloudWatch log group name          | required                  |
-| `LOG_GROUPS`              | Comma-separated list of log groups | -                         |
+| `LOG_GROUPS`              | Comma-separated list of log groups | required                  |
 | `AWS_REGION`              | AWS region                         | required                  |
 | `ES_HOST`                 | Elasticsearch URL                  | `http://localhost:9200`   |
 | `ES_USER`                 | Elasticsearch username             | `elastic`                 |
@@ -61,6 +60,8 @@ Configuration via `config.toml` or environment variables:
 | `HTTP_TIMEOUT_SECS`       | HTTP request timeout               | `30`                      |
 | `BACKOFF_BASE_MS`         | Base backoff delay                 | `200`                     |
 | `BACKOFF_MAX_MS`          | Max backoff delay                  | `10000`                   |
+
+`INDEX_PREFIX` defaults to `logs`. Indices are per log group per day (`${INDEX_PREFIX}-{group}-{YYYY.MM.DD}`) and a lightweight alias `${INDEX_PREFIX}-all` points to `${INDEX_PREFIX}-*` for the cumulative data view without duplicating data.
 
 ## License
 

@@ -205,6 +205,8 @@ pub fn execute_tail_daemon(
     mut tailer: CloudWatchTailer,
     sink: EventSender,
     buffer_cap: usize,
+    log_group: Arc<str>,
+    index_prefix: Arc<str>,
     scheduler: Arc<ProcessScheduler>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -212,8 +214,10 @@ pub fn execute_tail_daemon(
 
         tokio::spawn(async move {
             let mut events = 0usize;
+            let group = log_group.clone();
+            let prefix = index_prefix.clone();
             while let Some(raw) = raw_rx.recv().await {
-                if let Some(enriched) = enrich_event(raw, None) {
+                if let Some(enriched) = enrich_event(raw, &group, &prefix, None) {
                     if sink.send(enriched).await.is_err() {
                         break;
                     }
@@ -271,6 +275,8 @@ pub async fn execute_reconcile_daemon(
         cw_stress: ctx.cw_stress.clone(),
         seasonal_stats: ctx.seasonal_stats.clone(),
         schema_healer,
+        log_group: ctx.cfg.log_group.clone(),
+        index_prefix: ctx.cfg.index_prefix.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -309,6 +315,8 @@ pub async fn execute_full_history_daemon(
         cw_stress: ctx.cw_stress.clone(),
         seasonal_stats: ctx.seasonal_stats.clone(),
         schema_healer,
+        log_group: ctx.cfg.log_group.clone(),
+        index_prefix: ctx.cfg.index_prefix.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -475,11 +483,15 @@ async fn execute_heal_day(
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.heal_raw);
     let sink_tx = sender_factory.at(Priority::IDLE);
+    let log_group = cfg.log_group.clone();
+    let index_prefix = cfg.index_prefix.clone();
 
     let consumer = tokio::spawn(async move {
         let mut sent = 0usize;
         while let Some(raw) = raw_rx.recv().await {
-            if let Some(enriched) = enrich_event(raw, None) {
+            if let Some(enriched) =
+                enrich_event(raw, log_group.as_ref(), index_prefix.as_ref(), None)
+            {
                 if sink_tx.send(enriched).await.is_err() {
                     break;
                 }

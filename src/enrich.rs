@@ -11,6 +11,8 @@ const MAX_ARRAY_LEN: usize = 1000;
 
 pub fn enrich_event(
     raw: crate::types::LogEvent,
+    log_group: &str,
+    index_prefix: &str,
     target_index: Option<String>,
 ) -> Option<EnrichedEvent> {
     let ts_dt = DateTime::<Utc>::from_timestamp_millis(raw.timestamp_ms)
@@ -18,7 +20,8 @@ pub fn enrich_event(
     let ts = ts_dt.to_rfc3339();
     let idx = target_index.unwrap_or_else(|| {
         let date = ts_dt.format("%Y.%m.%d").to_string();
-        format!("logs-{}", date)
+        let group = sanitize_log_group_name(log_group);
+        format!("{index_prefix}-{group}-{date}")
     });
 
     let mut message_str = raw.message.replace('\r', "");
@@ -47,6 +50,7 @@ pub fn enrich_event(
         message,
         parsed,
         target_index: Some(idx),
+        log_group: log_group.to_string(),
         tags,
     })
 }
@@ -144,6 +148,25 @@ fn normalize_value(v: &mut Value, depth: usize) {
             }
         }
         _ => {}
+    }
+}
+
+pub fn sanitize_log_group_name(log_group: &str) -> String {
+    let cleaned = log_group
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "log-group".to_string()
+    } else {
+        trimmed
     }
 }
 

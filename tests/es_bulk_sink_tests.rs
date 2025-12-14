@@ -1,11 +1,14 @@
 //! Tests for Elasticsearch bulk sink.
 
 use logstream::es_bulk_sink::{
-    classify_error, create_fallback_event, resolve_index, BulkItemError, EsBulkConfig, EsBulkSink,
-    FailureKind,
+    classify_error, create_fallback_event, resolve_indices, BulkItemError, EsBulkConfig,
+    EsBulkSink, FailureKind,
 };
 use logstream::types::{EnrichedEvent, EventMeta};
 use std::time::Duration;
+
+const GROUP: &str = "/aws/test-group";
+const PREFIX: &str = "logs";
 
 fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent {
     EnrichedEvent {
@@ -13,6 +16,7 @@ fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent 
         event: EventMeta {
             id: "test-id".to_string(),
         },
+        log_group: GROUP.to_string(),
         message: serde_json::Value::String("test".to_string()),
         parsed: None,
         target_index,
@@ -23,36 +27,40 @@ fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent 
 #[test]
 fn test_resolve_index_with_target() {
     let ev = sample_event("2025-12-11T12:00:00Z", Some("custom-index".to_string()));
-    let idx = resolve_index(&ev, "logs");
-    assert_eq!(idx, "custom-index");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert_eq!(idx.len(), 2);
+    assert!(idx.contains(&"custom-index".to_string()));
+    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
 }
 
 #[test]
 fn test_resolve_index_from_timestamp() {
     let ev = sample_event("2025-12-11T12:00:00+00:00", None);
-    let idx = resolve_index(&ev, "logs");
-    assert_eq!(idx, "logs-2025.12.11");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert_eq!(idx.len(), 1);
+    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
 }
 
 #[test]
 fn test_resolve_index_different_prefix() {
     let ev = sample_event("2024-01-15T08:30:00Z", None);
-    let idx = resolve_index(&ev, "myapp");
-    assert_eq!(idx, "myapp-2024.01.15");
+    let idx = resolve_indices(&ev, "myapp");
+    assert_eq!(idx.len(), 1);
+    assert!(idx.contains(&"myapp-aws-test-group-2024.01.15".to_string()));
 }
 
 #[test]
 fn test_resolve_index_invalid_timestamp() {
     let ev = sample_event("not-a-timestamp", None);
-    let idx = resolve_index(&ev, "logs");
-    assert_eq!(idx, "logs-default");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert_eq!(idx, vec!["logs-default".to_string()]);
 }
 
 #[test]
 fn test_resolve_index_empty_timestamp() {
     let ev = sample_event("", None);
-    let idx = resolve_index(&ev, "logs");
-    assert_eq!(idx, "logs-default");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert_eq!(idx, vec!["logs-default".to_string()]);
 }
 
 #[test]
@@ -94,16 +102,17 @@ fn test_es_bulk_sink_new() {
 #[test]
 fn test_resolve_index_with_timezone_offset() {
     let ev = sample_event("2025-06-15T10:30:00-05:00", None);
-    let idx = resolve_index(&ev, "logs");
-    // Should be UTC: 15:30 UTC on 2025-06-15
-    assert_eq!(idx, "logs-2025.06.15");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert!(idx.contains(&"logs-aws-test-group-2025.06.15".to_string()));
 }
 
 #[test]
 fn test_resolve_index_target_takes_precedence() {
     let ev = sample_event("2025-12-11T12:00:00Z", Some("override-index".to_string()));
-    let idx = resolve_index(&ev, "logs");
-    assert_eq!(idx, "override-index");
+    let idx = resolve_indices(&ev, PREFIX);
+    assert_eq!(idx.len(), 2);
+    assert!(idx.contains(&"override-index".to_string()));
+    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
 }
 
 mod failure_classification_tests {
@@ -426,6 +435,7 @@ mod fallback_event_tests {
             event: EventMeta {
                 id: "test-event-123".to_string(),
             },
+            log_group: GROUP.to_string(),
             message: serde_json::json!({
                 "timestamp": "2025-12-12 16:09:19.519",
                 "level": "info",
@@ -551,6 +561,7 @@ mod fallback_event_tests {
             event: EventMeta {
                 id: "test-event-123".to_string(),
             },
+            log_group: GROUP.to_string(),
             message: serde_json::Value::String("raw log line".to_string()),
             parsed: None,
             target_index: None,
@@ -577,6 +588,7 @@ mod fallback_event_tests {
             event: EventMeta {
                 id: "39373209126831426785568878854856779300090876776318369911".to_string(),
             },
+            log_group: GROUP.to_string(),
             message: serde_json::json!({
                 "timestamp": "2025-12-12 16:09:19.519",
                 "level": "info",

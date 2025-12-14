@@ -1,5 +1,4 @@
-log_group = ""                              # required: set via env LOG_GROUP or here
-log_groups = []                             # optional override: comma-delimited LOG_GROUPS env
+log_groups = ["/aws/lambda/example"]        # required: set via env LOG_GROUPS or here
 region = ""                                 # required: set via env AWS_REGION or here
 index_prefix = "logs"                       # default; override with env INDEX_PREFIX
 batch_size = 100

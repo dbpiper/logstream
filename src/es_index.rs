@@ -9,6 +9,34 @@ use std::time::Duration;
 // Index Operations
 // ============================================================================
 
+/// Create or update an alias that points to a pattern.
+pub async fn ensure_alias(
+    base_url: &str,
+    user: &str,
+    pass: &str,
+    alias: &str,
+    pattern: &str,
+) -> Result<()> {
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let url = format!("{}/_aliases", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "actions": [
+            { "remove": { "alias": alias, "index": "*" } },
+            { "add": { "alias": alias, "index": pattern } }
+        ]
+    });
+    let resp = client
+        .post(&url)
+        .basic_auth(user, Some(pass))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("ensure_alias {} status {}", alias, resp.status());
+    }
+    Ok(())
+}
+
 /// Drop an index if it exists. Returns Ok if index doesn't exist or was deleted.
 pub async fn drop_index_if_exists(
     base_url: &str,
@@ -87,6 +115,34 @@ pub async fn cleanup_problematic_indices(
     }
 
     Ok(cleaned)
+}
+
+/// Remove legacy indices that used the old single-group pattern.
+pub async fn drop_legacy_indices(
+    base_url: &str,
+    user: &str,
+    pass: &str,
+    index_prefix: &str,
+) -> Result<()> {
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let legacy_pattern = format!(
+        "{}/{}-????.??.??,{}-default",
+        base_url.trim_end_matches('/'),
+        index_prefix,
+        index_prefix
+    );
+    let resp = client
+        .delete(&legacy_pattern)
+        .basic_auth(user, Some(pass))
+        .send()
+        .await?;
+    if resp.status().as_u16() == 404 {
+        return Ok(());
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("drop legacy indices status {}", resp.status());
+    }
+    Ok(())
 }
 
 /// Configure ES indices for bulk ingest with optimized settings.

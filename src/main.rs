@@ -21,6 +21,7 @@ use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
 use logstream::es_index::{
     apply_backfill_settings, cleanup_problematic_indices, drop_index_if_exists,
+    drop_legacy_indices, ensure_alias,
 };
 use logstream::es_recovery;
 use logstream::es_schema_heal::SchemaHealer;
@@ -216,6 +217,31 @@ async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
     }
 
     if let Err(err) =
+        drop_legacy_indices(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix).await
+    {
+        tracing::warn!("failed to drop legacy indices: {err:?}");
+    } else {
+        info!("dropped legacy single-group indices");
+    }
+
+    if let Err(err) = ensure_alias(
+        &es_cfg.url,
+        &es_cfg.user,
+        &es_cfg.pass,
+        &format!("{}-all", index_prefix),
+        &format!("{}-*", index_prefix),
+    )
+    .await
+    {
+        tracing::warn!("failed to ensure all-groups alias: {err:?}");
+    } else {
+        info!(
+            "ensured all-groups alias {}-all -> {}-*",
+            index_prefix, index_prefix
+        );
+    }
+
+    if let Err(err) =
         cleanup_problematic_indices(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix).await
     {
         tracing::warn!("failed to cleanup problematic indices: {err:?}");
@@ -374,6 +400,8 @@ async fn run_group(
         tailer,
         tail_sink,
         buffer_caps.tail_raw,
+        cfg.log_group.clone(),
+        cfg.index_prefix.clone(),
         group_scheduler.scheduler().clone(),
     );
 

@@ -28,9 +28,10 @@ fn test_enriched_event_serialization() {
         event: EventMeta {
             id: "event-456".to_string(),
         },
+        log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("test message".to_string()),
         parsed: Some(serde_json::json!({"key": "value"})),
-        target_index: Some("logs-2025.12.11".to_string()),
+        target_index: Some("logs-aws-test-group-2025.12.11".to_string()),
         tags: vec!["json_parsed".to_string(), "sync".to_string()],
     };
 
@@ -38,6 +39,7 @@ fn test_enriched_event_serialization() {
     assert!(json.contains("@timestamp"));
     assert!(json.contains("_target_index"));
     assert!(json.contains("event-456"));
+    assert!(json.contains("log_group"));
 
     let parsed: EnrichedEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.timestamp, event.timestamp);
@@ -52,6 +54,7 @@ fn test_enriched_event_without_parsed() {
         event: EventMeta {
             id: "event-789".to_string(),
         },
+        log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("plain text".to_string()),
         parsed: None,
         target_index: None,

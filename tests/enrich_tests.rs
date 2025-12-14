@@ -3,6 +3,9 @@
 use logstream::enrich::{enrich_event, sanitize_key};
 use logstream::types::LogEvent;
 
+const GROUP: &str = "/aws/test-group";
+const PREFIX: &str = "logs";
+
 #[test]
 fn test_enrich_basic_event() {
     let raw = LogEvent {
@@ -11,7 +14,7 @@ fn test_enrich_basic_event() {
         message: "Hello world".to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert_eq!(enriched.event.id, "test-id-123");
     assert!(enriched.timestamp.contains("2024") || enriched.timestamp.contains("2025"));
     assert!(enriched.tags.contains(&"sync".to_string()));
@@ -26,7 +29,7 @@ fn test_enrich_json_message() {
         message: r#"{"level":"info","msg":"test"}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_some());
     assert!(enriched.tags.contains(&"json_parsed".to_string()));
 
@@ -43,7 +46,7 @@ fn test_enrich_non_json_message() {
         message: "This is plain text".to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_none());
     assert!(enriched.tags.contains(&"not_json_message".to_string()));
 }
@@ -56,7 +59,7 @@ fn test_enrich_empty_message_returns_none() {
         message: "   ".to_string(),
     };
 
-    let result = enrich_event(raw, None);
+    let result = enrich_event(raw, GROUP, PREFIX, None);
     assert!(result.is_none());
 }
 
@@ -68,7 +71,7 @@ fn test_enrich_with_target_index() {
         message: "test".to_string(),
     };
 
-    let enriched = enrich_event(raw, Some("custom-index".to_string())).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, Some("custom-index".to_string())).unwrap();
     assert_eq!(enriched.target_index, Some("custom-index".to_string()));
 }
 
@@ -80,9 +83,9 @@ fn test_enrich_generates_index_from_timestamp() {
         message: "test".to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let idx = enriched.target_index.unwrap();
-    assert!(idx.starts_with("logs-"));
+    assert!(idx.starts_with("logs-aws-test-group-"));
     assert!(idx.contains('.'));
 }
 
@@ -94,7 +97,7 @@ fn test_enrich_strips_carriage_return() {
         message: "line1\r\nline2\r\n".to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let msg = enriched.message.as_str().unwrap();
     assert!(!msg.contains('\r'));
 }
@@ -124,7 +127,7 @@ fn test_normalize_large_numbers_to_strings() {
         message: r#"{"bigNum": 9999999999999999}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     assert!(parsed["bignum"].is_string());
 }
@@ -137,7 +140,7 @@ fn test_normalize_removes_null_values() {
         message: r#"{"key": "value", "nullKey": null}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     assert!(!parsed.as_object().unwrap().contains_key("nullKey"));
 }
@@ -150,7 +153,7 @@ fn test_normalize_nested_json() {
         message: r#"{"outer": {"inner.key": "value"}}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     assert!(parsed["outer"]
         .as_object()
@@ -166,7 +169,7 @@ fn test_enrich_array_message() {
         message: r#"[1, 2, 3]"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_some());
     assert!(enriched.tags.contains(&"json_parsed".to_string()));
 }
@@ -179,7 +182,7 @@ fn test_enrich_invalid_json() {
         message: r#"{"unclosed": "#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_none());
     assert!(enriched.tags.contains(&"json_failure".to_string()));
 }
@@ -192,7 +195,7 @@ fn test_reserved_field_sanitized() {
         message: r#"{"_id": "user-id", "_source": "custom"}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     let obj = parsed.as_object().unwrap();
     assert!(obj.contains_key("id") || obj.contains_key("field_id"));
@@ -207,7 +210,7 @@ fn test_heterogeneous_array_flattened() {
         message: r#"{"mixed": [1, "two", {"three": 3}]}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     let arr = parsed["mixed"].as_array().unwrap();
     assert!(arr.iter().all(|v| v.is_string()));
@@ -231,7 +234,7 @@ fn test_deep_nesting_flattened() {
         message: msg,
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_some());
 }
 
@@ -243,7 +246,7 @@ fn test_type_conflict_field_stringified() {
         message: r#"{"id": {"nested": "object"}, "status": [1, 2, 3]}"#.to_string(),
     };
 
-    let enriched = enrich_event(raw, None).unwrap();
+    let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let parsed = enriched.parsed.unwrap();
     assert!(parsed["id"].is_string());
     assert!(parsed["status"].is_string());

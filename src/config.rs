@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub log_group: Arc<str>,
     pub log_groups: Vec<Arc<str>>,
+    pub log_group: Arc<str>,
     pub region: Arc<str>,
     pub index_prefix: Arc<str>,
     pub batch_size: usize,
@@ -24,7 +24,6 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
-    log_group: String,
     #[serde(default)]
     log_groups: Vec<String>,
     region: String,
@@ -42,9 +41,11 @@ struct RawConfig {
 
 impl From<RawConfig> for Config {
     fn from(raw: RawConfig) -> Self {
+        let log_groups: Vec<Arc<str>> = collect_log_groups(raw.log_groups);
+        let log_group = log_groups.first().cloned().unwrap_or_else(|| Arc::from(""));
         Self {
-            log_group: raw.log_group.into(),
-            log_groups: raw.log_groups.into_iter().map(Into::into).collect(),
+            log_groups,
+            log_group,
             region: raw.region.into(),
             index_prefix: raw.index_prefix.into(),
             batch_size: raw.batch_size,
@@ -75,17 +76,10 @@ impl Config {
             }
         };
 
-        if let Ok(v) = env::var("LOG_GROUP") {
-            cfg.log_group = v.into();
-        }
         if let Ok(groups) = env::var("LOG_GROUPS") {
-            let parsed: Vec<Arc<str>> = groups
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(Arc::from)
-                .collect();
-            if !parsed.is_empty() {
+            let parsed = parse_log_groups(&groups);
+            if let Some(first) = parsed.first() {
+                cfg.log_group = first.clone();
                 cfg.log_groups = parsed;
             }
         }
@@ -123,8 +117,11 @@ impl Config {
     fn default_from_env() -> Result<Self> {
         let dirs = default_state_dir();
         let checkpoint_path = dirs.join("checkpoints.json");
+        let groups = parse_log_groups(&env_required("LOG_GROUPS")?);
+        let primary_group = groups.first().cloned().unwrap_or_else(|| Arc::from(""));
         Ok(Self {
-            log_group: env_required("LOG_GROUP")?.into(),
+            log_groups: groups,
+            log_group: primary_group,
             region: env_required("AWS_REGION")?.into(),
             index_prefix: env::var("INDEX_PREFIX")
                 .unwrap_or_else(|_| "logs".into())
@@ -138,18 +135,13 @@ impl Config {
             http_timeout_secs: env_u64("HTTP_TIMEOUT_SECS", 30),
             backoff_base_ms: env_u64("BACKOFF_BASE_MS", 200),
             backoff_max_ms: env_u64("BACKOFF_MAX_MS", 10_000),
-            log_groups: vec![],
         })
     }
 }
 
 impl Config {
     pub fn effective_log_groups(&self) -> Vec<Arc<str>> {
-        if !self.log_groups.is_empty() {
-            self.log_groups.clone()
-        } else {
-            vec![self.log_group.clone()]
-        }
+        self.log_groups.clone()
     }
 
     pub fn with_log_group(&self, group: Arc<str>, checkpoint_path: PathBuf) -> Self {
@@ -171,8 +163,8 @@ fn default_state_dir() -> PathBuf {
 }
 
 fn validate_required(cfg: &Config) -> Result<()> {
-    if cfg.log_group.trim().is_empty() {
-        anyhow::bail!("LOG_GROUP is required (set via env or config)");
+    if cfg.log_groups.is_empty() || cfg.log_group.trim().is_empty() {
+        anyhow::bail!("LOG_GROUPS is required (set via env or config)");
     }
     if cfg.region.trim().is_empty() {
         anyhow::bail!("AWS_REGION is required (set via env or config)");
@@ -219,4 +211,21 @@ fn env_required(key: &str) -> Result<String> {
         anyhow::bail!("{key} is required");
     }
     Ok(val)
+}
+
+fn collect_log_groups(groups: Vec<String>) -> Vec<Arc<str>> {
+    groups
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .map(Arc::from)
+        .collect()
+}
+
+fn parse_log_groups(raw: &str) -> Vec<Arc<str>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Arc::from)
+        .collect()
 }

@@ -13,6 +13,8 @@ pub struct EnrichedEvent {
     pub timestamp: String,
     #[serde(rename = "event")]
     pub event: EventMeta,
+    #[serde(rename = "log_group")]
+    pub log_group: String,
     #[serde(rename = "message")]
     pub message: serde_json::Value,
     /// Parsed JSON form of the message when available (keeps original string in `message`)
