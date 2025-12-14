@@ -439,7 +439,7 @@ mod fallback_event_tests {
             message: serde_json::json!({
                 "timestamp": "2025-12-12 16:09:19.519",
                 "level": "info",
-                "service_name": "gigworx-node",
+                "service_name": "myapp-node",
                 "event": "domain_event",
                 "metadata": {
                     "domain_event": {
@@ -451,7 +451,7 @@ mod fallback_event_tests {
             parsed: Some(serde_json::json!({
                 "event": "domain_event",
                 "level": "info",
-                "service_name": "gigworx-node",
+                "service_name": "myapp-node",
                 "metadata": {
                     "domain_event": {
                         "name": "mobile_shift_called_off"
@@ -532,7 +532,7 @@ mod fallback_event_tests {
         let original = make_event_with_parsed();
         let fallback = create_fallback_event(&original, "some_error", "reason");
         let parsed = fallback.parsed.unwrap();
-        assert_eq!(parsed["service_name"], "gigworx-node");
+        assert_eq!(parsed["service_name"], "myapp-node");
     }
 
     #[test]
@@ -592,7 +592,7 @@ mod fallback_event_tests {
             message: serde_json::json!({
                 "timestamp": "2025-12-12 16:09:19.519",
                 "level": "info",
-                "service_name": "gigworx-node",
+                "service_name": "myapp-node",
                 "event": "domain_event",
                 "metadata": {
                     "domain_event": {
@@ -607,7 +607,7 @@ mod fallback_event_tests {
             parsed: Some(serde_json::json!({
                 "event": "domain_event",
                 "level": "info",
-                "service_name": "gigworx-node"
+                "service_name": "myapp-node"
             })),
             target_index: None,
             tags: vec![],
@@ -809,7 +809,7 @@ mod field_limit_reduction_tests {
         let mut value = json!({
             "timestamp": "2025-12-12T16:09:19.519Z",
             "level": "info",
-            "service_name": "gigworx-node",
+            "service_name": "myapp-node",
             "event": "domain_event",
             "metadata": {
                 "domain_event": {
@@ -832,7 +832,7 @@ mod field_limit_reduction_tests {
         });
         reduce_fields_to_limit(&mut value);
         assert_eq!(value["level"], "info");
-        assert_eq!(value["service_name"], "gigworx-node");
+        assert_eq!(value["service_name"], "myapp-node");
         assert_eq!(value["event"], "domain_event");
         assert!(value.get("metadata").is_some());
     }

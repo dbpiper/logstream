@@ -242,7 +242,7 @@ Indices are organized by log group and date:
 **Example:**
 
 ```
-cloudwatch-ecs-gigworx-be-prod-service-2025.12.14
+cloudwatch-ecs-myapp-prod-service-2025.12.14
 cloudwatch-lambda-api-prod-2025.12.14
 ```
 
