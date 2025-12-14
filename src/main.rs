@@ -207,6 +207,34 @@ fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: Arc<str>) -> 
 }
 
 async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY_MS: u64 = 2000;
+
+    for attempt in 1..=MAX_RETRIES {
+        match wait_for_es_ready(es_cfg).await {
+            Ok(_) => {
+                info!("ES ready, running index hygiene");
+                break;
+            }
+            Err(err) if attempt < MAX_RETRIES => {
+                tracing::warn!(
+                    "ES not ready (attempt {}/{}): {err:?}, retrying in {}ms",
+                    attempt,
+                    MAX_RETRIES,
+                    RETRY_DELAY_MS
+                );
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "ES not ready after {} attempts: {err:?}, skipping hygiene",
+                    MAX_RETRIES
+                );
+                return;
+            }
+        }
+    }
+
     let default_index = format!("{}-default", index_prefix);
     if let Err(err) =
         drop_index_if_exists(&es_cfg.url, &es_cfg.user, &es_cfg.pass, &default_index).await
@@ -264,6 +292,22 @@ async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
             es_cfg.backfill_refresh, es_cfg.backfill_replicas
         );
     }
+}
+
+async fn wait_for_es_ready(es_cfg: &EsConfig) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let url = format!("{}/_cluster/health", es_cfg.url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .basic_auth(&*es_cfg.user, Some(&*es_cfg.pass))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("ES health check failed: {}", resp.status());
+    }
+    Ok(())
 }
 
 async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config) {
