@@ -8,7 +8,7 @@ use logstream::types::{EnrichedEvent, EventMeta};
 use std::time::Duration;
 
 const GROUP: &str = "/aws/test-group";
-const PREFIX: &str = "logs";
+const PREFIX: &str = "cloudwatch";
 
 fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent {
     EnrichedEvent {
@@ -30,7 +30,7 @@ fn test_resolve_index_with_target() {
     let idx = resolve_indices(&ev, PREFIX);
     assert_eq!(idx.len(), 2);
     assert!(idx.contains(&"custom-index".to_string()));
-    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_resolve_index_from_timestamp() {
     let ev = sample_event("2025-12-11T12:00:00+00:00", None);
     let idx = resolve_indices(&ev, PREFIX);
     assert_eq!(idx.len(), 1);
-    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
 }
 
 #[test]
@@ -53,14 +53,14 @@ fn test_resolve_index_different_prefix() {
 fn test_resolve_index_invalid_timestamp() {
     let ev = sample_event("not-a-timestamp", None);
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx, vec!["logs-default".to_string()]);
+    assert_eq!(idx, vec!["cloudwatch-default".to_string()]);
 }
 
 #[test]
 fn test_resolve_index_empty_timestamp() {
     let ev = sample_event("", None);
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx, vec!["logs-default".to_string()]);
+    assert_eq!(idx, vec!["cloudwatch-default".to_string()]);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn test_es_bulk_sink_new() {
 fn test_resolve_index_with_timezone_offset() {
     let ev = sample_event("2025-06-15T10:30:00-05:00", None);
     let idx = resolve_indices(&ev, PREFIX);
-    assert!(idx.contains(&"logs-aws-test-group-2025.06.15".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.06.15".to_string()));
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn test_resolve_index_target_takes_precedence() {
     let idx = resolve_indices(&ev, PREFIX);
     assert_eq!(idx.len(), 2);
     assert!(idx.contains(&"override-index".to_string()));
-    assert!(idx.contains(&"logs-aws-test-group-2025.12.11".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
 }
 
 mod failure_classification_tests {

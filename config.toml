@@ -1,6 +1,6 @@
 log_groups = ["/aws/lambda/example"]        # required: set via env LOG_GROUPS or here
 region = ""                                 # required: set via env AWS_REGION or here
-index_prefix = "logs"                       # default; override with env INDEX_PREFIX
+index_prefix = "cloudwatch"                 # default; override with env INDEX_PREFIX
 batch_size = 100
 max_in_flight = 2
 poll_interval_secs = 15

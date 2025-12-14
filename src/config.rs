@@ -124,7 +124,7 @@ impl Config {
             log_group: primary_group,
             region: env_required("AWS_REGION")?.into(),
             index_prefix: env::var("INDEX_PREFIX")
-                .unwrap_or_else(|_| "logs".into())
+                .unwrap_or_else(|_| "cloudwatch".into())
                 .into(),
             batch_size: env_usize("BATCH_SIZE", 100),
             max_in_flight: env_usize("MAX_IN_FLIGHT", 2),

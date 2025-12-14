@@ -50,7 +50,7 @@ Configuration via `config.toml` or environment variables:
 | `ES_HOST`                 | Elasticsearch URL                  | `http://localhost:9200`   |
 | `ES_USER`                 | Elasticsearch username             | `elastic`                 |
 | `ES_PASS`                 | Elasticsearch password             | `changeme`                |
-| `INDEX_PREFIX`            | Elasticsearch index prefix         | `logs`                    |
+| `INDEX_PREFIX`            | Elasticsearch index prefix         | `cloudwatch`              |
 | `BATCH_SIZE`              | Events per bulk request            | `100`                     |
 | `MAX_IN_FLIGHT`           | Concurrent bulk requests           | `2`                       |
 | `POLL_INTERVAL_SECS`      | Tail poll interval                 | `15`                      |
@@ -61,7 +61,7 @@ Configuration via `config.toml` or environment variables:
 | `BACKOFF_BASE_MS`         | Base backoff delay                 | `200`                     |
 | `BACKOFF_MAX_MS`          | Max backoff delay                  | `10000`                   |
 
-`INDEX_PREFIX` defaults to `logs`. Indices are per log group per day (`${INDEX_PREFIX}-{group}-{YYYY.MM.DD}`) and a lightweight alias `${INDEX_PREFIX}-all` points to `${INDEX_PREFIX}-*` for the cumulative data view without duplicating data.
+`INDEX_PREFIX` defaults to `cloudwatch` (avoids conflict with ES 9.x built-in `logs-*` data stream templates). Indices are per log group per day (`${INDEX_PREFIX}-{group}-{YYYY.MM.DD}`) and a lightweight alias `${INDEX_PREFIX}-all` points to `${INDEX_PREFIX}-*` for the cumulative data view without duplicating data.
 
 ## License
 

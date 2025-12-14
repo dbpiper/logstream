@@ -4,7 +4,7 @@ use logstream::enrich::{enrich_event, sanitize_key};
 use logstream::types::LogEvent;
 
 const GROUP: &str = "/aws/test-group";
-const PREFIX: &str = "logs";
+const PREFIX: &str = "cloudwatch";
 
 #[test]
 fn test_enrich_basic_event() {
@@ -85,7 +85,7 @@ fn test_enrich_generates_index_from_timestamp() {
 
     let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     let idx = enriched.target_index.unwrap();
-    assert!(idx.starts_with("logs-aws-test-group-"));
+    assert!(idx.starts_with("cloudwatch-aws-test-group-"));
     assert!(idx.contains('.'));
 }
 
