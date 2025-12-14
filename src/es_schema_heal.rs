@@ -89,29 +89,50 @@ impl SchemaHealer {
         }
 
         info!(
-            "schema_heal: checking {} indices for type mismatches",
+            "schema_heal: checking {} indices for conflicts",
             indices.len()
         );
 
-        // Data-driven detection: sample actual data and compare to mappings
-        let problematic = self.detect_problematic_indices(&indices).await?;
+        let mut problematic = Vec::new();
+
+        let cross_index_conflicts = self.detect_cross_index_conflicts(&indices).await?;
+        if !cross_index_conflicts.is_empty() {
+            info!(
+                "schema_heal: found {} indices with cross-index mapping conflicts",
+                cross_index_conflicts.len()
+            );
+            problematic.extend(cross_index_conflicts);
+        }
+
+        let within_index_conflicts = self.detect_problematic_indices(&indices).await?;
+        if !within_index_conflicts.is_empty() {
+            info!(
+                "schema_heal: found {} indices with data-mapping type mismatches",
+                within_index_conflicts.len()
+            );
+            for idx in within_index_conflicts {
+                if !problematic.contains(&idx) {
+                    problematic.push(idx);
+                }
+            }
+        }
 
         if problematic.is_empty() {
             info!(
-                "schema_heal: no type mismatches detected across {} indices",
+                "schema_heal: no conflicts detected across {} indices",
                 indices.len()
             );
             return Ok(0);
         }
 
         info!(
-            "schema_heal: detected {} indices with type mismatches, fixing",
+            "schema_heal: detected {} indices with conflicts, fixing",
             problematic.len()
         );
 
         let mut fixed = 0;
         for idx in &problematic {
-            info!("schema_heal: deleting index {} to fix type mismatches", idx);
+            info!("schema_heal: deleting index {} to fix conflicts", idx);
             if let Err(err) = self.delete_index(idx).await {
                 warn!("schema_heal: failed to delete {}: {err:?}", idx);
             } else {
@@ -120,6 +141,70 @@ impl SchemaHealer {
         }
 
         Ok(fixed)
+    }
+
+    /// Detect indices with cross-index mapping conflicts.
+    /// Groups indices by pattern prefix and checks if the same field has different types across indices.
+    async fn detect_cross_index_conflicts(&self, indices: &[String]) -> Result<Vec<String>> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut pattern_groups: HashMap<String, Vec<String>> = HashMap::new();
+        for idx in indices {
+            let prefix = extract_index_prefix(idx);
+            pattern_groups.entry(prefix).or_default().push(idx.clone());
+        }
+
+        let mut conflicted_indices = HashSet::new();
+
+        for (pattern, group_indices) in pattern_groups {
+            if group_indices.len() < 2 {
+                continue;
+            }
+
+            let mut field_types: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+
+            for idx in &group_indices {
+                match self.fetch_index_mapping(idx).await {
+                    Ok(mapping) => {
+                        let fields = extract_all_field_types(&mapping);
+                        for (field_path, field_type) in fields {
+                            field_types
+                                .entry(field_path)
+                                .or_default()
+                                .entry(field_type)
+                                .or_default()
+                                .push(idx.clone());
+                        }
+                    }
+                    Err(e) => {
+                        warn!("schema_heal: failed to fetch mapping for {}: {}", idx, e);
+                    }
+                }
+            }
+
+            for (field_path, type_map) in field_types {
+                if type_map.len() > 1 {
+                    let type_summary: Vec<String> = type_map
+                        .iter()
+                        .map(|(t, indices)| format!("{} in {} indices", t, indices.len()))
+                        .collect();
+
+                    info!(
+                        "schema_heal: field '{}' has conflicting types in pattern '{}': {}",
+                        field_path,
+                        pattern,
+                        type_summary.join(", ")
+                    );
+
+                    let minority_indices = find_minority_type_indices(&type_map);
+                    for idx in minority_indices {
+                        conflicted_indices.insert(idx);
+                    }
+                }
+            }
+        }
+
+        Ok(conflicted_indices.into_iter().collect())
     }
 
     /// Detect indices with type mismatches by sampling actual data and comparing to mappings.
@@ -621,4 +706,58 @@ fn types_compatible(es_type: &FieldType, data_type: &FieldType) -> bool {
     // This is what causes "tried to parse field as object, but found a concrete value"
     // Only flag Object vs non-Object mismatches
     false
+}
+
+fn extract_index_prefix(index: &str) -> String {
+    index
+        .rsplit_once('-')
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| index.to_string())
+}
+
+pub fn extract_all_field_types(mapping: &Value) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    if let Some(properties) = mapping.get("properties") {
+        extract_field_types_recursive(properties, "", &mut result);
+    }
+    result
+}
+
+fn extract_field_types_recursive(obj: &Value, prefix: &str, result: &mut Vec<(String, String)>) {
+    if let Some(props) = obj.as_object() {
+        for (key, val) in props {
+            let field_path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{}.{}", prefix, key)
+            };
+
+            if let Some(type_str) = val.get("type").and_then(|t| t.as_str()) {
+                result.push((field_path.clone(), type_str.to_string()));
+            }
+
+            if let Some(nested_props) = val.get("properties") {
+                extract_field_types_recursive(nested_props, &field_path, result);
+            }
+        }
+    }
+}
+
+pub fn find_minority_type_indices(
+    type_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    if type_map.len() <= 1 {
+        return vec![];
+    }
+
+    let max_count = type_map.values().map(|v| v.len()).max().unwrap_or(0);
+
+    let mut minority = Vec::new();
+    for indices in type_map.values() {
+        if indices.len() < max_count {
+            minority.extend(indices.clone());
+        }
+    }
+
+    minority
 }

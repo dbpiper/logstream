@@ -157,3 +157,201 @@ mod system_index_detection {
         assert_eq!(healer.base_url(), cloned.base_url());
     }
 }
+
+mod cross_index_conflicts {
+    use logstream::es_schema_heal::{extract_all_field_types, find_minority_type_indices};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_extract_field_types_simple() {
+        let mapping = json!({
+            "properties": {
+                "name": { "type": "keyword" },
+                "age": { "type": "long" },
+                "active": { "type": "boolean" }
+            }
+        });
+
+        let fields = extract_all_field_types(&mapping);
+        assert_eq!(fields.len(), 3);
+        assert!(fields.contains(&("name".to_string(), "keyword".to_string())));
+        assert!(fields.contains(&("age".to_string(), "long".to_string())));
+        assert!(fields.contains(&("active".to_string(), "boolean".to_string())));
+    }
+
+    #[test]
+    fn test_extract_field_types_nested() {
+        let mapping = json!({
+            "properties": {
+                "user": {
+                    "properties": {
+                        "name": { "type": "keyword" },
+                        "email": { "type": "text" }
+                    }
+                }
+            }
+        });
+
+        let fields = extract_all_field_types(&mapping);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains(&("user.name".to_string(), "keyword".to_string())));
+        assert!(fields.contains(&("user.email".to_string(), "text".to_string())));
+    }
+
+    #[test]
+    fn test_extract_field_types_deep_nesting() {
+        let mapping = json!({
+            "properties": {
+                "level1": {
+                    "properties": {
+                        "level2": {
+                            "properties": {
+                                "value": { "type": "long" }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let fields = extract_all_field_types(&mapping);
+        assert_eq!(fields.len(), 1);
+        assert!(fields.contains(&("level1.level2.value".to_string(), "long".to_string())));
+    }
+
+    #[test]
+    fn test_extract_field_types_empty() {
+        let mapping = json!({
+            "properties": {}
+        });
+
+        let fields = extract_all_field_types(&mapping);
+        assert_eq!(fields.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_field_types_no_properties() {
+        let mapping = json!({});
+
+        let fields = extract_all_field_types(&mapping);
+        assert_eq!(fields.len(), 0);
+    }
+
+    #[test]
+    fn test_find_minority_clear_majority() {
+        let mut type_map = HashMap::new();
+        type_map.insert(
+            "long".to_string(),
+            vec![
+                "idx1".to_string(),
+                "idx2".to_string(),
+                "idx3".to_string(),
+                "idx4".to_string(),
+                "idx5".to_string(),
+            ],
+        );
+        type_map.insert("keyword".to_string(), vec!["idx6".to_string()]);
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 1);
+        assert!(minority.contains(&"idx6".to_string()));
+    }
+
+    #[test]
+    fn test_find_minority_multiple_minorities() {
+        let mut type_map = HashMap::new();
+        type_map.insert(
+            "long".to_string(),
+            vec!["idx1".to_string(), "idx2".to_string(), "idx3".to_string()],
+        );
+        type_map.insert("keyword".to_string(), vec!["idx4".to_string()]);
+        type_map.insert("text".to_string(), vec!["idx5".to_string()]);
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 2);
+        assert!(minority.contains(&"idx4".to_string()));
+        assert!(minority.contains(&"idx5".to_string()));
+    }
+
+    #[test]
+    fn test_find_minority_tie_keeps_all() {
+        let mut type_map = HashMap::new();
+        type_map.insert("long".to_string(), vec!["idx1".to_string()]);
+        type_map.insert("keyword".to_string(), vec!["idx2".to_string()]);
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 0);
+    }
+
+    #[test]
+    fn test_find_minority_single_type() {
+        let mut type_map = HashMap::new();
+        type_map.insert(
+            "long".to_string(),
+            vec!["idx1".to_string(), "idx2".to_string()],
+        );
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 0);
+    }
+
+    #[test]
+    fn test_find_minority_empty() {
+        let type_map: HashMap<String, Vec<String>> = HashMap::new();
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 0);
+    }
+
+    #[test]
+    fn test_cross_index_scenario_realistic() {
+        let mut type_map = HashMap::new();
+        type_map.insert(
+            "long".to_string(),
+            vec![
+                "cloudwatch-2025.12.10".to_string(),
+                "cloudwatch-2025.12.11".to_string(),
+                "cloudwatch-2025.12.12".to_string(),
+                "cloudwatch-2025.12.13".to_string(),
+                "cloudwatch-2025.12.14".to_string(),
+            ],
+        );
+        type_map.insert(
+            "keyword".to_string(),
+            vec![
+                "cloudwatch-2025.12.08".to_string(),
+                "cloudwatch-2025.12.09".to_string(),
+            ],
+        );
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 2);
+        assert!(minority.contains(&"cloudwatch-2025.12.08".to_string()));
+        assert!(minority.contains(&"cloudwatch-2025.12.09".to_string()));
+    }
+
+    #[test]
+    fn test_cross_index_three_way_split() {
+        let mut type_map = HashMap::new();
+        type_map.insert(
+            "long".to_string(),
+            vec![
+                "idx1".to_string(),
+                "idx2".to_string(),
+                "idx3".to_string(),
+                "idx4".to_string(),
+            ],
+        );
+        type_map.insert(
+            "keyword".to_string(),
+            vec!["idx5".to_string(), "idx6".to_string()],
+        );
+        type_map.insert("text".to_string(), vec!["idx7".to_string()]);
+
+        let minority = find_minority_type_indices(&type_map);
+        assert_eq!(minority.len(), 3);
+        assert!(minority.contains(&"idx5".to_string()));
+        assert!(minority.contains(&"idx6".to_string()));
+        assert!(minority.contains(&"idx7".to_string()));
+    }
+}
