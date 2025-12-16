@@ -97,7 +97,7 @@ fn test_feasibility_detects_extreme_deviation() {
     }
 
     let tracker = make_tracker(StressLevel::Normal);
-    let result = stats.is_feasible(ts, 3_600_000, 1, &tracker);
+    let result = stats.is_feasible(ts, 3_600_000, 1000, &tracker);
     assert!(!result.is_feasible());
 }
 

@@ -26,6 +26,9 @@ impl CheckpointState {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("creating checkpoint directory")?;
+        }
         let tmp = path.with_extension("tmp");
         let data = serde_json::to_vec_pretty(self).context("serializing checkpoint")?;
         fs::write(&tmp, data).context("writing temp checkpoint")?;

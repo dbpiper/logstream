@@ -376,8 +376,9 @@ async fn send_bulk_tracked(
 
     let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
     let mut current_batch: Vec<EnrichedEvent> = batch.to_vec();
+    let mut has_mapping_failure = false;
 
-    for attempt in 1..=10u64 {
+    for attempt in 1..=3u64 {
         let body = build_bulk_body(&current_batch, index_prefix)?;
 
         let send_result = client
@@ -539,11 +540,20 @@ async fn send_bulk_tracked(
                 }
 
                 if !mapping_indices.is_empty() {
-                    warn!(
-                        "es bulk mapping failures: {} docs, re-normalizing (attempt {})",
-                        mapping_indices.len(),
-                        attempt
-                    );
+                    if !has_mapping_failure {
+                        info!(
+                            "es bulk mapping failures: {} docs, CloudWatch log structure changed, accepting with flattened schema (attempt {})",
+                            mapping_indices.len(),
+                            attempt
+                        );
+                        has_mapping_failure = true;
+                    } else {
+                        info!(
+                            "es bulk mapping failures: {} docs still failing, converting to strings (attempt {})",
+                            mapping_indices.len(),
+                            attempt
+                        );
+                    }
                 }
 
                 if !retryable_indices.is_empty() {

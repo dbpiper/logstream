@@ -46,7 +46,7 @@ fn test_healer_with_trailing_slash() {
 }
 
 mod field_type_analysis {
-    use logstream::es_schema_heal::{analyze_field_type, FieldType};
+    use logstream::es_schema_heal::{analyze_field_type, is_reliable_inferred_type, FieldType};
     use serde_json::json;
 
     #[test]
@@ -125,6 +125,18 @@ mod field_type_analysis {
     fn test_empty_array_is_unknown() {
         let samples = vec![json!([])];
         assert_eq!(analyze_field_type(&samples), FieldType::Unknown);
+    }
+
+    #[test]
+    fn test_is_reliable_inferred_type() {
+        assert!(!is_reliable_inferred_type(FieldType::Unknown));
+        assert!(!is_reliable_inferred_type(FieldType::Null));
+        assert!(is_reliable_inferred_type(FieldType::String));
+        assert!(is_reliable_inferred_type(FieldType::Number));
+        assert!(is_reliable_inferred_type(FieldType::Boolean));
+        assert!(is_reliable_inferred_type(FieldType::Date));
+        assert!(is_reliable_inferred_type(FieldType::Object));
+        assert!(is_reliable_inferred_type(FieldType::Array));
     }
 }
 

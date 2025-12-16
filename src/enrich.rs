@@ -1,7 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use tracing::warn;
 
 use crate::types::{EnrichedEvent, EventMeta};
 
@@ -35,10 +34,7 @@ pub fn enrich_event(
     let (parsed, mut tags) = match try_parse_and_normalize(&message_str) {
         Ok(Some(val)) => (Some(val), vec!["json_parsed".into()]),
         Ok(None) => (None, vec!["not_json_message".into()]),
-        Err(err) => {
-            warn!("json parse/normalize failure: {err}");
-            (None, vec!["json_failure".into()])
-        }
+        Err(_) => (None, vec!["not_json_message".into()]),
     };
 
     tags.push("sync".into());

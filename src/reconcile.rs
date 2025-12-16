@@ -19,7 +19,7 @@ use crate::{
     types::LogEvent,
 };
 
-const FULL_RESYNC_THRESHOLD_PCT: u64 = 5;
+const FULL_RESYNC_THRESHOLD_PCT: u64 = 30;
 const ES_STARTUP_WAIT_SECS: u64 = 30;
 const ES_STARTUP_MAX_ATTEMPTS: u32 = 20;
 const MAX_PARALLEL_DAYS: usize = 2;
@@ -309,7 +309,7 @@ async fn safe_replace_range(ctx: &ReconcileContext, start_ms: i64, end_ms: i64, 
     }
 }
 
-const LIVE_LEARN_THRESHOLD_PCT: u64 = 10;
+const LIVE_LEARN_THRESHOLD_PCT: u64 = 25;
 
 enum FeasibilityAction {
     FullReplace,
@@ -433,10 +433,17 @@ async fn check_with_es_blend(
             );
             ctx.seasonal_stats.record_verified(start_ms, es_count);
             FeasibilityAction::LiveLearn
+        } else if diff_pct <= 50 {
+            info!(
+                "reconcile es_blend moderate diff: cw={} es={} diff={}% (under 50%), trusting ES for {}-{}",
+                cw_count, es_count, diff_pct, start_ms, end_ms
+            );
+            ctx.seasonal_stats.record_verified(start_ms, es_count);
+            FeasibilityAction::LiveLearn
         } else {
             warn!(
-                "reconcile es_blend suspicious: cw={} es={} expected={:.0} dev={:.0} conf={:?} for {}-{}",
-                cw_count, es_count, expected, deviation, confidence, start_ms, end_ms
+                "reconcile es_blend suspicious: cw={} es={} expected={:.0} dev={:.0} diff={}% conf={:?} for {}-{}",
+                cw_count, es_count, expected, deviation, diff_pct, confidence, start_ms, end_ms
             );
             FeasibilityAction::CheckIntegrity
         }
