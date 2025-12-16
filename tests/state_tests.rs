@@ -88,7 +88,11 @@ fn test_load_nonexistent_returns_default() {
 #[test]
 fn test_save_creates_parent_dirs() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("checkpoints.json");
+    let path = dir
+        .path()
+        .join("nested")
+        .join("deeper")
+        .join("checkpoints.json");
 
     let state = CheckpointState::default();
     state.save(&path).unwrap();

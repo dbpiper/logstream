@@ -260,6 +260,12 @@ impl SchemaHealer {
         let mut mismatches = Vec::new();
         for (field_path, values) in &field_samples {
             let actual_type = analyze_field_type(values);
+            // If we can't infer a type (e.g., field is absent/null/empty array in samples),
+            // do not treat it as a mismatch. Otherwise we can end up deleting hot indices
+            // just because a field is present but empty.
+            if !is_reliable_inferred_type(actual_type) {
+                continue;
+            }
             let es_type = self.get_mapping_type_for_path(&mapping, field_path);
 
             if let Some(es_t) = es_type {
@@ -424,6 +430,11 @@ impl SchemaHealer {
         for conflict in conflicts {
             // Analyze the data to determine what the correct type should be
             let correct_type = analyze_field_type(&conflict.sample_values);
+            // If we can't infer the data type from samples, don't delete/recreate indices.
+            // This avoids churn when a field is intermittently absent/null/empty.
+            if !is_reliable_inferred_type(correct_type) {
+                continue;
+            }
             let current_type = self
                 .get_field_type(&conflict.index, &conflict.field_path)
                 .await;
@@ -614,6 +625,10 @@ pub enum FieldType {
     Array,
     Null,
     Unknown,
+}
+
+pub fn is_reliable_inferred_type(field_type: FieldType) -> bool {
+    !matches!(field_type, FieldType::Unknown | FieldType::Null)
 }
 
 /// Analyze a sample of values to determine the dominant type

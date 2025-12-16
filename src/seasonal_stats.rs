@@ -379,9 +379,9 @@ impl SeasonalStats {
     ) -> FeasibilityResult {
         let stress_level = stress.stress_level();
         let sigma_multiplier = match stress_level {
-            StressLevel::Normal => 4.0,
-            StressLevel::Elevated => 2.5,
-            StressLevel::Critical => 1.5,
+            StressLevel::Normal => 6.0,
+            StressLevel::Elevated => 4.0,
+            StressLevel::Critical => 2.5,
         };
 
         let range_hours = (range_ms as f64) / 3_600_000.0;
@@ -396,8 +396,8 @@ impl SeasonalStats {
         let deviation = (cw_f - expected_mean).abs();
         let threshold = stddev * sigma_multiplier;
 
-        let min_threshold = expected_mean * 0.1;
-        let effective_threshold = threshold.max(min_threshold).max(10.0);
+        let min_threshold = expected_mean * 0.3;
+        let effective_threshold = threshold.max(min_threshold).max(100.0);
 
         if deviation <= effective_threshold {
             FeasibilityResult::Feasible {

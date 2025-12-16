@@ -184,7 +184,8 @@ fn test_enrich_invalid_json() {
 
     let enriched = enrich_event(raw, GROUP, PREFIX, None).unwrap();
     assert!(enriched.parsed.is_none());
-    assert!(enriched.tags.contains(&"json_failure".to_string()));
+    // Invalid JSON is treated as a plain text message (we still ingest it).
+    assert!(enriched.tags.contains(&"not_json_message".to_string()));
 }
 
 #[test]

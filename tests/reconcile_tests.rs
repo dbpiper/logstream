@@ -489,7 +489,7 @@ mod live_learn_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    const LIVE_LEARN_THRESHOLD_PCT: u64 = 10;
+    const LIVE_LEARN_THRESHOLD_PCT: u64 = 25;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum LiveLearnDecision {
@@ -575,13 +575,13 @@ mod live_learn_tests {
     }
 
     #[test]
-    fn test_boundary_at_exactly_10_percent() {
+    fn test_boundary_at_exactly_25_percent() {
         assert_eq!(
-            decide_live_learn(1000, 1100, false),
+            decide_live_learn(900, 1200, false),
             LiveLearnDecision::TrustEs
         );
         assert_eq!(
-            decide_live_learn(1000, 1200, false),
+            decide_live_learn(900, 1300, false),
             LiveLearnDecision::Replace
         );
     }
@@ -638,13 +638,14 @@ mod live_learn_tests {
     #[test]
     fn test_threshold_edge_cases() {
         assert_eq!(decide_live_learn(10, 11, false), LiveLearnDecision::TrustEs);
-        assert_eq!(decide_live_learn(10, 13, false), LiveLearnDecision::Replace);
+        assert_eq!(decide_live_learn(10, 13, false), LiveLearnDecision::TrustEs);
+        assert_eq!(decide_live_learn(10, 14, false), LiveLearnDecision::Replace);
         assert_eq!(
             decide_live_learn(100, 110, false),
             LiveLearnDecision::TrustEs
         );
         assert_eq!(
-            decide_live_learn(100, 120, false),
+            decide_live_learn(100, 150, false),
             LiveLearnDecision::Replace
         );
     }
@@ -864,6 +865,31 @@ mod safe_replace_tests {
 
         assert_eq!(preserved, 80);
         assert!(preserved >= overlap);
+    }
+}
+
+mod full_resync_threshold_tests {
+    const FULL_RESYNC_THRESHOLD_PCT: u64 = 30;
+
+    fn should_full_resync(es_count: u64, cw_count: u64) -> bool {
+        let max_count = es_count.max(cw_count);
+        if max_count == 0 {
+            return false;
+        }
+        let diff = es_count.abs_diff(cw_count);
+        diff * 100 / max_count >= FULL_RESYNC_THRESHOLD_PCT
+    }
+
+    #[test]
+    fn test_below_threshold_does_not_resync() {
+        // 299 / 1000 = 29%
+        assert!(!should_full_resync(1000, 701));
+    }
+
+    #[test]
+    fn test_at_threshold_resyncs() {
+        // 300 / 1000 = 30%
+        assert!(should_full_resync(1000, 700));
     }
 }
 
