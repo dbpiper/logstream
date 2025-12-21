@@ -22,20 +22,7 @@ struct Hits {
 
 #[derive(Debug, Deserialize)]
 struct Hit {
-    #[serde(default)]
-    _source: Option<HitSource>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HitSource {
-    #[serde(default)]
-    event: Option<EventMeta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EventMeta {
-    #[serde(default)]
-    id: Option<String>,
+    _id: String,
 }
 
 #[derive(Clone)]
@@ -206,9 +193,9 @@ impl EsCounter {
             "size": limit,
             "sort": [
                 { "@timestamp": { "order": sort_dir } },
-                { "event.id": { "order": sort_dir } }
+                { "_id": { "order": sort_dir } }
             ],
-            "_source": ["event.id"],
+            "_source": false,
             "query": {
                 "range": {
                     "@timestamp": {
@@ -232,17 +219,7 @@ impl EsCounter {
             anyhow::bail!("es search status {}", status);
         }
         let parsed: SearchResp = resp.json().await.context("es search parse")?;
-        let mut ids = Vec::new();
-        for hit in parsed.hits.hits {
-            if let Some(src) = hit._source {
-                if let Some(ev) = src.event {
-                    if let Some(id) = ev.id {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        Ok(ids)
+        Ok(parsed.hits.hits.into_iter().map(|h| h._id).collect())
     }
 
     /// Get all event IDs in a time range (for orphan detection).

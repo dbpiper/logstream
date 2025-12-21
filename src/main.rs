@@ -38,19 +38,12 @@ use logstream::seasonal_stats::SeasonalStats;
 use logstream::state::CheckpointState;
 use logstream::stress::{StressConfig, StressTracker};
 
-mod migrate_daily;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenv();
     init_tracing();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let migrate = args.iter().any(|a| a == "--migrate");
-    let cfg_path = args
-        .iter()
-        .find(|a| a.as_str() != "--migrate")
-        .map(PathBuf::from);
+    let cfg_path = std::env::args().nth(1).map(PathBuf::from);
     let cfg = Config::load(cfg_path)?;
     info!("starting logstream with config {:?}", cfg);
 
@@ -89,23 +82,6 @@ async fn main() -> Result<()> {
         es_cfg.pass.clone(),
     )
     .await?;
-
-    // Auto-migrate legacy daily indices into data streams when present.
-    // This deletes legacy indices only after verify succeeds, so we won't re-run forever.
-    let should_migrate = migrate
-        || migrate_daily::needs_migration(&cfg, &es_cfg.url, &es_cfg.user, &es_cfg.pass).await?;
-    if should_migrate {
-        migrate_daily::run_migrate_daily_indices(
-            &cfg,
-            es_cfg.url.clone(),
-            es_cfg.user.clone(),
-            es_cfg.pass.clone(),
-        )
-        .await?;
-        if migrate {
-            return Ok(());
-        }
-    }
 
     let es_bootstrap = start_es_bootstrap(
         &cfg,
