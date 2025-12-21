@@ -16,6 +16,8 @@ use logstream::checkpoint::checkpoint_path_for;
 use logstream::config::Config;
 use logstream::cw_counts::CwCounter;
 use logstream::cw_tail::{CloudWatchTailer, TailConfig};
+use logstream::enrich::sanitize_log_group_name;
+use logstream::es_bootstrap::start_es_bootstrap;
 use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
 use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
@@ -36,12 +38,19 @@ use logstream::seasonal_stats::SeasonalStats;
 use logstream::state::CheckpointState;
 use logstream::stress::{StressConfig, StressTracker};
 
+mod migrate_daily;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenv();
     init_tracing();
 
-    let cfg_path = std::env::args().nth(1).map(PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let migrate = args.iter().any(|a| a == "--migrate");
+    let cfg_path = args
+        .iter()
+        .find(|a| a.as_str() != "--migrate")
+        .map(PathBuf::from);
     let cfg = Config::load(cfg_path)?;
     info!("starting logstream with config {:?}", cfg);
 
@@ -61,7 +70,44 @@ async fn main() -> Result<()> {
     let (event_router, sender_factory) = create_event_router();
 
     let es_cfg = EsConfig::from_env();
-    let sink = create_bulk_sink(&cfg, &es_cfg, index_prefix.clone())?;
+    // Ensure templates/ILM/data streams/aliases exist before any ingest or migration.
+    logstream::es_bootstrap::bootstrap_now(
+        &cfg,
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+    )
+    .await?;
+
+    // Auto-migrate legacy daily indices into data streams when present.
+    // This deletes legacy indices only after verify succeeds, so we won't re-run forever.
+    let should_migrate = migrate
+        || migrate_daily::needs_migration(&cfg, &es_cfg.url, &es_cfg.user, &es_cfg.pass).await?;
+    if should_migrate {
+        migrate_daily::run_migrate_daily_indices(
+            &cfg,
+            es_cfg.url.clone(),
+            es_cfg.user.clone(),
+            es_cfg.pass.clone(),
+        )
+        .await?;
+        if migrate {
+            return Ok(());
+        }
+    }
+
+    let es_bootstrap = start_es_bootstrap(
+        &cfg,
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+    );
+    let sink = create_bulk_sink(
+        &cfg,
+        &es_cfg,
+        index_prefix.clone(),
+        es_bootstrap.as_ref().map(|h| h.notifier()),
+    )?;
     let es_stress_tracker = sink.stress_tracker();
     let cw_stress_tracker =
         std::sync::Arc::new(StressTracker::with_config(StressConfig::CLOUDWATCH));
@@ -90,7 +136,7 @@ async fn main() -> Result<()> {
 
     run_index_hygiene(&es_cfg, &index_prefix).await;
     run_schema_healing(&es_cfg, &cfg).await;
-    run_recovery_checks(&es_cfg, &cfg, &index_prefix).await;
+    run_recovery_checks(&es_cfg, &cfg).await;
     let groups = cfg.effective_log_groups();
     let mut handles = Vec::new();
 
@@ -186,7 +232,12 @@ fn create_event_router() -> (EventRouter, EventSenderFactory) {
     (router, sender_factory)
 }
 
-fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: Arc<str>) -> Result<EsBulkSink> {
+fn create_bulk_sink(
+    cfg: &Config,
+    es_cfg: &EsConfig,
+    index_prefix: Arc<str>,
+    bootstrap_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<EsBulkSink> {
     let max_batch = std::env::var("BULK_MAX_BATCH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -201,6 +252,7 @@ fn create_bulk_sink(cfg: &Config, es_cfg: &EsConfig, index_prefix: Arc<str>) -> 
         timeout: cfg.http_timeout(),
         gzip: true,
         index_prefix,
+        bootstrap_notify,
     };
     EsBulkSink::new(sink_cfg)
 }
@@ -298,22 +350,36 @@ async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config) {
         }
     };
 
-    match schema_healer.heal().await {
-        Ok(fixed) if fixed > 0 => info!("schema_heal: fixed {} indices with mapping drift", fixed),
-        Ok(_) => info!("schema_heal: all indices have correct mappings"),
-        Err(err) => tracing::warn!("schema_heal: failed: {err:?}"),
+    let (start_ms, end_ms) = {
+        let now = chrono::Utc::now();
+        let today = now.date_naive();
+        let start_naive = (today - chrono::Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let end_naive = today.and_hms_opt(0, 0, 0).unwrap();
+        let start =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_naive, chrono::Utc);
+        let end =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_naive, chrono::Utc);
+        (start.timestamp_millis(), end.timestamp_millis())
+    };
+
+    for group in cfg.effective_log_groups() {
+        let stable = format!("{}-{}", cfg.index_prefix, sanitize_log_group_name(&group));
+        match schema_healer.heal_window(&stable, start_ms, end_ms).await {
+            Ok(true) => info!(
+                "schema_heal: repaired window alias={} start={} end={}",
+                stable, start_ms, end_ms
+            ),
+            Ok(false) => {}
+            Err(err) => tracing::warn!("schema_heal: failed alias={} err={err:?}", stable),
+        }
     }
 }
 
-async fn run_recovery_checks(es_cfg: &EsConfig, cfg: &Config, index_prefix: &str) {
-    match es_recovery::check_on_startup(
-        &es_cfg.url,
-        &es_cfg.user,
-        &es_cfg.pass,
-        cfg.http_timeout(),
-        index_prefix,
-    )
-    .await
+async fn run_recovery_checks(es_cfg: &EsConfig, cfg: &Config) {
+    match es_recovery::check_on_startup(&es_cfg.url, &es_cfg.user, &es_cfg.pass, cfg.http_timeout())
+        .await
     {
         Ok(()) => info!("es_recovery: startup checks passed"),
         Err(err) => tracing::warn!("es_recovery: startup check failed: {err:?}"),
@@ -352,12 +418,14 @@ async fn run_group(
         cw_stress_tracker.clone(),
     );
 
+    let group_slug = sanitize_log_group_name(&cfg.log_group);
+    let es_target = format!("{}-{}", cfg.index_prefix, group_slug);
     let es_counter = EsCounter::new(
         env_cfg.es_url.clone(),
         env_cfg.es_user.clone(),
         env_cfg.es_pass.clone(),
         cfg.http_timeout(),
-        cfg.index_prefix.clone(),
+        es_target,
     )?;
     let cw_counter = CwCounter::new(cwi_client, cfg.log_group.clone());
     let es_conflicts = EsConflictResolver::new(
@@ -419,7 +487,6 @@ async fn run_group(
         tail_sink,
         buffer_caps.tail_raw,
         cfg.log_group.clone(),
-        cfg.index_prefix.clone(),
         group_scheduler.scheduler().clone(),
     );
 

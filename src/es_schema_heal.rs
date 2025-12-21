@@ -6,6 +6,9 @@ use reqwest::Client;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::es_repair::{next_versioned_stream, EsRepairClient};
+use crate::es_window::EsWindowClient;
+
 #[derive(Clone)]
 pub struct SchemaHealer {
     client: Client,
@@ -141,6 +144,65 @@ impl SchemaHealer {
         }
 
         Ok(fixed)
+    }
+
+    pub async fn heal_window(
+        &self,
+        stable_alias: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<bool> {
+        self.wait_for_ready().await?;
+        let repair = EsRepairClient::new(
+            self.base_url.clone(),
+            self.user.clone(),
+            self.pass.clone(),
+            self.timeout,
+        )?;
+        let Some(source_stream) = repair.resolve_alias_single_target(stable_alias).await? else {
+            return Ok(false);
+        };
+        let dest_stream = next_versioned_stream(&source_stream, stable_alias);
+
+        let Some(end_inclusive_ms) = (end_ms > start_ms).then_some(end_ms.saturating_sub(1)) else {
+            return Ok(false);
+        };
+
+        let window = EsWindowClient::new(
+            self.base_url.clone(),
+            self.user.clone(),
+            self.pass.clone(),
+            self.timeout,
+        )?;
+        let indices = window
+            .indices_overlapping_window(&source_stream, start_ms, end_inclusive_ms)
+            .await?;
+        if indices.is_empty() {
+            return Ok(false);
+        }
+
+        let cross = self.detect_cross_index_conflicts(&indices).await?;
+        let within = self.detect_problematic_indices(&indices).await?;
+        let mut problematic: Vec<String> = Vec::new();
+        for idx in cross {
+            if !problematic.contains(&idx) {
+                problematic.push(idx);
+            }
+        }
+        for idx in within {
+            if !problematic.contains(&idx) {
+                problematic.push(idx);
+            }
+        }
+
+        if problematic.is_empty() {
+            return Ok(false);
+        }
+
+        repair
+            .repair_window(stable_alias, &source_stream, &dest_stream, start_ms, end_ms)
+            .await?;
+        Ok(true)
     }
 
     /// Detect indices with cross-index mapping conflicts.

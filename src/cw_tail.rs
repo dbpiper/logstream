@@ -176,7 +176,7 @@ impl CloudWatchTailer {
             let tracker = self.stress_tracker.clone();
 
             handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
+                let permit_guard = sem.acquire().await.unwrap();
                 let mut next_token: Option<String> = None;
                 let mut sent: usize = 0;
                 loop {
@@ -259,6 +259,7 @@ impl CloudWatchTailer {
                         }
                     }
                 }
+                drop(permit_guard);
                 Ok(sent)
             }));
         }

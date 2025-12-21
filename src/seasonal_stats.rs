@@ -415,7 +415,7 @@ impl SeasonalStats {
         }
     }
 
-    pub fn sample_count(&self, _timestamp_ms: i64) -> u64 {
+    pub fn sample_count(&self) -> u64 {
         let buffer = self.samples.read().unwrap();
         buffer.data.len() as u64
     }

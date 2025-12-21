@@ -3,11 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -26,6 +25,7 @@ pub struct EsBulkConfig {
     pub timeout: Duration,
     pub gzip: bool,
     pub index_prefix: Arc<str>,
+    pub bootstrap_notify: Option<Arc<Notify>>,
 }
 
 pub struct EsBulkSink {
@@ -148,12 +148,13 @@ impl EsBulkSink {
 
                 if buf.len() >= effective_batch || buf.len() >= cfg.min_batch_for_send() {
                     let batch = std::mem::take(&mut buf);
+                    let batch_len = batch.len();
                     let started = std::time::Instant::now();
 
                     let res = send_bulk_adaptive_tracked(
                         &client,
                         &cfg,
-                        &batch,
+                        batch,
                         adaptive.clone(),
                         max_in_flight,
                         stress_tracker.clone(),
@@ -168,7 +169,7 @@ impl EsBulkSink {
                             adaptive.record_latency(latency_ms, true).await;
                             info!(
                                 "adaptive bulk: batch={} latency={}ms (target_batch={} in_flight={} stress={:?})",
-                                batch.len(),
+                                batch_len,
                                 latency_ms,
                                 target_batch,
                                 max_in_flight,
@@ -185,16 +186,8 @@ impl EsBulkSink {
 
             // Flush remaining
             if !buf.is_empty() {
-                let _ = send_bulk_tracked(
-                    &client,
-                    &cfg.url,
-                    &cfg.user,
-                    &cfg.pass,
-                    &cfg.index_prefix,
-                    &buf,
-                    &stress_tracker,
-                )
-                .await;
+                let batch = std::mem::take(&mut buf);
+                let _ = send_bulk_tracked(&client, &cfg, batch, &stress_tracker).await;
             }
         });
     }
@@ -210,7 +203,7 @@ impl EsBulkConfig {
 async fn send_bulk_adaptive_tracked(
     client: &Client,
     cfg: &EsBulkConfig,
-    batch: &[EnrichedEvent],
+    batch: Vec<EnrichedEvent>,
     adaptive: Arc<AdaptiveController>,
     max_in_flight: usize,
     stress_tracker: Arc<StressTracker>,
@@ -223,40 +216,43 @@ async fn send_bulk_adaptive_tracked(
     };
 
     let sem = Arc::new(Semaphore::new(effective_in_flight));
-    let chunk_size = (batch.len() / effective_in_flight).max(100);
+    let desired_chunks = ((batch.len() / 100).max(1)).min(effective_in_flight);
 
     let mut handles: FuturesUnordered<tokio::task::JoinHandle<Result<()>>> =
         FuturesUnordered::new();
 
-    for chunk in batch.chunks(chunk_size) {
+    let batch_len = batch.len();
+    let base = batch_len / desired_chunks;
+    let rem = batch_len % desired_chunks;
+    let mut it = batch.into_iter();
+    let chunks = (0..desired_chunks)
+        .filter_map(|i| {
+            let size = base + if i < rem { 1 } else { 0 };
+            if size == 0 {
+                return None;
+            }
+            let chunk_vec = it.by_ref().take(size).collect::<Vec<EnrichedEvent>>();
+            (!chunk_vec.is_empty()).then_some(chunk_vec)
+        })
+        .collect::<Vec<Vec<EnrichedEvent>>>();
+
+    for chunk_vec in chunks {
         let permit = sem.clone().acquire_owned().await?;
         let c = client.clone();
-        let url = cfg.url.clone();
-        let user = cfg.user.clone();
-        let pass = cfg.pass.clone();
-        let index_prefix = cfg.index_prefix.clone();
-        let chunk_vec: Vec<EnrichedEvent> = chunk.to_vec();
+        let cfg_clone = cfg.clone();
         let adaptive_clone = adaptive.clone();
         let stress_clone = stress_tracker.clone();
 
         handles.push(tokio::spawn(async move {
-            let _p = permit;
+            let permit_guard = permit;
             let started = std::time::Instant::now();
-            let res = send_bulk_tracked(
-                &c,
-                &url,
-                &user,
-                &pass,
-                &index_prefix,
-                &chunk_vec,
-                &stress_clone,
-            )
-            .await;
+            let res = send_bulk_tracked(&c, &cfg_clone, chunk_vec, &stress_clone).await;
             let latency = started.elapsed().as_millis() as u64;
 
             // Record chunk latency for fine-grained adaptation
             adaptive_clone.record_latency(latency, res.is_ok()).await;
 
+            drop(permit_guard);
             res
         }));
     }
@@ -348,6 +344,9 @@ pub fn classify_error(error: &BulkItemError) -> FailureKind {
     if error.error_type == "version_conflict_engine_exception" {
         return FailureKind::VersionConflict;
     }
+    if error.error_type == "document_already_exists_exception" {
+        return FailureKind::VersionConflict;
+    }
     let is_retryable = matches!(
         error.error_type.as_str(),
         "circuit_breaker_exception"
@@ -363,27 +362,24 @@ pub fn classify_error(error: &BulkItemError) -> FailureKind {
 
 async fn send_bulk_tracked(
     client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    index_prefix: &str,
-    batch: &[EnrichedEvent],
+    cfg: &EsBulkConfig,
+    batch: Vec<EnrichedEvent>,
     stress_tracker: &StressTracker,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
 
-    let url = format!("{}/_bulk", base_url.trim_end_matches('/'));
-    let mut current_batch: Vec<EnrichedEvent> = batch.to_vec();
+    let url = format!("{}/_bulk", cfg.url.trim_end_matches('/'));
+    let mut current_batch: Vec<EnrichedEvent> = batch;
     let mut has_mapping_failure = false;
 
     for attempt in 1..=3u64 {
-        let body = build_bulk_body(&current_batch, index_prefix)?;
+        let body = build_bulk_body(&current_batch, &cfg.index_prefix, "create")?;
 
         let send_result = client
             .post(&url)
-            .basic_auth(user, Some(pass))
+            .basic_auth(&*cfg.user, Some(&*cfg.pass))
             .header("Content-Type", "application/x-ndjson")
             .body(body)
             .send()
@@ -455,6 +451,11 @@ async fn send_bulk_tracked(
                 if shard_limit_hit {
                     stress_tracker.record_failure();
                     let backoff = stress_tracker.backoff_duration();
+                    if attempt == 1 {
+                        if let Some(notify) = cfg.bootstrap_notify.as_ref() {
+                            notify.notify_one();
+                        }
+                    }
                     warn!(
                         "es bulk: shard limit exceeded, recording stress and waiting {:?} (attempt {}/10)",
                         backoff, attempt
@@ -496,11 +497,12 @@ async fn send_bulk_tracked(
                         .collect();
 
                     if !fallback_docs.is_empty() {
-                        let fallback_body = build_bulk_body(&fallback_docs, index_prefix).ok();
+                        let fallback_body =
+                            build_bulk_body(&fallback_docs, &cfg.index_prefix, "create").ok();
                         if let Some(body) = fallback_body {
                             let resp = client
                                 .post(&url)
-                                .basic_auth(user, Some(pass))
+                                .basic_auth(&*cfg.user, Some(&*cfg.pass))
                                 .header("Content-Type", "application/x-ndjson")
                                 .body(body)
                                 .send()
@@ -636,10 +638,10 @@ async fn send_bulk_tracked(
             }
         }
 
-        let body = build_bulk_body(&current_batch, index_prefix)?;
+        let body = build_bulk_body(&current_batch, &cfg.index_prefix, "create")?;
         match client
             .post(&url)
-            .basic_auth(user, Some(pass))
+            .basic_auth(&*cfg.user, Some(&*cfg.pass))
             .header("Content-Type", "application/x-ndjson")
             .body(body)
             .send()
@@ -710,7 +712,7 @@ fn max_depth(value: &serde_json::Value) -> usize {
 
 /// Count fields if we were to flatten at target_depth.
 /// Uses unique path counting like ES does.
-fn count_fields_at_depth(value: &serde_json::Value, target_depth: usize, _current: usize) -> usize {
+fn count_fields_at_depth(value: &serde_json::Value, target_depth: usize) -> usize {
     let mut paths = std::collections::HashSet::new();
     collect_paths_at_depth(value, String::new(), 0, target_depth, &mut paths);
     paths.len()
@@ -791,7 +793,7 @@ fn binary_search_optimal_depth(value: &serde_json::Value) -> usize {
 
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let fields = count_fields_at_depth(value, mid, 0);
+        let fields = count_fields_at_depth(value, mid);
         if fields <= FIELD_LIMIT_TARGET {
             hi = mid;
         } else {
@@ -934,12 +936,14 @@ fn stringify_at_path(value: &mut serde_json::Value, path: &[String]) {
     }
 }
 
-fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str) -> Result<String> {
+fn build_bulk_body(batch: &[EnrichedEvent], index_prefix: &str, op: &str) -> Result<String> {
     let mut body = String::with_capacity(batch.len() * 512);
     for ev in batch {
         let id = &ev.event.id;
         for idx in resolve_indices(ev, index_prefix) {
-            body.push_str("{\"index\":{\"_index\":\"");
+            body.push_str("{\"");
+            body.push_str(op);
+            body.push_str("\":{\"_index\":\"");
             body.push_str(&idx);
             body.push_str("\",\"_id\":\"");
             body.push_str(id);
@@ -985,7 +989,6 @@ pub fn create_fallback_event(
         log_group: original.log_group.clone(),
         message: original.message.clone(),
         parsed: Some(fallback_parsed),
-        target_index: original.target_index.clone(),
         tags: {
             let mut tags = original.tags.clone();
             tags.push("ingestion_error".to_string());
@@ -1048,25 +1051,12 @@ fn parse_failed_items(resp_body: &str, batch: &[EnrichedEvent]) -> Vec<FailedIte
 }
 
 pub fn resolve_indices(ev: &EnrichedEvent, index_prefix: &str) -> Vec<String> {
-    let mut indices = Vec::new();
-    if let Some(idx) = ev.target_index.as_ref() {
-        indices.push(idx.clone());
+    let slug = sanitize_log_group_name(&ev.log_group);
+    if slug.trim().is_empty() {
+        vec![format!("{}-default", index_prefix)]
+    } else {
+        vec![format!("{index_prefix}-{slug}")]
     }
-    let parsed_date = DateTime::parse_from_rfc3339(&ev.timestamp)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc).format("%Y.%m.%d").to_string());
-    if let Some(date) = parsed_date.as_ref() {
-        let slug = sanitize_log_group_name(&ev.log_group);
-        indices.push(format!("{index_prefix}-{slug}-{date}"));
-    }
-    if indices.is_empty() {
-        indices.push(format!("{}-default", index_prefix));
-    }
-    let mut seen = HashSet::new();
-    indices
-        .into_iter()
-        .filter(|idx| seen.insert(idx.clone()))
-        .collect()
 }
 
 /// ES resource usage stats

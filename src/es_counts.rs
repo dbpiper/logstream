@@ -44,7 +44,7 @@ pub struct EsCounter {
     base_url: Arc<str>,
     user: Arc<str>,
     pass: Arc<str>,
-    index_prefix: Arc<str>,
+    target: Arc<str>,
 }
 
 impl EsCounter {
@@ -53,7 +53,7 @@ impl EsCounter {
         user: impl Into<Arc<str>>,
         pass: impl Into<Arc<str>>,
         timeout: Duration,
-        index_prefix: impl Into<Arc<str>>,
+        target: impl Into<Arc<str>>,
     ) -> Result<Self> {
         let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
@@ -61,12 +61,12 @@ impl EsCounter {
             base_url: base_url.into(),
             user: user.into(),
             pass: pass.into(),
-            index_prefix: index_prefix.into(),
+            target: target.into(),
         })
     }
 
     pub async fn count_range(&self, start_ms: i64, end_ms: i64) -> Result<u64> {
-        let url = format!("{}/{}-*/_count", self.base_url, self.index_prefix);
+        let url = format!("{}/{}/_count", self.base_url, self.target);
         let body = serde_json::json!({
             "query": {
                 "range": {
@@ -103,7 +103,7 @@ impl EsCounter {
         if ids.is_empty() {
             return Ok(0);
         }
-        let url = format!("{}/{}-*/_search", self.base_url, self.index_prefix);
+        let url = format!("{}/{}/_search", self.base_url, self.target);
         let body = serde_json::json!({
             "size": 0,
             "query": {
@@ -147,8 +147,8 @@ impl EsCounter {
 
     pub async fn delete_range(&self, start_ms: i64, end_ms: i64) -> Result<()> {
         let url = format!(
-            "{}/{}-*/_delete_by_query?conflicts=proceed",
-            self.base_url, self.index_prefix
+            "{}/{}/_delete_by_query?conflicts=proceed",
+            self.base_url, self.target
         );
         let body = serde_json::json!({
             "query": {
@@ -200,7 +200,7 @@ impl EsCounter {
         limit: usize,
         asc: bool,
     ) -> Result<Vec<String>> {
-        let url = format!("{}/{}-*/_search", self.base_url, self.index_prefix);
+        let url = format!("{}/{}/_search", self.base_url, self.target);
         let sort_dir = if asc { "asc" } else { "desc" };
         let body = serde_json::json!({
             "size": limit,
@@ -252,7 +252,7 @@ impl EsCounter {
         const BATCH_SIZE: usize = 5000;
 
         loop {
-            let url = format!("{}/{}-*/_search", self.base_url, self.index_prefix);
+            let url = format!("{}/{}/_search", self.base_url, self.target);
             let mut body = serde_json::json!({
                 "size": BATCH_SIZE,
                 "sort": [
@@ -329,8 +329,8 @@ impl EsCounter {
         }
 
         let url = format!(
-            "{}/{}-*/_delete_by_query?conflicts=proceed",
-            self.base_url, self.index_prefix
+            "{}/{}/_delete_by_query?conflicts=proceed",
+            self.base_url, self.target
         );
         let body = serde_json::json!({
             "query": {

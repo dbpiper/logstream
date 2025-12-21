@@ -20,8 +20,6 @@ pub struct EnrichedEvent {
     /// Parsed JSON form of the message when available (keeps original string in `message`)
     #[serde(rename = "parsed", skip_serializing_if = "Option::is_none")]
     pub parsed: Option<serde_json::Value>,
-    #[serde(rename = "_target_index")]
-    pub target_index: Option<String>,
     #[serde(rename = "tags")]
     pub tags: Vec<String>,
 }

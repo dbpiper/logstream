@@ -31,13 +31,11 @@ fn test_enriched_event_serialization() {
         log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("test message".to_string()),
         parsed: Some(serde_json::json!({"key": "value"})),
-        target_index: Some("cloudwatch-aws-test-group-2025.12.11".to_string()),
         tags: vec!["json_parsed".to_string(), "sync".to_string()],
     };
 
     let json = serde_json::to_string(&event).unwrap();
     assert!(json.contains("@timestamp"));
-    assert!(json.contains("_target_index"));
     assert!(json.contains("event-456"));
     assert!(json.contains("log_group"));
 
@@ -57,7 +55,6 @@ fn test_enriched_event_without_parsed() {
         log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("plain text".to_string()),
         parsed: None,
-        target_index: None,
         tags: vec![],
     };
 

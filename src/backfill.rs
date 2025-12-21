@@ -216,14 +216,11 @@ pub async fn execute_backfill_day(
     let sink_tx = sender_factory.at(priority);
     let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.backfill_raw);
     let log_group = cfg.log_group.clone();
-    let index_prefix = cfg.index_prefix.clone();
 
     let consumer_handle = tokio::spawn(async move {
         let mut sent = 0usize;
         while let Some(raw) = raw_rx.recv().await {
-            if let Some(enriched) =
-                enrich_event(raw, log_group.as_ref(), index_prefix.as_ref(), None)
-            {
+            if let Some(enriched) = enrich_event(raw, log_group.as_ref()) {
                 if sink_tx.send(enriched).await.is_err() {
                     break;
                 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 const GROUP: &str = "/aws/test-group";
 const PREFIX: &str = "cloudwatch";
 
-fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent {
+fn sample_event(timestamp: &str) -> EnrichedEvent {
     EnrichedEvent {
         timestamp: timestamp.to_string(),
         event: EventMeta {
@@ -19,48 +19,45 @@ fn sample_event(timestamp: &str, target_index: Option<String>) -> EnrichedEvent 
         log_group: GROUP.to_string(),
         message: serde_json::Value::String("test".to_string()),
         parsed: None,
-        target_index,
         tags: vec![],
     }
 }
 
 #[test]
 fn test_resolve_index_with_target() {
-    let ev = sample_event("2025-12-11T12:00:00Z", Some("custom-index".to_string()));
+    let ev = sample_event("2025-12-11T12:00:00Z");
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx.len(), 2);
-    assert!(idx.contains(&"custom-index".to_string()));
-    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
+    assert_eq!(idx, vec!["cloudwatch-aws-test-group".to_string()]);
 }
 
 #[test]
 fn test_resolve_index_from_timestamp() {
-    let ev = sample_event("2025-12-11T12:00:00+00:00", None);
+    let ev = sample_event("2025-12-11T12:00:00+00:00");
     let idx = resolve_indices(&ev, PREFIX);
     assert_eq!(idx.len(), 1);
-    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group".to_string()));
 }
 
 #[test]
 fn test_resolve_index_different_prefix() {
-    let ev = sample_event("2024-01-15T08:30:00Z", None);
+    let ev = sample_event("2024-01-15T08:30:00Z");
     let idx = resolve_indices(&ev, "myapp");
     assert_eq!(idx.len(), 1);
-    assert!(idx.contains(&"myapp-aws-test-group-2024.01.15".to_string()));
+    assert!(idx.contains(&"myapp-aws-test-group".to_string()));
 }
 
 #[test]
 fn test_resolve_index_invalid_timestamp() {
-    let ev = sample_event("not-a-timestamp", None);
+    let ev = sample_event("not-a-timestamp");
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx, vec!["cloudwatch-default".to_string()]);
+    assert_eq!(idx, vec!["cloudwatch-aws-test-group".to_string()]);
 }
 
 #[test]
 fn test_resolve_index_empty_timestamp() {
-    let ev = sample_event("", None);
+    let ev = sample_event("");
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx, vec!["cloudwatch-default".to_string()]);
+    assert_eq!(idx, vec!["cloudwatch-aws-test-group".to_string()]);
 }
 
 #[test]
@@ -74,6 +71,7 @@ fn test_es_bulk_config_clone() {
         timeout: Duration::from_secs(30),
         gzip: true,
         index_prefix: "logs".into(),
+        bootstrap_notify: None,
     };
 
     let cloned = cfg.clone();
@@ -93,6 +91,7 @@ fn test_es_bulk_sink_new() {
         timeout: Duration::from_secs(30),
         gzip: true,
         index_prefix: "logs".into(),
+        bootstrap_notify: None,
     };
 
     let sink = EsBulkSink::new(cfg);
@@ -101,18 +100,16 @@ fn test_es_bulk_sink_new() {
 
 #[test]
 fn test_resolve_index_with_timezone_offset() {
-    let ev = sample_event("2025-06-15T10:30:00-05:00", None);
+    let ev = sample_event("2025-06-15T10:30:00-05:00");
     let idx = resolve_indices(&ev, PREFIX);
-    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.06.15".to_string()));
+    assert!(idx.contains(&"cloudwatch-aws-test-group".to_string()));
 }
 
 #[test]
 fn test_resolve_index_target_takes_precedence() {
-    let ev = sample_event("2025-12-11T12:00:00Z", Some("override-index".to_string()));
+    let ev = sample_event("2025-12-11T12:00:00Z");
     let idx = resolve_indices(&ev, PREFIX);
-    assert_eq!(idx.len(), 2);
-    assert!(idx.contains(&"override-index".to_string()));
-    assert!(idx.contains(&"cloudwatch-aws-test-group-2025.12.11".to_string()));
+    assert_eq!(idx, vec!["cloudwatch-aws-test-group".to_string()]);
 }
 
 mod failure_classification_tests {
@@ -458,7 +455,6 @@ mod fallback_event_tests {
                     }
                 }
             })),
-            target_index: None,
             tags: vec!["production".to_string()],
         }
     }
@@ -564,7 +560,6 @@ mod fallback_event_tests {
             log_group: GROUP.to_string(),
             message: serde_json::Value::String("raw log line".to_string()),
             parsed: None,
-            target_index: None,
             tags: vec![],
         };
         let fallback = create_fallback_event(&original, "some_error", "reason");
@@ -609,7 +604,6 @@ mod fallback_event_tests {
                 "level": "info",
                 "service_name": "myapp-node"
             })),
-            target_index: None,
             tags: vec![],
         };
 

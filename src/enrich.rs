@@ -8,20 +8,10 @@ const MAX_FIELD_NAME_LEN: usize = 256;
 const MAX_STRING_VALUE_LEN: usize = 32000;
 const MAX_ARRAY_LEN: usize = 1000;
 
-pub fn enrich_event(
-    raw: crate::types::LogEvent,
-    log_group: &str,
-    index_prefix: &str,
-    target_index: Option<String>,
-) -> Option<EnrichedEvent> {
+pub fn enrich_event(raw: crate::types::LogEvent, log_group: &str) -> Option<EnrichedEvent> {
     let ts_dt = DateTime::<Utc>::from_timestamp_millis(raw.timestamp_ms)
         .unwrap_or_else(|| DateTime::<Utc>::from_timestamp_millis(0).unwrap());
     let ts = ts_dt.to_rfc3339();
-    let idx = target_index.unwrap_or_else(|| {
-        let date = ts_dt.format("%Y.%m.%d").to_string();
-        let group = sanitize_log_group_name(log_group);
-        format!("{index_prefix}-{group}-{date}")
-    });
 
     let mut message_str = raw.message.replace('\r', "");
     message_str = message_str.trim().to_string();
@@ -45,7 +35,6 @@ pub fn enrich_event(
         event: EventMeta { id: raw.id },
         message,
         parsed,
-        target_index: Some(idx),
         log_group: log_group.to_string(),
         tags,
     })

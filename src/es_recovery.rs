@@ -64,7 +64,6 @@ pub async fn check_and_recover_tracked(
     base_url: &str,
     user: &str,
     pass: &str,
-    _index_prefix: &str,
     tracker: &StressTracker,
 ) -> bool {
     let mut stress_detected = false;
@@ -227,10 +226,9 @@ pub async fn check_on_startup(
     user: &str,
     pass: &str,
     timeout: Duration,
-    index_prefix: &str,
 ) -> Result<()> {
     let client = Client::builder().timeout(timeout).build()?;
     let tracker = StressTracker::with_config(StressConfig::ES);
-    let _ = check_and_recover_tracked(&client, base_url, user, pass, index_prefix, &tracker).await;
+    let _ = check_and_recover_tracked(&client, base_url, user, pass, &tracker).await;
     Ok(())
 }

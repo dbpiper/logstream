@@ -11,6 +11,12 @@ pub struct Config {
     pub log_group: Arc<str>,
     pub region: Arc<str>,
     pub index_prefix: Arc<str>,
+    pub enable_es_bootstrap: bool,
+    pub es_target_replicas: usize,
+    pub ilm_rollover_max_age: Arc<str>,
+    pub ilm_rollover_max_primary_shard_size: Arc<str>,
+    pub ilm_enable_delete_phase: bool,
+    pub ilm_delete_min_age: Arc<str>,
     pub batch_size: usize,
     pub max_in_flight: usize,
     pub poll_interval_secs: u64,
@@ -28,6 +34,18 @@ struct RawConfig {
     log_groups: Vec<String>,
     region: String,
     index_prefix: String,
+    #[serde(default = "default_true")]
+    enable_es_bootstrap: bool,
+    #[serde(default = "default_es_target_replicas")]
+    es_target_replicas: usize,
+    #[serde(default = "default_rollover_max_age")]
+    ilm_rollover_max_age: String,
+    #[serde(default = "default_rollover_max_primary_shard_size")]
+    ilm_rollover_max_primary_shard_size: String,
+    #[serde(default = "default_false")]
+    ilm_enable_delete_phase: bool,
+    #[serde(default = "default_delete_min_age")]
+    ilm_delete_min_age: String,
     batch_size: usize,
     max_in_flight: usize,
     poll_interval_secs: u64,
@@ -48,6 +66,12 @@ impl From<RawConfig> for Config {
             log_group,
             region: raw.region.into(),
             index_prefix: raw.index_prefix.into(),
+            enable_es_bootstrap: raw.enable_es_bootstrap,
+            es_target_replicas: raw.es_target_replicas,
+            ilm_rollover_max_age: raw.ilm_rollover_max_age.into(),
+            ilm_rollover_max_primary_shard_size: raw.ilm_rollover_max_primary_shard_size.into(),
+            ilm_enable_delete_phase: raw.ilm_enable_delete_phase,
+            ilm_delete_min_age: raw.ilm_delete_min_age.into(),
             batch_size: raw.batch_size,
             max_in_flight: raw.max_in_flight,
             poll_interval_secs: raw.poll_interval_secs,
@@ -89,6 +113,29 @@ impl Config {
         if let Ok(v) = env::var("INDEX_PREFIX") {
             cfg.index_prefix = v.into();
         }
+        cfg.enable_es_bootstrap = env_bool("ENABLE_ES_BOOTSTRAP", cfg.enable_es_bootstrap);
+        if let Ok(v) = env::var("ES_TARGET_REPLICAS") {
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.es_target_replicas = n;
+            }
+        }
+        if let Ok(v) = env::var("ILM_ROLLOVER_MAX_AGE") {
+            if !v.trim().is_empty() {
+                cfg.ilm_rollover_max_age = v.into();
+            }
+        }
+        if let Ok(v) = env::var("ILM_ROLLOVER_MAX_PRIMARY_SHARD_SIZE") {
+            if !v.trim().is_empty() {
+                cfg.ilm_rollover_max_primary_shard_size = v.into();
+            }
+        }
+        cfg.ilm_enable_delete_phase =
+            env_bool("ILM_ENABLE_DELETE_PHASE", cfg.ilm_enable_delete_phase);
+        if let Ok(v) = env::var("ILM_DELETE_MIN_AGE") {
+            if !v.trim().is_empty() {
+                cfg.ilm_delete_min_age = v.into();
+            }
+        }
         maybe_env_usize(&mut cfg.batch_size, "BATCH_SIZE");
         maybe_env_usize(&mut cfg.max_in_flight, "MAX_IN_FLIGHT");
         maybe_env_u64(&mut cfg.poll_interval_secs, "POLL_INTERVAL_SECS");
@@ -126,6 +173,18 @@ impl Config {
             index_prefix: env::var("INDEX_PREFIX")
                 .unwrap_or_else(|_| "cloudwatch".into())
                 .into(),
+            enable_es_bootstrap: env_bool("ENABLE_ES_BOOTSTRAP", true),
+            es_target_replicas: env_usize("ES_TARGET_REPLICAS", 0),
+            ilm_rollover_max_age: env::var("ILM_ROLLOVER_MAX_AGE")
+                .unwrap_or_else(|_| "1d".into())
+                .into(),
+            ilm_rollover_max_primary_shard_size: env::var("ILM_ROLLOVER_MAX_PRIMARY_SHARD_SIZE")
+                .unwrap_or_else(|_| "25gb".into())
+                .into(),
+            ilm_enable_delete_phase: env_bool("ILM_ENABLE_DELETE_PHASE", true),
+            ilm_delete_min_age: env::var("ILM_DELETE_MIN_AGE")
+                .unwrap_or_else(|_| "30d".into())
+                .into(),
             batch_size: env_usize("BATCH_SIZE", 100),
             max_in_flight: env_usize("MAX_IN_FLIGHT", 2),
             poll_interval_secs: env_u64("POLL_INTERVAL_SECS", 15),
@@ -137,6 +196,10 @@ impl Config {
             backoff_max_ms: env_u64("BACKOFF_MAX_MS", 10_000),
         })
     }
+}
+
+fn default_delete_min_age() -> String {
+    "30d".to_string()
 }
 
 impl Config {
@@ -175,6 +238,26 @@ fn validate_required(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_es_target_replicas() -> usize {
+    0
+}
+
+fn default_rollover_max_age() -> String {
+    "1d".into()
+}
+
+fn default_rollover_max_primary_shard_size() -> String {
+    "25gb".into()
+}
+
 fn maybe_env_usize(val: &mut usize, key: &str) {
     if let Ok(v) = env::var(key) {
         if let Ok(n) = v.parse::<usize>() {
@@ -189,6 +272,13 @@ fn maybe_env_u64(val: &mut u64, key: &str) {
             *val = n;
         }
     }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

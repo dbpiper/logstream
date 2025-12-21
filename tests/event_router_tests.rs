@@ -11,7 +11,6 @@ fn test_event(id: &str) -> EnrichedEvent {
         log_group: "/aws/test-group".to_string(),
         message: serde_json::Value::String("test".to_string()),
         parsed: None,
-        target_index: None,
         tags: vec![],
     }
 }

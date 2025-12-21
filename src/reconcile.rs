@@ -11,6 +11,7 @@ use crate::{
     cw_counts::CwCounter,
     cw_tail::CloudWatchTailer,
     enrich::enrich_event,
+    enrich::sanitize_log_group_name,
     es_counts::EsCounter,
     es_schema_heal::SchemaHealer,
     event_router::EventSender,
@@ -120,20 +121,39 @@ async fn run_schema_healing(ctx: &ReconcileContext) {
         return;
     };
 
-    match healer.heal().await {
-        Ok(fixed) if fixed > 0 => {
+    let stable = format!(
+        "{}-{}",
+        &*ctx.index_prefix,
+        sanitize_log_group_name(&ctx.log_group)
+    );
+    let (start_ms, end_ms) = utc_prev_day_bounds_ms();
+    match healer.heal_window(&stable, start_ms, end_ms).await {
+        Ok(true) => {
             info!(
-                "reconcile schema_heal: fixed {} indices with mapping drift",
-                fixed
+                "reconcile schema_heal: repaired window alias={} start={} end={}",
+                stable, start_ms, end_ms
             );
         }
-        Ok(_) => {
-            debug!("reconcile schema_heal: all indices have correct mappings");
+        Ok(false) => {
+            debug!("reconcile schema_heal: no repair needed");
         }
         Err(err) => {
             warn!("reconcile schema_heal: error: {err:?}");
         }
     }
+}
+
+fn utc_prev_day_bounds_ms() -> (i64, i64) {
+    let now = chrono::Utc::now();
+    let today = now.date_naive();
+    let start_naive = (today - chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let end_naive = today.and_hms_opt(0, 0, 0).unwrap();
+    let start =
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_naive, chrono::Utc);
+    let end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_naive, chrono::Utc);
+    (start.timestamp_millis(), end.timestamp_millis())
 }
 
 pub async fn run_full_history(ctx: ReconcileContext, params: ReconcileParams, backfill_days: u32) {
@@ -178,10 +198,11 @@ async fn reconcile_all_days(
         let day_offset = offset;
         let ctx_clone = ctx.clone();
         futs.push(tokio::spawn(async move {
-            let _permit = permit;
+            let permit_guard = permit;
             if let Err(err) = process_day(&ctx_clone, params, day_offset).await {
                 warn!("day offset {} error: {err:?}", day_offset);
             }
+            drop(permit_guard);
         }));
         offset += 1;
         while futs.len() >= MAX_PARALLEL_DAYS {
@@ -521,9 +542,7 @@ async fn execute_full_replace(
     let mut ingested = 0usize;
     let mut enrich_failures = 0usize;
     for raw in events {
-        if let Some(enriched) =
-            enrich_event(raw, ctx.log_group.as_ref(), ctx.index_prefix.as_ref(), None)
-        {
+        if let Some(enriched) = enrich_event(raw, ctx.log_group.as_ref()) {
             if ctx.sink_tx.send(enriched).await.is_err() {
                 warn!(
                     "reconcile safe_replace: sink closed after {} ingested for {}-{}",
@@ -683,9 +702,7 @@ async fn upsert_events(ctx: &ReconcileContext, events: Vec<LogEvent>) {
     let mut enrich_failures = 0usize;
 
     for raw in events {
-        if let Some(enriched) =
-            enrich_event(raw, ctx.log_group.as_ref(), ctx.index_prefix.as_ref(), None)
-        {
+        if let Some(enriched) = enrich_event(raw, ctx.log_group.as_ref()) {
             if ctx.sink_tx.send(enriched).await.is_err() {
                 warn!(
                     "reconcile upsert: sink closed after {}/{} events",
