@@ -21,10 +21,9 @@ use logstream::es_bootstrap::start_es_bootstrap;
 use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
 use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
-use logstream::es_index::{
-    apply_backfill_settings, cleanup_problematic_indices, drop_index_if_exists,
-};
+use logstream::es_index::{cleanup_problematic_indices, drop_index_if_exists};
 use logstream::es_recovery;
+use logstream::es_refresh_tuner::{start_refresh_tuner, RefreshTunerConfig};
 use logstream::es_schema_heal::SchemaHealer;
 use logstream::event_router::{build_event_router, EventRouter, EventSenderFactory};
 use logstream::process::GroupScheduler;
@@ -121,6 +120,19 @@ async fn main() -> Result<()> {
     sink.start_adaptive(event_router, adaptive_controller.clone());
     sink.start_heap_monitor(adaptive_controller.clone());
 
+    start_refresh_tuner(
+        cfg.clone(),
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+        cfg.http_timeout(),
+        RefreshTunerConfig {
+            hot_refresh_interval: es_cfg.refresh_hot.clone(),
+            cold_refresh_interval: es_cfg.refresh_cold.clone(),
+            cold_age_days: es_cfg.refresh_cold_age_days,
+            interval_secs: es_cfg.refresh_tune_interval_secs,
+        },
+    );
     run_index_hygiene(&es_cfg, &index_prefix).await;
     run_schema_healing(&es_cfg, &cfg).await;
     run_recovery_checks(&es_cfg, &cfg).await;
@@ -167,8 +179,10 @@ struct EsConfig {
     url: Arc<str>,
     user: Arc<str>,
     pass: Arc<str>,
-    backfill_refresh: String,
-    backfill_replicas: String,
+    refresh_hot: Arc<str>,
+    refresh_cold: Arc<str>,
+    refresh_cold_age_days: u64,
+    refresh_tune_interval_secs: u64,
 }
 
 impl EsConfig {
@@ -183,9 +197,20 @@ impl EsConfig {
             pass: std::env::var("ES_PASS")
                 .unwrap_or_else(|_| "changeme".into())
                 .into(),
-            backfill_refresh: std::env::var("ES_BACKFILL_REFRESH_INTERVAL")
-                .unwrap_or_else(|_| "-1".into()),
-            backfill_replicas: std::env::var("ES_BACKFILL_REPLICAS").unwrap_or_else(|_| "0".into()),
+            refresh_hot: std::env::var("ES_HOT_REFRESH_INTERVAL")
+                .unwrap_or_else(|_| "1s".into())
+                .into(),
+            refresh_cold: std::env::var("ES_COLD_REFRESH_INTERVAL")
+                .unwrap_or_else(|_| "30s".into())
+                .into(),
+            refresh_cold_age_days: std::env::var("ES_COLD_AGE_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(7),
+            refresh_tune_interval_secs: std::env::var("ES_REFRESH_TUNE_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3600),
         }
     }
 }
@@ -286,24 +311,6 @@ async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
         cleanup_problematic_indices(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix).await
     {
         tracing::warn!("failed to cleanup problematic indices: {err:?}");
-    }
-
-    if let Err(err) = apply_backfill_settings(
-        &es_cfg.url,
-        &es_cfg.user,
-        &es_cfg.pass,
-        index_prefix,
-        &es_cfg.backfill_refresh,
-        &es_cfg.backfill_replicas,
-    )
-    .await
-    {
-        tracing::warn!("failed to apply backfill index settings: {err:?}");
-    } else {
-        info!(
-            "applied backfill settings refresh_interval={} replicas={}",
-            es_cfg.backfill_refresh, es_cfg.backfill_replicas
-        );
     }
 }
 

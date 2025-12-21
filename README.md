@@ -84,15 +84,16 @@ Ensures real-time logs are never blocked by background operations.
 
 - Stream multiple log groups simultaneously
 - Independent checkpoints per group
-- Per-group index naming: `{prefix}-{group}-{date}`
-- Unified view via `{prefix}-all` alias
+- Per-group data streams with stable names (see **Data stream organization** below)
+- Unified querying via `cloudwatch-*` (or your configured `INDEX_PREFIX-*`)
 
-**Index Organization**
+**Data stream organization**
 
 ```
-cloudwatch-ecs-app-prod-2025.12.14        # App logs for Dec 14
-cloudwatch-lambda-api-prod-2025.12.14     # Lambda logs for Dec 14
-cloudwatch-all                            # Alias pointing to all indices
+cloudwatch-ecs-app-prod-service           # Stable name (alias)
+cloudwatch-ecs-app-prod-service-v1        # Versioned data stream (active)
+cloudwatch-ecs-app-prod-service-v2        # Versioned data stream (standby/repair)
+.ds-cloudwatch-ecs-app-prod-service-v1-2025.12.21-000001  # Backing index (managed by ES)
 ```
 
 ### Checkpointing & Recovery
@@ -195,7 +196,7 @@ Configuration via environment variables or `config.toml`:
 | `ES_PASS`      | Elasticsearch password     | `changeme`              |
 | `INDEX_PREFIX` | Elasticsearch index prefix | `cloudwatch`            |
 
-**Note:** `INDEX_PREFIX` defaults to `cloudwatch` to avoid conflicts with ES 9.x built-in `logs-*` data stream templates.
+**Note:** `INDEX_PREFIX` defaults to `cloudwatch` to avoid conflicts with ES built-in `logs-*` data stream templates and data views.
 
 ### Performance Tuning
 
@@ -216,6 +217,22 @@ Configuration via environment variables or `config.toml`:
 | `BACKFILL_DAYS`           | Days of historical data to stream on first run | `30`                      |
 | `CHECKPOINT_PATH`         | Where to store checkpoint state                | `/state/checkpoints.json` |
 
+### Discover visibility (refresh policy)
+
+logstream manages backing index refresh so Kibana Discover stays live while keeping overhead reasonable:
+
+- Backing indices whose `max(@timestamp)` is within the last **7 days**: `refresh_interval=1s`
+- Older backing indices: `refresh_interval=30s`
+
+You can tune this behavior with:
+
+| Variable                        | Description                                             | Default |
+| ------------------------------- | ------------------------------------------------------- | ------- |
+| `ES_HOT_REFRESH_INTERVAL`       | Refresh interval for “hot” backing indices              | `1s`    |
+| `ES_COLD_REFRESH_INTERVAL`      | Refresh interval for “cold” backing indices             | `30s`   |
+| `ES_COLD_AGE_DAYS`              | Backing index is “cold” if max `@timestamp` is older    | `7`     |
+| `ES_REFRESH_TUNE_INTERVAL_SECS` | How often to re-evaluate backing index refresh settings | `3600`  |
+
 ### Advanced
 
 **Adaptive controller** automatically adjusts `BATCH_SIZE` and `MAX_IN_FLIGHT` based on:
@@ -231,28 +248,31 @@ Configuration via environment variables or `config.toml`:
 - ES returns 429 (too many requests)
 - Bulk requests fail repeatedly
 
-## Index Structure
+## Index / data stream structure
 
-Indices are organized by log group and date:
+logstream writes to **data streams** (not daily indices). Each log group has a stable name and two versioned data streams to support safe repairs.
 
 ```
-{INDEX_PREFIX}-{sanitized-group-name}-{YYYY.MM.DD}
+{INDEX_PREFIX}-{sanitized-group-name}         # Stable name (alias)
+{INDEX_PREFIX}-{sanitized-group-name}-v1      # Versioned data stream
+{INDEX_PREFIX}-{sanitized-group-name}-v2      # Versioned data stream
 ```
 
 **Example:**
 
 ```
-cloudwatch-ecs-myapp-prod-service-2025.12.14
-cloudwatch-lambda-api-prod-2025.12.14
+cloudwatch-ecs-myapp-prod-service
+cloudwatch-ecs-myapp-prod-service-v1
+cloudwatch-ecs-myapp-prod-service-v2
 ```
 
 **Cumulative view:**
 
 ```
-cloudwatch-*  # Query all indices
+cloudwatch-*  # Query all logstream streams (or {INDEX_PREFIX}-*)
 ```
 
-### Per-Group Indices
+### Per-Group Data Streams
 
 Each log group gets its own index pattern, allowing you to:
 
@@ -351,6 +371,7 @@ INFO logstream::es_schema_heal: schema_heal: fixed 2 indices with mapping confli
 2. Verify credentials work
 3. Check logstream logs for errors
 4. Verify log group exists in CloudWatch
+5. In Kibana Discover, ensure your data view matches `cloudwatch-*` (not `logs-*`) and the time field is `@timestamp`
 
 ### Missing historical data
 

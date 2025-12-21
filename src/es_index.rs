@@ -123,6 +123,81 @@ pub async fn apply_backfill_settings(
     Ok(())
 }
 
+pub async fn ensure_index_refresh_interval(
+    client: &Client,
+    base_url: &str,
+    user: &str,
+    pass: &str,
+    index: &str,
+    refresh_interval: &str,
+) -> Result<bool> {
+    let current = get_index_refresh_interval(client, base_url, user, pass, index).await?;
+    if current.as_deref() == Some(refresh_interval) {
+        return Ok(false);
+    }
+    set_index_refresh_interval(client, base_url, user, pass, index, refresh_interval).await
+}
+
+async fn get_index_refresh_interval(
+    client: &Client,
+    base_url: &str,
+    user: &str,
+    pass: &str,
+    index: &str,
+) -> Result<Option<String>> {
+    let url = format!(
+        "{}/{}/_settings?filter_path=**.refresh_interval",
+        base_url.trim_end_matches('/'),
+        index
+    );
+    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let interval = v
+        .as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|x| x.pointer("/settings/index/refresh_interval"))
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    Ok(interval)
+}
+
+async fn set_index_refresh_interval(
+    client: &Client,
+    base_url: &str,
+    user: &str,
+    pass: &str,
+    index: &str,
+    refresh_interval: &str,
+) -> Result<bool> {
+    let url = format!("{}/{}/_settings", base_url.trim_end_matches('/'), index);
+    let body = serde_json::json!({
+        "index": {
+            "refresh_interval": refresh_interval
+        }
+    });
+    let resp = client
+        .put(&url)
+        .basic_auth(user, Some(pass))
+        .json(&body)
+        .send()
+        .await?;
+    if resp.status().as_u16() == 404 {
+        // Backing indices can roll over or be deleted between discovery and update.
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "set refresh interval index={} status={}",
+            index,
+            resp.status()
+        );
+    }
+    Ok(true)
+}
+
 /// Reset indices to normal settings after backfill.
 pub async fn restore_normal_settings(
     base_url: &str,

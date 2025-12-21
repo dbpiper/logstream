@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone)]
 pub struct EsWindowClient {
@@ -97,6 +98,53 @@ impl EsWindowClient {
         }
     }
 
+    pub async fn backing_index_max_timestamp_ms(
+        &self,
+        stream: &str,
+    ) -> Result<BTreeMap<String, i64>> {
+        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), stream);
+        let body = serde_json::json!({
+            "size": 0,
+            "aggs": {
+                "by_index": {
+                    "terms": {
+                        "field": "_index",
+                        "size": 10000
+                    },
+                    "aggs": {
+                        "max_ts": { "max": { "field": "@timestamp" } }
+                    }
+                }
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .basic_auth(&*self.user, Some(&*self.pass))
+            .json(&body)
+            .send()
+            .await
+            .context("stream max_ts by backing index search")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "stream max_ts by backing index failed stream={} status={}",
+                stream,
+                resp.status()
+            );
+        }
+
+        let parsed: StreamIndexMaxTsResp = resp.json().await.unwrap_or_default();
+        Ok(parsed
+            .aggregations
+            .by_index
+            .buckets
+            .into_iter()
+            .filter_map(|b| b.max_ts.value.map(|v| (b.key, v as i64)))
+            .collect())
+    }
+
     pub async fn indices_overlapping_window(
         &self,
         stream: &str,
@@ -164,4 +212,36 @@ struct DataStreamEntry {
 struct DataStreamIndex {
     #[serde(default)]
     index_name: String,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamIndexMaxTsResp {
+    #[serde(default)]
+    aggregations: StreamIndexMaxTsAggs,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamIndexMaxTsAggs {
+    #[serde(default)]
+    by_index: StreamIndexMaxTsByIndex,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamIndexMaxTsByIndex {
+    #[serde(default)]
+    buckets: Vec<StreamIndexMaxTsBucket>,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamIndexMaxTsBucket {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    max_ts: StreamIndexMaxTsValue,
+}
+
+#[derive(Default, Deserialize)]
+struct StreamIndexMaxTsValue {
+    #[serde(default)]
+    value: Option<f64>,
 }

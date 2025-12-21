@@ -234,9 +234,9 @@ impl EsCounter {
                 "size": BATCH_SIZE,
                 "sort": [
                     { "@timestamp": { "order": "asc" } },
-                    { "event.id": { "order": "asc" } }
+                    { "_id": { "order": "asc" } }
                 ],
-                "_source": ["event.id"],
+                "_source": false,
                 "query": {
                     "range": {
                         "@timestamp": {
@@ -278,14 +278,18 @@ impl EsCounter {
             }
 
             for hit in hits {
-                if let Some(id) = hit["_source"]["event"]["id"].as_str() {
+                if let Some(id) = hit["_id"].as_str() {
                     all_ids.push(id.to_string());
                 }
                 // Update search_after for pagination
                 if let Some(sort) = hit["sort"].as_array() {
                     if sort.len() >= 2 {
                         let ts = sort[0].as_i64().unwrap_or(0);
-                        let id_val = sort[1].as_str().unwrap_or("").to_string();
+                        let id_val = sort[1]
+                            .as_str()
+                            .or_else(|| hit["_id"].as_str())
+                            .unwrap_or("")
+                            .to_string();
                         search_after = Some((ts, id_val));
                     }
                 }

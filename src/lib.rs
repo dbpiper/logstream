@@ -14,6 +14,7 @@ pub mod es_conflicts;
 pub mod es_counts;
 pub mod es_index;
 pub mod es_recovery;
+pub mod es_refresh_tuner;
 pub mod es_repair;
 pub mod es_schema_heal;
 pub mod es_window;
