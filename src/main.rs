@@ -70,6 +70,17 @@ async fn main() -> Result<()> {
     let (event_router, sender_factory) = create_event_router();
 
     let es_cfg = EsConfig::from_env();
+    // Avoid crash loops when ES is still starting up: wait until it answers health checks.
+    loop {
+        match wait_for_es_ready(&es_cfg).await {
+            Ok(()) => break,
+            Err(err) => {
+                tracing::warn!("ES not ready yet: {err:?}; retrying in 1s");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
     // Ensure templates/ILM/data streams/aliases exist before any ingest or migration.
     logstream::es_bootstrap::bootstrap_now(
         &cfg,

@@ -319,7 +319,7 @@ pub fn build_index_template_body(
     let pattern = format!("{}-*", index_prefix);
     serde_json::json!({
         "index_patterns": [pattern],
-        "priority": 500,
+        "priority": 600,
         "data_stream": {},
         "template": {
             "settings": {
