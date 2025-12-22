@@ -19,13 +19,13 @@ pub fn enrich_event(raw: crate::types::LogEvent, log_group: &str) -> Option<Enri
         return None;
     }
 
-    let message = Value::String(message_str.clone());
-
     let (parsed, mut tags) = match try_parse_and_normalize(&message_str) {
         Ok(Some(val)) => (Some(val), vec!["json_parsed".into()]),
         Ok(None) => (None, vec!["not_json_message".into()]),
         Err(_) => (None, vec!["not_json_message".into()]),
     };
+
+    let message = Value::String(message_str);
 
     tags.push("sync".into());
     tags.push("synced".into());
@@ -69,36 +69,38 @@ fn normalize_value(v: &mut Value, depth: usize) {
 
     match v {
         Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for k in keys {
-                if let Some(mut child) = map.remove(&k) {
+            let original = std::mem::take(map);
+            let rebuilt = original
+                .into_iter()
+                .filter_map(|(k, mut child)| {
                     if child.is_null() {
-                        continue;
+                        return None;
                     }
 
                     let clean_key = sanitize_key(&k);
                     if clean_key.is_empty() || clean_key.len() > MAX_FIELD_NAME_LEN {
-                        continue;
+                        return None;
                     }
 
                     if is_reserved_field(&clean_key) {
                         let renamed = format!("_user_{}", clean_key);
                         normalize_value(&mut child, depth + 1);
-                        map.insert(renamed, child);
-                    } else if has_type_conflict(&child, &clean_key) {
-                        // Field pattern suggests it should be a primitive
-                        let stringified = flatten_to_string(&child);
-                        map.insert(clean_key, stringified);
-                    } else if depth >= FLATTEN_DEPTH && matches!(child, Value::Object(_)) {
-                        // Deep nesting: flatten objects to prevent mapping conflicts
-                        let stringified = flatten_to_string(&child);
-                        map.insert(clean_key, stringified);
-                    } else {
-                        normalize_value(&mut child, depth + 1);
-                        map.insert(clean_key, child);
+                        return Some((renamed, child));
                     }
-                }
-            }
+
+                    if has_type_conflict(&child, &clean_key) {
+                        return Some((clean_key, flatten_to_string(&child)));
+                    }
+
+                    if depth >= FLATTEN_DEPTH && matches!(child, Value::Object(_)) {
+                        return Some((clean_key, flatten_to_string(&child)));
+                    }
+
+                    normalize_value(&mut child, depth + 1);
+                    Some((clean_key, child))
+                })
+                .collect();
+            *map = rebuilt;
         }
         Value::Array(arr) => {
             arr.retain(|x| !x.is_null());

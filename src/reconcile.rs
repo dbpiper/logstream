@@ -7,16 +7,17 @@ use tracing::{debug, info, warn};
 
 use std::sync::Arc;
 
+use crate::prune_state::PruneState;
 use crate::{
     cw_counts::CwCounter,
     cw_tail::CloudWatchTailer,
     enrich::enrich_event,
-    enrich::sanitize_log_group_name,
     es_counts::EsCounter,
     es_schema_heal::SchemaHealer,
     event_router::EventSender,
     seasonal_stats::{validate_event_integrity, Confidence, DataIntegrity, SeasonalStats},
     stress::StressTracker,
+    time_windows,
     types::LogEvent,
 };
 
@@ -35,7 +36,8 @@ pub struct ReconcileContext {
     pub seasonal_stats: Arc<SeasonalStats>,
     pub schema_healer: Option<SchemaHealer>,
     pub log_group: Arc<str>,
-    pub index_prefix: Arc<str>,
+    pub stable_alias: Arc<str>,
+    pub prune_state: Arc<PruneState>,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +104,17 @@ pub async fn run_reconcile_loop(ctx: ReconcileContext, params: ReconcileParams) 
 
         let now_ms = current_time_ms();
         let start_ms = now_ms.saturating_sub(params.replay_window.as_millis() as i64);
+        let Some((start_ms, now_ms)) = ctx
+            .prune_state
+            .apply_window(&ctx.stable_alias, start_ms, now_ms)
+            .await
+        else {
+            info!(
+                "reconcile: skipped replay window (pruned) for {}",
+                ctx.stable_alias
+            );
+            continue;
+        };
         let range_ms = now_ms.saturating_sub(start_ms);
         let sync = derive_sync_params(range_ms, params);
         info!(
@@ -121,17 +134,23 @@ async fn run_schema_healing(ctx: &ReconcileContext) {
         return;
     };
 
-    let stable = format!(
-        "{}-{}",
-        &*ctx.index_prefix,
-        sanitize_log_group_name(&ctx.log_group)
-    );
-    let (start_ms, end_ms) = utc_prev_day_bounds_ms();
-    match healer.heal_window(&stable, start_ms, end_ms).await {
+    let (start_ms, end_ms) = time_windows::utc_prev_day_bounds_ms();
+    let Some((start_ms, end_ms)) = ctx
+        .prune_state
+        .apply_window(&ctx.stable_alias, start_ms, end_ms)
+        .await
+    else {
+        debug!("reconcile schema_heal: skipped (pruned)");
+        return;
+    };
+    match healer
+        .heal_window(&ctx.stable_alias, start_ms, end_ms)
+        .await
+    {
         Ok(true) => {
             info!(
                 "reconcile schema_heal: repaired window alias={} start={} end={}",
-                stable, start_ms, end_ms
+                ctx.stable_alias, start_ms, end_ms
             );
         }
         Ok(false) => {
@@ -143,20 +162,10 @@ async fn run_schema_healing(ctx: &ReconcileContext) {
     }
 }
 
-fn utc_prev_day_bounds_ms() -> (i64, i64) {
-    let now = chrono::Utc::now();
-    let today = now.date_naive();
-    let start_naive = (today - chrono::Duration::days(1))
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
-    let end_naive = today.and_hms_opt(0, 0, 0).unwrap();
-    let start =
-        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_naive, chrono::Utc);
-    let end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_naive, chrono::Utc);
-    (start.timestamp_millis(), end.timestamp_millis())
-}
+// day/window bounds are defined in time_windows (end-exclusive)
 
 pub async fn run_full_history(ctx: ReconcileContext, params: ReconcileParams, backfill_days: u32) {
+    let ctx = std::sync::Arc::new(ctx);
     wait_for_es_ready(&ctx.es_counter).await;
     let mut ticker = interval(params.period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -164,27 +173,39 @@ pub async fn run_full_history(ctx: ReconcileContext, params: ReconcileParams, ba
         ticker.tick().await;
 
         // Run schema healing before each reconciliation cycle
-        run_schema_healing(&ctx).await;
+        run_schema_healing(ctx.as_ref()).await;
 
         info!(
             "full_history reconcile tick backfill_days={} period_secs={}",
             backfill_days,
             params.period.as_secs()
         );
-        if let Err(err) = reconcile_all_days(&ctx, params, backfill_days).await {
+        if let Err(err) = reconcile_all_days(ctx.clone(), params, backfill_days).await {
             warn!("full history reconcile error: {err:?}");
         }
     }
 }
 
 async fn reconcile_all_days(
-    ctx: &ReconcileContext,
+    ctx: std::sync::Arc<ReconcileContext>,
     params: ReconcileParams,
     backfill_days: u32,
 ) -> Result<(), anyhow::Error> {
-    let priority_days = 7u32.min(backfill_days);
+    let min_supported_ms = ctx.prune_state.min_supported_ms(&ctx.stable_alias).await;
+    let effective_backfill_days = if backfill_days == 0 && min_supported_ms > 0 {
+        let now_ms = current_time_ms();
+        let age_days = now_ms
+            .saturating_sub(min_supported_ms)
+            .saturating_div(86_400_000)
+            .saturating_add(1);
+        u32::try_from(age_days).unwrap_or(u32::MAX)
+    } else {
+        backfill_days
+    };
+
+    let priority_days = 7u32.min(effective_backfill_days);
     for offset in 0..priority_days {
-        if let Err(err) = process_day(ctx, params, offset).await {
+        if let Err(err) = process_day(ctx.as_ref(), params, offset).await {
             warn!("priority day offset {} error: {err:?}", offset);
         }
     }
@@ -193,13 +214,13 @@ async fn reconcile_all_days(
     let mut futs: FuturesUnordered<tokio::task::JoinHandle<()>> = FuturesUnordered::new();
 
     let mut offset: u32 = priority_days;
-    while backfill_days == 0 || offset < backfill_days {
+    while effective_backfill_days == 0 || offset < effective_backfill_days {
         let permit = semaphore.clone().acquire_owned().await?;
         let day_offset = offset;
         let ctx_clone = ctx.clone();
         futs.push(tokio::spawn(async move {
             let permit_guard = permit;
-            if let Err(err) = process_day(&ctx_clone, params, day_offset).await {
+            if let Err(err) = process_day(ctx_clone.as_ref(), params, day_offset).await {
                 warn!("day offset {} error: {err:?}", day_offset);
             }
             drop(permit_guard);
@@ -568,19 +589,19 @@ async fn execute_full_replace(
         match ctx.es_counter.get_ids_in_range(start_ms, end_ms).await {
             Ok(es_ids) => {
                 let es_id_count = es_ids.len();
-                let es_id_set: std::collections::HashSet<String> = es_ids.into_iter().collect();
-
-                // Find orphans (in ES but not in CW)
-                let orphan_ids: Vec<String> = es_id_set
-                    .iter()
-                    .filter(|id| !cw_ids.contains(*id))
-                    .cloned()
-                    .collect();
+                let es_id_set: std::collections::HashSet<&str> =
+                    es_ids.iter().map(|s| s.as_str()).collect();
 
                 // Find missing (in CW but not in ES) - for debugging
                 let missing_from_es: Vec<&String> = cw_ids
                     .iter()
-                    .filter(|id| !es_id_set.contains(*id))
+                    .filter(|id| !es_id_set.contains(id.as_str()))
+                    .collect();
+
+                // Find orphans (in ES but not in CW)
+                let orphan_ids: Vec<String> = es_ids
+                    .into_iter()
+                    .filter(|id| !cw_ids.contains(id))
                     .collect();
 
                 if !missing_from_es.is_empty() {
@@ -768,15 +789,18 @@ async fn process_day(
     offset: u32,
 ) -> Result<(), anyhow::Error> {
     let started = Instant::now();
-    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(offset as i64);
-    let start = day
-        .and_hms_opt(0, 0, 0)
-        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
-    let end = day
-        .and_hms_opt(23, 59, 59)
-        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
-    let start_ms = start.and_utc().timestamp_millis();
-    let end_ms = end.and_utc().timestamp_millis();
+    let (start_ms, end_ms) = time_windows::utc_day_range_ms(offset);
+    let Some((start_ms, end_ms)) = ctx
+        .prune_state
+        .apply_window(&ctx.stable_alias, start_ms, end_ms)
+        .await
+    else {
+        info!(
+            "day offset {} skipped (pruned) for {}",
+            offset, ctx.stable_alias
+        );
+        return Ok(());
+    };
     let range_ms = end_ms.saturating_sub(start_ms);
     let sync = derive_sync_params(range_ms, params);
 

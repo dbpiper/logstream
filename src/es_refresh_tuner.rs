@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::enrich::sanitize_log_group_name;
+use crate::es_http::EsHttp;
 use crate::es_index::ensure_index_refresh_interval;
 use crate::es_window::EsWindowClient;
+use crate::naming;
 
 #[derive(Debug, Clone)]
 pub struct RefreshTunerConfig {
@@ -26,21 +26,23 @@ pub fn start_refresh_tuner(
     tune_cfg: RefreshTunerConfig,
 ) {
     tokio::spawn(async move {
-        let client = Client::builder().timeout(timeout).build();
-        let window = EsWindowClient::new(es_url.clone(), es_user.clone(), es_pass.clone(), timeout);
-        let (Ok(client), Ok(window)) = (client, window) else {
+        let http = EsHttp::new(
+            es_url.clone(),
+            es_user.clone(),
+            es_pass.clone(),
+            timeout,
+            true,
+        );
+        let Ok(http) = http else {
             warn!("refresh_tuner: failed to create clients");
             return;
         };
+        let window = EsWindowClient::from_http(http.clone());
 
         let mut interval = tokio::time::interval(Duration::from_secs(tune_cfg.interval_secs));
         loop {
             interval.tick().await;
-            if let Err(err) = tune_once(
-                &client, &window, &cfg, &es_url, &es_user, &es_pass, &tune_cfg,
-            )
-            .await
-            {
+            if let Err(err) = tune_once(&http, &window, &cfg, &tune_cfg).await {
                 warn!("refresh_tuner: tune failed: {err:?}");
             }
         }
@@ -48,25 +50,20 @@ pub fn start_refresh_tuner(
 }
 
 async fn tune_once(
-    client: &Client,
+    http: &EsHttp,
     window: &EsWindowClient,
     cfg: &Config,
-    es_url: &str,
-    es_user: &str,
-    es_pass: &str,
     tune_cfg: &RefreshTunerConfig,
 ) -> anyhow::Result<()> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let cutoff_ms = now_ms.saturating_sub((tune_cfg.cold_age_days as i64) * 86_400_000);
 
     for group in cfg.effective_log_groups() {
-        let slug = sanitize_log_group_name(&group);
-        let stable = format!("{}-{}", cfg.index_prefix, slug);
-        let v1 = format!("{stable}-v1");
-        let v2 = format!("{stable}-v2");
+        let stable = naming::stable_alias(&cfg.index_prefix, &group);
+        let [v1, v2] = naming::versioned_streams(&stable);
 
-        for stream in [v1, v2] {
-            let max_by_index = match window.backing_index_max_timestamp_ms(&stream).await {
+        for stream in [&v1, &v2] {
+            let max_by_index = match window.backing_index_max_timestamp_ms(stream.as_ref()).await {
                 Ok(v) => v,
                 Err(err) => {
                     warn!("refresh_tuner: stream={stream} max_ts_by_index failed: {err:?}");
@@ -74,7 +71,7 @@ async fn tune_once(
                 }
             };
 
-            let indices = match window.data_stream_backing_indices(&stream).await {
+            let indices = match window.data_stream_backing_indices(stream.as_ref()).await {
                 Ok(v) => v,
                 Err(err) => {
                     warn!("refresh_tuner: stream={stream} list backing indices failed: {err:?}");
@@ -89,10 +86,7 @@ async fn tune_once(
                     &tune_cfg.hot_refresh_interval,
                     &tune_cfg.cold_refresh_interval,
                 );
-                let changed = ensure_index_refresh_interval(
-                    client, es_url, es_user, es_pass, &index, desired,
-                )
-                .await?;
+                let changed = ensure_index_refresh_interval(http, &index, desired).await?;
                 if changed {
                     info!(
                         "refresh_tuner: set index={} refresh_interval={}",

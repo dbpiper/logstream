@@ -3,16 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::es_http::EsHttp;
+
 #[derive(Clone)]
 pub struct EsConflictResolver {
-    client: Client,
-    base_url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
+    http: EsHttp,
     index_prefix: Arc<str>,
 }
 
@@ -24,12 +22,8 @@ impl EsConflictResolver {
         timeout: Duration,
         index_prefix: impl Into<Arc<str>>,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
+            http: EsHttp::new(base_url, user, pass, timeout, true)?,
             index_prefix: index_prefix.into(),
         })
     }
@@ -50,21 +44,14 @@ impl EsConflictResolver {
     }
 
     pub async fn conflict_indices(&self) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/{}-*/_field_caps?fields=*",
-            self.base_url, self.index_prefix
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
+        let v: Value = self
+            .http
+            .get_value(
+                &format!("{}-*/_field_caps?fields=*", self.index_prefix),
+                "field_caps request",
+            )
             .await
-            .context("field_caps request")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("field_caps status {}", resp.status());
-        }
-        let v: Value = resp.json().await.context("field_caps parse")?;
+            .context("field_caps parse")?;
         let mut indices: HashSet<String> = HashSet::new();
         if let Some(fields) = v.get("fields").and_then(|f| f.as_object()) {
             for value in fields.values() {
@@ -89,16 +76,9 @@ impl EsConflictResolver {
 
     pub async fn reindex_index(&self, index: &str) -> Result<()> {
         let temp = format!("{index}-conflict-temp");
-        let temp_url = format!("{}/{}", self.base_url, temp);
-        let index_url = format!("{}/{}", self.base_url, index);
 
         // Best-effort cleanup
-        let _ = self
-            .client
-            .delete(&temp_url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
-            .await;
+        let _ = self.http.delete_allow_404(&temp, "delete temp index").await;
 
         // Create temp index with tolerant settings
         let create_body = serde_json::json!({
@@ -111,17 +91,10 @@ impl EsConflictResolver {
                 }
             }
         });
-        let resp = self
-            .client
-            .put(&temp_url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&create_body)
-            .send()
-            .await
-            .context("create temp index")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("create temp index status {}", resp.status());
-        }
+        let _: Value = self
+            .http
+            .put_value(&temp, &create_body, "create temp index")
+            .await?;
 
         // Reindex original -> temp
         self.reindex(index, &temp)
@@ -130,10 +103,8 @@ impl EsConflictResolver {
 
         // Delete original (best effort)
         let _ = self
-            .client
-            .delete(&index_url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
+            .http
+            .delete_allow_404(index, "delete original index")
             .await;
 
         // Reindex temp -> original
@@ -141,10 +112,8 @@ impl EsConflictResolver {
 
         // Cleanup temp
         let _ = self
-            .client
-            .delete(&temp_url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
+            .http
+            .delete_allow_404(&temp, "cleanup temp index")
             .await;
 
         info!("conflict reindex complete for {}", index);
@@ -152,22 +121,18 @@ impl EsConflictResolver {
     }
 
     async fn reindex(&self, source: &str, dest: &str) -> Result<()> {
-        let url = format!("{}/_reindex?wait_for_completion=true", self.base_url);
         let body = serde_json::json!({
             "source": { "index": source },
             "dest": { "index": dest }
         });
-        let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("reindex request")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("reindex status {}", resp.status());
-        }
+        let _: Value = self
+            .http
+            .post_value(
+                "_reindex?wait_for_completion=true",
+                &body,
+                "reindex request",
+            )
+            .await?;
         Ok(())
     }
 }

@@ -14,10 +14,13 @@ use crate::es_conflicts::EsConflictResolver;
 use crate::es_counts::EsCounter;
 use crate::es_schema_heal::SchemaHealer;
 use crate::event_router::{EventSender, EventSenderFactory};
+use crate::naming;
 use crate::process::{GroupScheduler, Priority, ProcessScheduler, Resources, WorkerPool};
+use crate::prune_state::PruneState;
 use crate::reconcile;
 use crate::state::CheckpointState;
 use crate::stress::StressTracker;
+use crate::time_windows;
 use crate::types::LogEvent;
 
 pub struct GroupContext {
@@ -245,6 +248,7 @@ pub struct ReconcileExecContext<'a> {
     pub es_user: &'a str,
     pub es_pass: &'a str,
     pub index_prefix: &'a str,
+    pub prune_state: Arc<PruneState>,
 }
 
 /// Execute the reconcile loop daemon.
@@ -257,13 +261,14 @@ pub async fn execute_reconcile_daemon(
 
     // Create schema healer for automatic mapping conflict resolution
     let schema_healer = SchemaHealer::new(
-        ctx.es_url.to_string(),
-        ctx.es_user.to_string(),
-        ctx.es_pass.to_string(),
+        ctx.es_url,
+        ctx.es_user,
+        ctx.es_pass,
         Duration::from_secs(60),
     )
     .ok();
 
+    let stable_alias = naming::stable_alias(&ctx.cfg.index_prefix, ctx.cfg.log_group.as_ref());
     let reconcile_ctx = reconcile::ReconcileContext {
         tailer: create_tailer_for_reconcile(ctx.cfg, ctx.cfg.checkpoint_path.clone(), ctx.aws_cfg)
             .await?,
@@ -274,7 +279,8 @@ pub async fn execute_reconcile_daemon(
         seasonal_stats: ctx.seasonal_stats.clone(),
         schema_healer,
         log_group: ctx.cfg.log_group.clone(),
-        index_prefix: ctx.cfg.index_prefix.clone(),
+        stable_alias,
+        prune_state: ctx.prune_state.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -297,13 +303,14 @@ pub async fn execute_full_history_daemon(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // Create schema healer for automatic mapping conflict resolution
     let schema_healer = SchemaHealer::new(
-        ctx.es_url.to_string(),
-        ctx.es_user.to_string(),
-        ctx.es_pass.to_string(),
+        ctx.es_url,
+        ctx.es_user,
+        ctx.es_pass,
         Duration::from_secs(60),
     )
     .ok();
 
+    let stable_alias = naming::stable_alias(&ctx.cfg.index_prefix, ctx.cfg.log_group.as_ref());
     let reconcile_ctx = reconcile::ReconcileContext {
         tailer: create_tailer_for_reconcile(ctx.cfg, ctx.cfg.checkpoint_path.clone(), ctx.aws_cfg)
             .await?,
@@ -314,7 +321,8 @@ pub async fn execute_full_history_daemon(
         seasonal_stats: ctx.seasonal_stats.clone(),
         schema_healer,
         log_group: ctx.cfg.log_group.clone(),
-        index_prefix: ctx.cfg.index_prefix.clone(),
+        stable_alias,
+        prune_state: ctx.prune_state.clone(),
     };
     let params = reconcile::ReconcileParams {
         period: Duration::from_secs(ctx.cfg.reconcile_interval_secs),
@@ -336,23 +344,38 @@ pub async fn execute_full_history_daemon(
 /// Heal concurrency - keep low to avoid CloudWatch API throttling.
 const HEAL_CONCURRENCY: usize = 2;
 
+pub struct HealRunContext {
+    pub cfg: Config,
+    pub aws_cfg: aws_config::SdkConfig,
+    pub sender_factory: EventSenderFactory,
+    pub buffer_caps: BufferCapacities,
+    pub prune_state: Arc<PruneState>,
+    pub stable_alias: Arc<str>,
+}
+
 /// Execute heal days with demand-driven spawning (Linux-style).
 ///
 /// Like run_backfill_days, this uses a BatchWorkQueue to only spawn
 /// max_ready processes at a time, avoiding memory exhaustion.
 /// Pauses workers when ES or CW is under stress.
 pub async fn run_heal_days(
-    cfg: Config,
-    aws_cfg: aws_config::SdkConfig,
-    sender_factory: EventSenderFactory,
+    ctx: HealRunContext,
     heal_days: u32,
-    buffer_caps: BufferCapacities,
     es_stress_tracker: Option<Arc<StressTracker>>,
     cw_stress_tracker: Option<Arc<StressTracker>>,
 ) {
     if heal_days == 0 {
         return;
     }
+
+    let HealRunContext {
+        cfg,
+        aws_cfg,
+        sender_factory,
+        buffer_caps,
+        prune_state,
+        stable_alias,
+    } = ctx;
 
     // Create group scheduler for heal
     let resources = Resources {
@@ -385,9 +408,9 @@ pub async fn run_heal_days(
     let worker_pool = WorkerPool::new(group_scheduler.scheduler().clone(), HEAL_CONCURRENCY);
 
     // Create shared context
-    let cfg_arc = Arc::new(cfg.clone());
-    let aws_cfg_arc = Arc::new(aws_cfg.clone());
-    let sender_factory_arc = Arc::new(sender_factory.clone());
+    let cfg_arc = Arc::new(cfg);
+    let aws_cfg_arc = Arc::new(aws_cfg);
+    let sender_factory_arc = Arc::new(sender_factory);
 
     // Create priority-aware pause check function based on ES + CW stress
     // Heal work is IDLE priority so it pauses most aggressively
@@ -419,10 +442,14 @@ pub async fn run_heal_days(
             let cfg = cfg_arc.clone();
             let aws_cfg = aws_cfg_arc.clone();
             let sender_factory = sender_factory_arc.clone();
+            let prune_state = prune_state.clone();
+            let stable_alias = stable_alias.clone();
             move |_pid, info| {
                 let cfg = cfg.clone();
                 let aws_cfg = aws_cfg.clone();
                 let sender_factory = sender_factory.clone();
+                let prune_state = prune_state.clone();
+                let stable_alias = stable_alias.clone();
                 async move {
                     execute_heal_day(
                         &cfg,
@@ -430,6 +457,8 @@ pub async fn run_heal_days(
                         &sender_factory,
                         buffer_caps,
                         info.day_offset,
+                        prune_state,
+                        stable_alias,
                     )
                     .await
                 }
@@ -447,7 +476,7 @@ pub async fn run_heal_days(
     tracing::info!(
         "heal complete: {} processes terminated for {}",
         counts.terminated,
-        cfg.log_group
+        cfg_arc.log_group
     );
 }
 
@@ -458,6 +487,8 @@ async fn execute_heal_day(
     sender_factory: &EventSenderFactory,
     buffer_caps: BufferCapacities,
     day_offset: u32,
+    prune_state: Arc<PruneState>,
+    stable_alias: Arc<str>,
 ) -> usize {
     let tailer = match create_tailer_for_reconcile(cfg, cfg.checkpoint_path.clone(), aws_cfg).await
     {
@@ -468,16 +499,19 @@ async fn execute_heal_day(
         }
     };
 
-    let day = chrono::Utc::now().date_naive() - chrono::Duration::days(day_offset as i64);
-    let start = day
-        .and_hms_opt(0, 0, 0)
-        .unwrap_or_else(|| (chrono::Utc::now() - chrono::Duration::days(365)).naive_utc());
-    let end = day
-        .and_hms_opt(23, 59, 59)
-        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+    let (start_ms, end_ms) = time_windows::utc_day_range_ms(day_offset);
 
-    let start_ms = start.and_utc().timestamp_millis();
-    let end_ms = end.and_utc().timestamp_millis();
+    let Some((start_ms, end_ms)) = prune_state
+        .apply_window(&stable_alias, start_ms, end_ms)
+        .await
+    else {
+        tracing::info!(
+            "heal day offset {} skipped (pruned) for {}",
+            day_offset,
+            stable_alias
+        );
+        return 0;
+    };
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.heal_raw);
     let sink_tx = sender_factory.at(Priority::IDLE);

@@ -2,16 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::Method;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+use crate::es_http::EsHttp;
+use crate::es_query;
+
 #[derive(Clone)]
 pub struct EsWindowClient {
-    client: Client,
-    base_url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
+    http: EsHttp,
 }
 
 impl EsWindowClient {
@@ -21,34 +21,20 @@ impl EsWindowClient {
         pass: impl Into<Arc<str>>,
         timeout: Duration,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
+            http: EsHttp::new(base_url, user, pass, timeout, true)?,
         })
     }
 
+    pub fn from_http(http: EsHttp) -> Self {
+        Self { http }
+    }
+
     pub async fn data_stream_backing_indices(&self, stream: &str) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/_data_stream/{}",
-            self.base_url.trim_end_matches('/'),
-            stream
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&*self.user, Some(&*self.pass))
-            .send()
-            .await
-            .context("get data stream")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("data stream lookup failed status={}", resp.status());
-        }
-
-        let parsed: DataStreamGetResp = resp.json().await.unwrap_or_default();
+        let parsed: DataStreamGetResp = self
+            .http
+            .get_json(&format!("_data_stream/{}", stream), "get data stream")
+            .await?;
         let indices = parsed
             .data_streams
             .into_iter()
@@ -58,19 +44,11 @@ impl EsWindowClient {
     }
 
     pub async fn index_time_bounds_ms(&self, index: &str) -> Result<Option<TimeBoundsMs>> {
-        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
-        let body = serde_json::json!({
-            "size": 0,
-            "aggs": {
-                "min_ts": { "min": { "field": "@timestamp" } },
-                "max_ts": { "max": { "field": "@timestamp" } }
-            }
-        });
+        let body = es_query::min_max_ts_aggs_body();
 
         let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&*self.user, Some(&*self.pass))
+            .http
+            .request(Method::POST, &format!("{}/_search", index))
             .json(&body)
             .send()
             .await
@@ -102,40 +80,16 @@ impl EsWindowClient {
         &self,
         stream: &str,
     ) -> Result<BTreeMap<String, i64>> {
-        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), stream);
-        let body = serde_json::json!({
-            "size": 0,
-            "aggs": {
-                "by_index": {
-                    "terms": {
-                        "field": "_index",
-                        "size": 10000
-                    },
-                    "aggs": {
-                        "max_ts": { "max": { "field": "@timestamp" } }
-                    }
-                }
-            }
-        });
+        let body = es_query::max_ts_by_index_aggs_body();
 
-        let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&*self.user, Some(&*self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("stream max_ts by backing index search")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!(
-                "stream max_ts by backing index failed stream={} status={}",
-                stream,
-                resp.status()
-            );
-        }
-
-        let parsed: StreamIndexMaxTsResp = resp.json().await.unwrap_or_default();
+        let parsed: StreamIndexMaxTsResp = self
+            .http
+            .post_json(
+                &format!("{}/_search", stream),
+                &body,
+                "stream max_ts by backing index search",
+            )
+            .await?;
         Ok(parsed
             .aggregations
             .by_index

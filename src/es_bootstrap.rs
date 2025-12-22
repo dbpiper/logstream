@@ -2,20 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use reqwest::Client;
+use reqwest::Method;
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::enrich::sanitize_log_group_name;
-
-#[derive(Clone)]
-struct EsConn {
-    url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
-}
+use crate::es_http::EsHttp;
 
 #[derive(Clone)]
 struct EsBootstrapConfig {
@@ -58,11 +52,6 @@ pub fn start_es_bootstrap(
         notify: notify.clone(),
     };
 
-    let conn = EsConn {
-        url: es_url,
-        user: es_user,
-        pass: es_pass,
-    };
     let bs_cfg = EsBootstrapConfig {
         log_groups: cfg.log_groups.clone(),
         index_prefix: cfg.index_prefix.clone(),
@@ -73,11 +62,7 @@ pub fn start_es_bootstrap(
         delete_min_age: cfg.ilm_delete_min_age.clone(),
     };
 
-    let client = Client::builder()
-        .timeout(cfg.http_timeout())
-        .gzip(true)
-        .build()
-        .ok()?;
+    let http = EsHttp::new(es_url, es_user, es_pass, cfg.http_timeout(), true).ok()?;
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(900));
@@ -87,7 +72,7 @@ pub fn start_es_bootstrap(
                 _ = notify.notified() => {}
             }
 
-            let res = bootstrap_once(&client, &conn, &bs_cfg).await;
+            let res = bootstrap_once(&http, &bs_cfg).await;
 
             if let Err(err) = res {
                 warn!("es bootstrap failed: {err:?}");
@@ -104,11 +89,6 @@ pub async fn bootstrap_now(
     es_user: Arc<str>,
     es_pass: Arc<str>,
 ) -> Result<()> {
-    let conn = EsConn {
-        url: es_url,
-        user: es_user,
-        pass: es_pass,
-    };
     let bs_cfg = EsBootstrapConfig {
         log_groups: cfg.log_groups.clone(),
         index_prefix: cfg.index_prefix.clone(),
@@ -118,11 +98,8 @@ pub async fn bootstrap_now(
         enable_delete_phase: cfg.ilm_enable_delete_phase,
         delete_min_age: cfg.ilm_delete_min_age.clone(),
     };
-    let client = Client::builder()
-        .timeout(cfg.http_timeout())
-        .gzip(true)
-        .build()?;
-    bootstrap_once(&client, &conn, &bs_cfg).await
+    let http = EsHttp::new(es_url, es_user, es_pass, cfg.http_timeout(), true)?;
+    bootstrap_once(&http, &bs_cfg).await
 }
 
 #[derive(Deserialize)]
@@ -130,16 +107,15 @@ struct ClusterHealth {
     number_of_data_nodes: u64,
 }
 
-async fn bootstrap_once(client: &Client, conn: &EsConn, cfg: &EsBootstrapConfig) -> Result<()> {
-    let data_nodes = fetch_data_nodes(client, conn).await?;
+async fn bootstrap_once(http: &EsHttp, cfg: &EsBootstrapConfig) -> Result<()> {
+    let data_nodes = fetch_data_nodes(http).await?;
     let replicas = compute_replicas(cfg.target_replicas, data_nodes);
 
     let ilm_policy_name = ilm_policy_name(&cfg.index_prefix);
     let template_name = index_template_name(&cfg.index_prefix);
 
     ensure_ilm_policy(
-        client,
-        conn,
+        http,
         &ilm_policy_name,
         &cfg.rollover_max_age,
         &cfg.rollover_max_primary_shard_size,
@@ -149,8 +125,7 @@ async fn bootstrap_once(client: &Client, conn: &EsConn, cfg: &EsBootstrapConfig)
     .await?;
 
     ensure_index_template(
-        client,
-        conn,
+        http,
         &template_name,
         &cfg.index_prefix,
         &ilm_policy_name,
@@ -162,9 +137,9 @@ async fn bootstrap_once(client: &Client, conn: &EsConn, cfg: &EsBootstrapConfig)
         let stable = stable_alias_name(&cfg.index_prefix, group);
         let v1 = versioned_stream_name(&stable, "v1");
         let v2 = versioned_stream_name(&stable, "v2");
-        ensure_data_stream(client, conn, &v1).await?;
-        ensure_data_stream(client, conn, &v2).await?;
-        ensure_alias_exists(client, conn, &stable, &v1).await?;
+        ensure_data_stream(http, &v1).await?;
+        ensure_data_stream(http, &v2).await?;
+        ensure_alias_exists(http, &stable, &v1).await?;
     }
 
     info!(
@@ -175,19 +150,10 @@ async fn bootstrap_once(client: &Client, conn: &EsConn, cfg: &EsBootstrapConfig)
     Ok(())
 }
 
-async fn fetch_data_nodes(client: &Client, conn: &EsConn) -> Result<u64> {
-    let url = format!("{}/_cluster/health", conn.url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
-        .send()
+async fn fetch_data_nodes(http: &EsHttp) -> Result<u64> {
+    let health: ClusterHealth = http
+        .get_json("_cluster/health", "es bootstrap health")
         .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("es bootstrap health check failed: {}", resp.status());
-    }
-
-    let health: ClusterHealth = resp.json().await?;
     Ok(health.number_of_data_nodes)
 }
 
@@ -205,41 +171,26 @@ pub fn compute_replicas(target_replicas: usize, data_nodes: u64) -> usize {
 }
 
 async fn ensure_ilm_policy(
-    client: &Client,
-    conn: &EsConn,
+    http: &EsHttp,
     policy_name: &str,
     rollover_max_age: &str,
     rollover_max_primary_shard_size: &str,
     enable_delete_phase: bool,
     delete_min_age: &str,
 ) -> Result<()> {
-    let url = format!(
-        "{}/_ilm/policy/{}",
-        conn.url.trim_end_matches('/'),
-        policy_name
-    );
     let body = build_ilm_policy_body(
         rollover_max_age,
         rollover_max_primary_shard_size,
         enable_delete_phase,
         delete_min_age,
     );
-    let resp = client
-        .put(&url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
-        .json(&body)
-        .send()
+    let _: serde_json::Value = http
+        .put_value(
+            &format!("_ilm/policy/{}", policy_name),
+            &body,
+            "es bootstrap ilm policy",
+        )
         .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "es bootstrap ilm policy failed status={} body_sample={}",
-            status,
-            &text[..text.len().min(500)]
-        );
-    }
 
     Ok(())
 }
@@ -278,35 +229,20 @@ pub fn build_ilm_policy_body(
 }
 
 async fn ensure_index_template(
-    client: &Client,
-    conn: &EsConn,
+    http: &EsHttp,
     template_name: &str,
     index_prefix: &str,
     ilm_policy_name: &str,
     replicas: usize,
 ) -> Result<()> {
-    let url = format!(
-        "{}/_index_template/{}",
-        conn.url.trim_end_matches('/'),
-        template_name
-    );
     let body = build_index_template_body(index_prefix, ilm_policy_name, replicas);
-    let resp = client
-        .put(&url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
-        .json(&body)
-        .send()
+    let _: serde_json::Value = http
+        .put_value(
+            &format!("_index_template/{}", template_name),
+            &body,
+            "es bootstrap index template",
+        )
         .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "es bootstrap index template failed status={} body_sample={}",
-            status,
-            &text[..text.len().min(500)]
-        );
-    }
 
     Ok(())
 }
@@ -345,11 +281,9 @@ fn versioned_stream_name(stable_alias: &str, version: &str) -> String {
     format!("{stable_alias}-{version}")
 }
 
-async fn ensure_data_stream(client: &Client, conn: &EsConn, name: &str) -> Result<()> {
-    let url = format!("{}/_data_stream/{}", conn.url.trim_end_matches('/'), name);
-    let resp = client
-        .put(&url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
+async fn ensure_data_stream(http: &EsHttp, name: &str) -> Result<()> {
+    let resp = http
+        .request(Method::PUT, &format!("_data_stream/{}", name))
         .send()
         .await?;
 
@@ -380,17 +314,9 @@ async fn ensure_data_stream(client: &Client, conn: &EsConn, name: &str) -> Resul
     );
 }
 
-async fn reset_alias_to_target(
-    client: &Client,
-    conn: &EsConn,
-    alias: &str,
-    target: &str,
-) -> Result<()> {
-    let base = conn.url.trim_end_matches('/');
-    let get_url = format!("{}/_alias/{}", base, alias);
-    let resp = client
-        .get(&get_url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
+async fn reset_alias_to_target(http: &EsHttp, alias: &str, target: &str) -> Result<()> {
+    let resp = http
+        .request(Method::GET, &format!("_alias/{}", alias))
         .send()
         .await?;
 
@@ -411,38 +337,16 @@ async fn reset_alias_to_target(
         "add": { "index": target, "alias": alias, "is_write_index": true }
     }));
 
-    let update_url = format!("{}/_aliases", base);
     let payload = serde_json::json!({ "actions": actions });
-    let update_resp = client
-        .post(&update_url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
-        .json(&payload)
-        .send()
+    let _: serde_json::Value = http
+        .post_value("_aliases", &payload, "es bootstrap alias update")
         .await?;
-
-    if !update_resp.status().is_success() {
-        let status = update_resp.status();
-        let text = update_resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "es bootstrap alias update failed status={} body_sample={}",
-            status,
-            &text[..text.len().min(500)]
-        );
-    }
     Ok(())
 }
 
-async fn ensure_alias_exists(
-    client: &Client,
-    conn: &EsConn,
-    alias: &str,
-    default_target: &str,
-) -> Result<()> {
-    let base = conn.url.trim_end_matches('/');
-    let get_url = format!("{}/_alias/{}", base, alias);
-    let resp = client
-        .get(&get_url)
-        .basic_auth(&*conn.user, Some(&*conn.pass))
+async fn ensure_alias_exists(http: &EsHttp, alias: &str, default_target: &str) -> Result<()> {
+    let resp = http
+        .request(Method::GET, &format!("_alias/{}", alias))
         .send()
         .await?;
 
@@ -457,5 +361,5 @@ async fn ensure_alias_exists(
         }
     }
 
-    reset_alias_to_target(client, conn, alias, default_target).await
+    reset_alias_to_target(http, alias, default_target).await
 }

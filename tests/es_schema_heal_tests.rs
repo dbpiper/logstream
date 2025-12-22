@@ -42,7 +42,7 @@ fn test_healer_with_trailing_slash() {
     )
     .unwrap();
 
-    assert!(healer.base_url().ends_with('/'));
+    assert_eq!(healer.base_url(), "http://localhost:9200");
 }
 
 mod field_type_analysis {
@@ -255,42 +255,33 @@ mod cross_index_conflicts {
         let mut type_map = HashMap::new();
         type_map.insert(
             "long".to_string(),
-            vec![
-                "idx1".to_string(),
-                "idx2".to_string(),
-                "idx3".to_string(),
-                "idx4".to_string(),
-                "idx5".to_string(),
-            ],
+            vec!["idx1", "idx2", "idx3", "idx4", "idx5"],
         );
-        type_map.insert("keyword".to_string(), vec!["idx6".to_string()]);
+        type_map.insert("keyword".to_string(), vec!["idx6"]);
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 1);
-        assert!(minority.contains(&"idx6".to_string()));
+        assert!(minority.contains(&"idx6"));
     }
 
     #[test]
     fn test_find_minority_multiple_minorities() {
         let mut type_map = HashMap::new();
-        type_map.insert(
-            "long".to_string(),
-            vec!["idx1".to_string(), "idx2".to_string(), "idx3".to_string()],
-        );
-        type_map.insert("keyword".to_string(), vec!["idx4".to_string()]);
-        type_map.insert("text".to_string(), vec!["idx5".to_string()]);
+        type_map.insert("long".to_string(), vec!["idx1", "idx2", "idx3"]);
+        type_map.insert("keyword".to_string(), vec!["idx4"]);
+        type_map.insert("text".to_string(), vec!["idx5"]);
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 2);
-        assert!(minority.contains(&"idx4".to_string()));
-        assert!(minority.contains(&"idx5".to_string()));
+        assert!(minority.contains(&"idx4"));
+        assert!(minority.contains(&"idx5"));
     }
 
     #[test]
     fn test_find_minority_tie_keeps_all() {
         let mut type_map = HashMap::new();
-        type_map.insert("long".to_string(), vec!["idx1".to_string()]);
-        type_map.insert("keyword".to_string(), vec!["idx2".to_string()]);
+        type_map.insert("long".to_string(), vec!["idx1"]);
+        type_map.insert("keyword".to_string(), vec!["idx2"]);
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 0);
@@ -299,10 +290,7 @@ mod cross_index_conflicts {
     #[test]
     fn test_find_minority_single_type() {
         let mut type_map = HashMap::new();
-        type_map.insert(
-            "long".to_string(),
-            vec!["idx1".to_string(), "idx2".to_string()],
-        );
+        type_map.insert("long".to_string(), vec!["idx1", "idx2"]);
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 0);
@@ -310,7 +298,7 @@ mod cross_index_conflicts {
 
     #[test]
     fn test_find_minority_empty() {
-        let type_map: HashMap<String, Vec<String>> = HashMap::new();
+        let type_map: HashMap<String, Vec<&str>> = HashMap::new();
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 0);
     }
@@ -321,49 +309,35 @@ mod cross_index_conflicts {
         type_map.insert(
             "long".to_string(),
             vec![
-                "cloudwatch-2025.12.10".to_string(),
-                "cloudwatch-2025.12.11".to_string(),
-                "cloudwatch-2025.12.12".to_string(),
-                "cloudwatch-2025.12.13".to_string(),
-                "cloudwatch-2025.12.14".to_string(),
+                "cloudwatch-2025.12.10",
+                "cloudwatch-2025.12.11",
+                "cloudwatch-2025.12.12",
+                "cloudwatch-2025.12.13",
+                "cloudwatch-2025.12.14",
             ],
         );
         type_map.insert(
             "keyword".to_string(),
-            vec![
-                "cloudwatch-2025.12.08".to_string(),
-                "cloudwatch-2025.12.09".to_string(),
-            ],
+            vec!["cloudwatch-2025.12.08", "cloudwatch-2025.12.09"],
         );
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 2);
-        assert!(minority.contains(&"cloudwatch-2025.12.08".to_string()));
-        assert!(minority.contains(&"cloudwatch-2025.12.09".to_string()));
+        assert!(minority.contains(&"cloudwatch-2025.12.08"));
+        assert!(minority.contains(&"cloudwatch-2025.12.09"));
     }
 
     #[test]
     fn test_cross_index_three_way_split() {
         let mut type_map = HashMap::new();
-        type_map.insert(
-            "long".to_string(),
-            vec![
-                "idx1".to_string(),
-                "idx2".to_string(),
-                "idx3".to_string(),
-                "idx4".to_string(),
-            ],
-        );
-        type_map.insert(
-            "keyword".to_string(),
-            vec!["idx5".to_string(), "idx6".to_string()],
-        );
-        type_map.insert("text".to_string(), vec!["idx7".to_string()]);
+        type_map.insert("long".to_string(), vec!["idx1", "idx2", "idx3", "idx4"]);
+        type_map.insert("keyword".to_string(), vec!["idx5", "idx6"]);
+        type_map.insert("text".to_string(), vec!["idx7"]);
 
         let minority = find_minority_type_indices(&type_map);
         assert_eq!(minority.len(), 3);
-        assert!(minority.contains(&"idx5".to_string()));
-        assert!(minority.contains(&"idx6".to_string()));
-        assert!(minority.contains(&"idx7".to_string()));
+        assert!(minority.contains(&"idx5"));
+        assert!(minority.contains(&"idx6"));
+        assert!(minority.contains(&"idx7"));
     }
 }

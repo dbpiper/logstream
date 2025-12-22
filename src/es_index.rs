@@ -1,35 +1,16 @@
 //! Elasticsearch index management operations.
 //! Handles index cleanup, settings, and maintenance.
 
+use crate::es_http::EsHttp;
 use anyhow::Result;
-use reqwest::Client;
-use std::time::Duration;
 
 // ============================================================================
 // Index Operations
 // ============================================================================
 
 /// Drop an index if it exists. Returns Ok if index doesn't exist or was deleted.
-pub async fn drop_index_if_exists(
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    index: &str,
-) -> Result<()> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let url = format!("{}/{}", base_url.trim_end_matches('/'), index);
-    let resp = client
-        .delete(&url)
-        .basic_auth(user, Some(pass))
-        .send()
-        .await?;
-
-    if resp.status().as_u16() == 404 {
-        return Ok(());
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("drop index {} status {}", index, resp.status());
-    }
+pub async fn drop_index_if_exists(http: &EsHttp, index: &str) -> Result<()> {
+    http.delete_allow_404(index, "drop index").await?;
     Ok(())
 }
 
@@ -39,27 +20,18 @@ pub fn should_cleanup_index(name: &str, docs: &str, health: &str) -> bool {
 }
 
 /// Delete temp and broken indices with the given prefix.
-pub async fn cleanup_problematic_indices(
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    index_prefix: &str,
-) -> Result<Vec<String>> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-
+pub async fn cleanup_problematic_indices(http: &EsHttp, index_prefix: &str) -> Result<Vec<String>> {
     // Get all indices with the target prefix
-    let url = format!(
-        "{}/_cat/indices/{}-*?format=json",
-        base_url.trim_end_matches('/'),
-        index_prefix
-    );
-    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
-
-    if !resp.status().is_success() {
-        return Ok(Vec::new()); // Skip if we can't list indices
-    }
-
-    let indices: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+    let indices: Vec<serde_json::Value> = match http
+        .get_json(
+            &format!("_cat/indices/{}-*?format=json", index_prefix),
+            "cat indices request",
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
     let mut cleaned = Vec::new();
 
     for idx in indices {
@@ -77,10 +49,7 @@ pub async fn cleanup_problematic_indices(
                 docs,
                 health
             );
-            if drop_index_if_exists(base_url, user, pass, name)
-                .await
-                .is_ok()
-            {
+            if drop_index_if_exists(http, name).await.is_ok() {
                 cleaned.push(name.to_string());
             }
         }
@@ -91,66 +60,47 @@ pub async fn cleanup_problematic_indices(
 
 /// Configure ES indices for bulk ingest with optimized settings.
 pub async fn apply_backfill_settings(
-    base_url: &str,
-    user: &str,
-    pass: &str,
+    http: &EsHttp,
     index_prefix: &str,
     refresh_interval: &str,
     replicas: &str,
 ) -> Result<()> {
-    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let url = format!(
-        "{}/{}-*/_settings",
-        base_url.trim_end_matches('/'),
-        index_prefix
-    );
     let body = serde_json::json!({
         "index": {
             "refresh_interval": refresh_interval,
             "number_of_replicas": replicas
         }
     });
-    let resp = client
-        .put(&url)
-        .basic_auth(user, Some(pass))
-        .json(&body)
-        .send()
+    let _: serde_json::Value = http
+        .put_value(
+            &format!("{}-*/_settings", index_prefix),
+            &body,
+            "apply backfill settings",
+        )
         .await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("apply backfill settings status {}", resp.status());
-    }
     Ok(())
 }
 
 pub async fn ensure_index_refresh_interval(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
+    http: &EsHttp,
     index: &str,
     refresh_interval: &str,
 ) -> Result<bool> {
-    let current = get_index_refresh_interval(client, base_url, user, pass, index).await?;
+    let current = get_index_refresh_interval(http, index).await?;
     if current.as_deref() == Some(refresh_interval) {
         return Ok(false);
     }
-    set_index_refresh_interval(client, base_url, user, pass, index, refresh_interval).await
+    set_index_refresh_interval(http, index, refresh_interval).await
 }
 
-async fn get_index_refresh_interval(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    index: &str,
-) -> Result<Option<String>> {
-    let url = format!(
-        "{}/{}/_settings?filter_path=**.refresh_interval",
-        base_url.trim_end_matches('/'),
-        index
-    );
-    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
+async fn get_index_refresh_interval(http: &EsHttp, index: &str) -> Result<Option<String>> {
+    let resp = http
+        .request(
+            reqwest::Method::GET,
+            &format!("{}/_settings?filter_path=**.refresh_interval", index),
+        )
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Ok(None);
     }
@@ -165,60 +115,40 @@ async fn get_index_refresh_interval(
 }
 
 async fn set_index_refresh_interval(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
+    http: &EsHttp,
     index: &str,
     refresh_interval: &str,
 ) -> Result<bool> {
-    let url = format!("{}/{}/_settings", base_url.trim_end_matches('/'), index);
     let body = serde_json::json!({
         "index": {
             "refresh_interval": refresh_interval
         }
     });
-    let resp = client
-        .put(&url)
-        .basic_auth(user, Some(pass))
-        .json(&body)
-        .send()
+    let resp = http
+        .send_expect(
+            http.request(reqwest::Method::PUT, &format!("{}/_settings", index))
+                .json(&body),
+            "set refresh interval",
+            |s| s.is_success() || s.as_u16() == 404,
+        )
         .await?;
     if resp.status().as_u16() == 404 {
         // Backing indices can roll over or be deleted between discovery and update.
         return Ok(false);
     }
-    if !resp.status().is_success() {
-        anyhow::bail!(
-            "set refresh interval index={} status={}",
-            index,
-            resp.status()
-        );
-    }
     Ok(true)
 }
 
 /// Reset indices to normal settings after backfill.
-pub async fn restore_normal_settings(
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    index_prefix: &str,
-) -> Result<()> {
-    apply_backfill_settings(base_url, user, pass, index_prefix, "1s", "1").await
+pub async fn restore_normal_settings(http: &EsHttp, index_prefix: &str) -> Result<()> {
+    apply_backfill_settings(http, index_prefix, "1s", "1").await
 }
 
 /// Check if ES cluster is healthy.
-pub async fn check_cluster_health(base_url: &str, user: &str, pass: &str) -> Result<String> {
-    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let url = format!("{}/_cluster/health", base_url.trim_end_matches('/'));
-    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("cluster health check failed: {}", resp.status());
-    }
-
-    let body: serde_json::Value = resp.json().await?;
+pub async fn check_cluster_health(http: &EsHttp) -> Result<String> {
+    let body: serde_json::Value = http
+        .get_value("_cluster/health", "cluster health check")
+        .await?;
     let status = body
         .get("status")
         .and_then(|v| v.as_str())

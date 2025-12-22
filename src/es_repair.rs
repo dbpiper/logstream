@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use reqwest::Client;
+use anyhow::Result;
+use reqwest::Method;
 use tracing::{info, warn};
 
 use crate::es_counts::EsCounter;
+use crate::es_http::EsHttp;
+use crate::es_query;
 use crate::es_window::EsWindowClient;
 
 fn end_inclusive_for_exclusive_end(start_ms: i64, end_ms: i64) -> Option<i64> {
@@ -14,11 +16,7 @@ fn end_inclusive_for_exclusive_end(start_ms: i64, end_ms: i64) -> Option<i64> {
 
 #[derive(Clone)]
 pub struct EsRepairClient {
-    client: Client,
-    base_url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
-    timeout: Duration,
+    http: EsHttp,
 }
 
 impl EsRepairClient {
@@ -28,26 +26,19 @@ impl EsRepairClient {
         pass: impl Into<Arc<str>>,
         timeout: Duration,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
-        Ok(Self {
-            client,
-            base_url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
-            timeout,
-        })
+        Ok(Self::from_http(EsHttp::new(
+            base_url, user, pass, timeout, true,
+        )?))
+    }
+
+    pub fn from_http(http: EsHttp) -> Self {
+        Self { http }
     }
 
     pub async fn ensure_data_stream(&self, name: &str) -> Result<()> {
-        let url = format!(
-            "{}/_data_stream/{}",
-            self.base_url.trim_end_matches('/'),
-            name
-        );
         let resp = self
-            .client
-            .put(&url)
-            .basic_auth(&*self.user, Some(&*self.pass))
+            .http
+            .request(Method::PUT, &format!("_data_stream/{}", name))
             .send()
             .await?;
 
@@ -73,38 +64,18 @@ impl EsRepairClient {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<()> {
-        let url = format!("{}/_reindex", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "conflicts": "proceed",
             "source": {
                 "index": source,
-                "query": {
-                    "range": {
-                        "@timestamp": { "gte": start_ms, "lt": end_ms, "format": "epoch_millis" }
-                    }
-                }
+                "query": es_query::ts_range_lt_query(start_ms, end_ms)
             },
             "dest": { "index": dest, "op_type": "create" }
         });
-
-        let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&*self.user, Some(&*self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("reindex request")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "reindex failed status={} body_sample={}",
-                status,
-                &text[..text.len().min(500)]
-            );
-        }
+        let _: serde_json::Value = self
+            .http
+            .post_value("_reindex", &body, "reindex request")
+            .await?;
         Ok(())
     }
 
@@ -119,23 +90,12 @@ impl EsRepairClient {
         let Some(end_inclusive_ms) = end_inclusive_for_exclusive_end(start_ms, end_ms) else {
             return Ok(true);
         };
-        let src = EsCounter::new(
-            self.base_url.clone(),
-            self.user.clone(),
-            self.pass.clone(),
-            self.timeout,
-            Arc::<str>::from(source),
-        )?;
-        let dst = EsCounter::new(
-            self.base_url.clone(),
-            self.user.clone(),
-            self.pass.clone(),
-            self.timeout,
-            Arc::<str>::from(dest),
-        )?;
+        let src = EsCounter::from_http(self.http.clone(), Arc::<str>::from(source));
+        let dst = EsCounter::from_http(self.http.clone(), Arc::<str>::from(dest));
 
-        let src_count = src.count_range(start_ms, end_inclusive_ms).await?;
-        let dst_count = dst.count_range(start_ms, end_inclusive_ms).await?;
+        let end_exclusive_ms = end_inclusive_ms.saturating_add(1);
+        let src_count = src.count_range(start_ms, end_exclusive_ms).await?;
+        let dst_count = dst.count_range(start_ms, end_exclusive_ms).await?;
         if src_count != dst_count {
             warn!(
                 "repair verify: count mismatch source={} dest={} src_count={} dst_count={}",
@@ -144,8 +104,8 @@ impl EsRepairClient {
             return Ok(false);
         }
 
-        let (src_first, src_last) = src.sample_ids(start_ms, end_inclusive_ms, sample).await?;
-        let (dst_first, dst_last) = dst.sample_ids(start_ms, end_inclusive_ms, sample).await?;
+        let (src_first, src_last) = src.sample_ids(start_ms, end_exclusive_ms, sample).await?;
+        let (dst_first, dst_last) = dst.sample_ids(start_ms, end_exclusive_ms, sample).await?;
         if src_first != dst_first || src_last != dst_last {
             warn!(
                 "repair verify: boundary mismatch source={} dest={}",
@@ -157,12 +117,9 @@ impl EsRepairClient {
     }
 
     pub async fn cutover_alias(&self, alias: &str, new_target: &str) -> Result<()> {
-        let base = self.base_url.trim_end_matches('/');
-        let get_url = format!("{}/_alias/{}", base, alias);
         let resp = self
-            .client
-            .get(&get_url)
-            .basic_auth(&*self.user, Some(&*self.pass))
+            .http
+            .request(Method::GET, &format!("_alias/{}", alias))
             .send()
             .await?;
 
@@ -181,35 +138,18 @@ impl EsRepairClient {
             "add": { "index": new_target, "alias": alias, "is_write_index": true }
         }));
 
-        let update_url = format!("{}/_aliases", base);
         let payload = serde_json::json!({ "actions": actions });
-        let update_resp = self
-            .client
-            .post(&update_url)
-            .basic_auth(&*self.user, Some(&*self.pass))
-            .json(&payload)
-            .send()
+        let _: serde_json::Value = self
+            .http
+            .post_value("_aliases", &payload, "alias cutover")
             .await?;
-
-        if !update_resp.status().is_success() {
-            let status = update_resp.status();
-            let text = update_resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "alias cutover failed status={} body_sample={}",
-                status,
-                &text[..text.len().min(500)]
-            );
-        }
         Ok(())
     }
 
     pub async fn resolve_alias_single_target(&self, alias: &str) -> Result<Option<String>> {
-        let base = self.base_url.trim_end_matches('/');
-        let get_url = format!("{}/_alias/{}", base, alias);
         let resp = self
-            .client
-            .get(&get_url)
-            .basic_auth(&*self.user, Some(&*self.pass))
+            .http
+            .request(Method::GET, &format!("_alias/{}", alias))
             .send()
             .await?;
 
@@ -237,23 +177,12 @@ impl EsRepairClient {
         let Some(end_inclusive_ms) = end_inclusive_for_exclusive_end(start_ms, end_ms) else {
             return Ok(());
         };
-        let window = EsWindowClient::new(
-            self.base_url.clone(),
-            self.user.clone(),
-            self.pass.clone(),
-            self.timeout,
-        )?;
+        let window = EsWindowClient::from_http(self.http.clone());
         let indices = window
             .indices_fully_within_window(source_stream, start_ms, end_inclusive_ms)
             .await?;
         for idx in indices {
-            let url = format!("{}/{}", self.base_url.trim_end_matches('/'), idx);
-            let resp = self
-                .client
-                .delete(&url)
-                .basic_auth(&*self.user, Some(&*self.pass))
-                .send()
-                .await?;
+            let resp = self.http.request(Method::DELETE, &idx).send().await?;
             if !resp.status().is_success() && resp.status().as_u16() != 404 {
                 warn!("cleanup: failed to delete {} status={}", idx, resp.status());
             }

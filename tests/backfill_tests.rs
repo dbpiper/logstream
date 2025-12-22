@@ -114,8 +114,8 @@ fn test_day_range_yesterday_before_today() {
     let (yesterday_start, yesterday_end) = day_range_ms(1);
 
     assert!(
-        yesterday_end < today_start,
-        "Yesterday should end before today starts"
+        yesterday_end <= today_start,
+        "Yesterday should end at/before today starts"
     );
     assert!(
         yesterday_start < yesterday_end,

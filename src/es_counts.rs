@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::es_http::EsHttp;
+use crate::es_query;
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -27,10 +28,7 @@ struct Hit {
 
 #[derive(Clone)]
 pub struct EsCounter {
-    client: Client,
-    base_url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
+    http: EsHttp,
     target: Arc<str>,
 }
 
@@ -42,42 +40,36 @@ impl EsCounter {
         timeout: Duration,
         target: impl Into<Arc<str>>,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
+            http: EsHttp::new(base_url, user, pass, timeout, true)?,
             target: target.into(),
         })
     }
 
-    pub async fn count_range(&self, start_ms: i64, end_ms: i64) -> Result<u64> {
-        let url = format!("{}/{}/_count", self.base_url, self.target);
-        let body = serde_json::json!({
-            "query": {
-                "range": {
-                    "@timestamp": {
-                        "gte": start_ms,
-                        "lte": end_ms,
-                        "format": "epoch_millis"
-                    }
-                }
-            }
-        });
-        let resp = self
-            .client
-            .post(url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("es count request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("es count status {}", status);
+    pub fn from_http(http: EsHttp, target: impl Into<Arc<str>>) -> Self {
+        Self {
+            http,
+            target: target.into(),
         }
-        let parsed: CountResp = resp.json().await.context("es count parse")?;
+    }
+
+    pub async fn count_range(&self, start_ms: i64, end_ms: i64) -> Result<u64> {
+        if end_ms <= start_ms {
+            return Ok(0);
+        }
+        let end_inclusive_ms = end_ms.saturating_sub(1);
+        let body = serde_json::json!({
+            "query": es_query::ts_range_query(start_ms, end_inclusive_ms)
+        });
+        let parsed: CountResp = self
+            .http
+            .post_json(
+                &format!("{}/_count", self.target),
+                &body,
+                "es count request",
+            )
+            .await
+            .context("es count parse")?;
         Ok(parsed.count)
     }
 
@@ -90,39 +82,30 @@ impl EsCounter {
         if ids.is_empty() {
             return Ok(0);
         }
-        let url = format!("{}/{}/_search", self.base_url, self.target);
+        if end_ms <= start_ms {
+            return Ok(0);
+        }
+        let end_inclusive_ms = end_ms.saturating_sub(1);
         let body = serde_json::json!({
             "size": 0,
             "query": {
                 "bool": {
                     "must": [
-                        { "terms": { "event.id": ids } },
-                        {
-                            "range": {
-                                "@timestamp": {
-                                    "gte": start_ms,
-                                    "lte": end_ms,
-                                    "format": "epoch_millis"
-                                }
-                            }
-                        }
+                        { "terms": { "_id": ids } },
+                        es_query::ts_range_query(start_ms, end_inclusive_ms)
                     ]
                 }
             }
         });
-        let resp = self
-            .client
-            .post(url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
+        let v: serde_json::Value = self
+            .http
+            .post_value(
+                &format!("{}/_search", self.target),
+                &body,
+                "es terms search request",
+            )
             .await
-            .context("es terms search request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("es terms search status {}", status);
-        }
-        let v: serde_json::Value = resp.json().await.context("es terms parse")?;
+            .context("es terms parse")?;
         let count = v
             .get("hits")
             .and_then(|h| h.get("total"))
@@ -133,33 +116,21 @@ impl EsCounter {
     }
 
     pub async fn delete_range(&self, start_ms: i64, end_ms: i64) -> Result<()> {
-        let url = format!(
-            "{}/{}/_delete_by_query?conflicts=proceed",
-            self.base_url, self.target
-        );
-        let body = serde_json::json!({
-            "query": {
-                "range": {
-                    "@timestamp": {
-                        "gte": start_ms,
-                        "lte": end_ms,
-                        "format": "epoch_millis"
-                    }
-                }
-            }
-        });
-        let resp = self
-            .client
-            .post(url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("es delete_by_query request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("es delete_by_query status {}", status);
+        if end_ms <= start_ms {
+            return Ok(());
         }
+        let end_inclusive_ms = end_ms.saturating_sub(1);
+        let body = serde_json::json!({
+            "query": es_query::ts_range_query(start_ms, end_inclusive_ms)
+        });
+        let _: serde_json::Value = self
+            .http
+            .post_value(
+                &format!("{}/_delete_by_query?conflicts=proceed", self.target),
+                &body,
+                "es delete_by_query request",
+            )
+            .await?;
         Ok(())
     }
 
@@ -187,7 +158,10 @@ impl EsCounter {
         limit: usize,
         asc: bool,
     ) -> Result<Vec<String>> {
-        let url = format!("{}/{}/_search", self.base_url, self.target);
+        if end_ms <= start_ms {
+            return Ok(Vec::new());
+        }
+        let end_inclusive_ms = end_ms.saturating_sub(1);
         let sort_dir = if asc { "asc" } else { "desc" };
         let body = serde_json::json!({
             "size": limit,
@@ -196,40 +170,31 @@ impl EsCounter {
                 { "_id": { "order": sort_dir } }
             ],
             "_source": false,
-            "query": {
-                "range": {
-                    "@timestamp": {
-                        "gte": start_ms,
-                        "lte": end_ms,
-                        "format": "epoch_millis"
-                    }
-                }
-            }
+            "query": es_query::ts_range_query(start_ms, end_inclusive_ms)
         });
-        let resp = self
-            .client
-            .post(url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
+        let parsed: SearchResp = self
+            .http
+            .post_json(
+                &format!("{}/_search", self.target),
+                &body,
+                "es search request",
+            )
             .await
-            .context("es search request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("es search status {}", status);
-        }
-        let parsed: SearchResp = resp.json().await.context("es search parse")?;
+            .context("es search parse")?;
         Ok(parsed.hits.hits.into_iter().map(|h| h._id).collect())
     }
 
     /// Get all event IDs in a time range (for orphan detection).
     pub async fn get_ids_in_range(&self, start_ms: i64, end_ms: i64) -> Result<Vec<String>> {
+        if end_ms <= start_ms {
+            return Ok(Vec::new());
+        }
+        let end_inclusive_ms = end_ms.saturating_sub(1);
         let mut all_ids = Vec::new();
         let mut search_after: Option<(i64, String)> = None;
         const BATCH_SIZE: usize = 5000;
 
         loop {
-            let url = format!("{}/{}/_search", self.base_url, self.target);
             let mut body = serde_json::json!({
                 "size": BATCH_SIZE,
                 "sort": [
@@ -237,36 +202,22 @@ impl EsCounter {
                     { "_id": { "order": "asc" } }
                 ],
                 "_source": false,
-                "query": {
-                    "range": {
-                        "@timestamp": {
-                            "gte": start_ms,
-                            "lte": end_ms,
-                            "format": "epoch_millis"
-                        }
-                    }
-                }
+                "query": es_query::ts_range_query(start_ms, end_inclusive_ms)
             });
 
             if let Some((ts, id)) = &search_after {
                 body["search_after"] = serde_json::json!([ts, id]);
             }
 
-            let resp = self
-                .client
-                .post(&url)
-                .basic_auth(&self.user, Some(&self.pass))
-                .json(&body)
-                .send()
+            let parsed: serde_json::Value = self
+                .http
+                .post_value(
+                    &format!("{}/_search", self.target),
+                    &body,
+                    "es get_ids_in_range request",
+                )
                 .await
-                .context("es get_ids_in_range request")?;
-
-            if !resp.status().is_success() {
-                anyhow::bail!("es get_ids_in_range status {}", resp.status());
-            }
-
-            let parsed: serde_json::Value =
-                resp.json().await.context("es get_ids_in_range parse")?;
+                .context("es get_ids_in_range parse")?;
             let hits = parsed["hits"]["hits"].as_array();
 
             let Some(hits) = hits else {
@@ -309,30 +260,21 @@ impl EsCounter {
             return Ok(());
         }
 
-        let url = format!(
-            "{}/{}/_delete_by_query?conflicts=proceed",
-            self.base_url, self.target
-        );
         let body = serde_json::json!({
             "query": {
                 "terms": {
-                    "event.id": ids
+                    "_id": ids
                 }
             }
         });
-
-        let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .json(&body)
-            .send()
-            .await
-            .context("es delete_ids request")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("es delete_ids status {}", resp.status());
-        }
+        let _: serde_json::Value = self
+            .http
+            .post_value(
+                &format!("{}/_delete_by_query?conflicts=proceed", self.target),
+                &body,
+                "es delete_ids request",
+            )
+            .await?;
 
         Ok(())
     }

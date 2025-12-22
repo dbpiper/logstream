@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use crate::time_windows::utc_day_range_ms as day_range_ms;
 use anyhow::Result;
-use chrono::{Duration as ChronoDuration, NaiveTime, Utc};
 use tokio::sync::mpsc;
 
 use crate::buffer::BufferCapacities;
@@ -10,27 +10,23 @@ use crate::config::Config;
 use crate::cw_tail::{CloudWatchTailer, TailConfig};
 use crate::enrich::enrich_event;
 use crate::event_router::EventSenderFactory;
+use crate::naming;
 use crate::process::{GroupScheduler, Priority, Resources, WorkerPool};
+use crate::prune_state::PruneState;
 use crate::state::CheckpointState;
 use crate::stress::StressTracker;
 use crate::types::LogEvent;
 
 pub const BACKFILL_CONCURRENCY: usize = 2;
 
-pub fn day_range_ms(day_offset: u32) -> (i64, i64) {
-    let day = Utc::now().date_naive() - ChronoDuration::days(day_offset as i64);
-
-    let start = day
-        .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
-        .and_utc()
-        .timestamp_millis();
-
-    let end = day
-        .and_time(NaiveTime::from_hms_opt(23, 59, 59).unwrap_or_default())
-        .and_utc()
-        .timestamp_millis();
-
-    (start, end)
+#[derive(Clone)]
+pub struct BackfillDayContext {
+    pub cfg: Arc<Config>,
+    pub aws_cfg: Arc<aws_config::SdkConfig>,
+    pub sender_factory: Arc<EventSenderFactory>,
+    pub buffer_caps: BufferCapacities,
+    pub prune_state: Arc<PruneState>,
+    pub stable_alias: Arc<str>,
 }
 
 pub fn calculate_eps(event_count: usize, elapsed_ms: u128) -> u128 {
@@ -78,7 +74,9 @@ pub async fn run_backfill_days(
     buffer_caps: BufferCapacities,
     es_stress_tracker: Option<Arc<StressTracker>>,
     cw_stress_tracker: Option<Arc<StressTracker>>,
+    prune_state: Arc<PruneState>,
 ) -> Result<BackfillStats> {
+    let cfg = Arc::new(cfg);
     if cfg.backfill_days == 0 {
         return Ok(BackfillStats::default());
     }
@@ -115,9 +113,9 @@ pub async fn run_backfill_days(
         WorkerPool::optimal_worker_count()
     );
 
-    let cfg_arc = Arc::new(cfg.clone());
-    let aws_cfg_arc = Arc::new(aws_cfg.clone());
-    let sender_factory_arc = Arc::new(sender_factory.clone());
+    let cfg_arc = cfg;
+    let aws_cfg_arc = Arc::new(aws_cfg);
+    let sender_factory_arc = Arc::new(sender_factory);
 
     let pause_check = {
         let es_tracker = es_stress_tracker.clone();
@@ -143,16 +141,24 @@ pub async fn run_backfill_days(
             let cfg = cfg_arc.clone();
             let aws_cfg = aws_cfg_arc.clone();
             let sender_factory = sender_factory_arc.clone();
+            let prune_state = prune_state.clone();
+            let stable_alias = naming::stable_alias(&cfg.index_prefix, cfg.log_group.as_ref());
             move |_pid, info| {
                 let cfg = cfg.clone();
                 let aws_cfg = aws_cfg.clone();
                 let sender_factory = sender_factory.clone();
+                let prune_state = prune_state.clone();
+                let stable_alias = stable_alias.clone();
                 async move {
                     execute_backfill_day(
-                        &cfg,
-                        &aws_cfg,
-                        &sender_factory,
-                        buffer_caps,
+                        BackfillDayContext {
+                            cfg,
+                            aws_cfg,
+                            sender_factory,
+                            buffer_caps,
+                            prune_state,
+                            stable_alias,
+                        },
                         info.day_offset,
                         info.priority,
                     )
@@ -192,35 +198,46 @@ pub async fn run_backfill_days(
 }
 
 pub async fn execute_backfill_day(
-    cfg: &Config,
-    aws_cfg: &aws_config::SdkConfig,
-    sender_factory: &EventSenderFactory,
-    buffer_caps: BufferCapacities,
+    ctx: BackfillDayContext,
     day_offset: u32,
     priority: Priority,
 ) -> usize {
     let (start_ms, end_ms) = day_range_ms(day_offset);
 
-    let tailer = match create_tailer_for_day(cfg, aws_cfg).await {
+    let Some((start_ms, end_ms)) = ctx
+        .prune_state
+        .apply_window(&ctx.stable_alias, start_ms, end_ms)
+        .await
+    else {
+        tracing::info!(
+            "backfill day offset {} skipped (pruned) for {}",
+            day_offset,
+            ctx.stable_alias
+        );
+        return 0;
+    };
+
+    let tailer = match create_tailer_for_day(&ctx.cfg, &ctx.aws_cfg).await {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(
                 "backfill {} day {} tailer init failed: {err:?}",
-                cfg.log_group,
+                ctx.cfg.log_group,
                 day_offset
             );
             return 0;
         }
     };
 
-    let sink_tx = sender_factory.at(priority);
-    let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(buffer_caps.backfill_raw);
-    let log_group = cfg.log_group.clone();
+    let sink_tx = ctx.sender_factory.at(priority);
+    let (raw_tx, mut raw_rx) = mpsc::channel::<LogEvent>(ctx.buffer_caps.backfill_raw);
+    let log_group = ctx.cfg.log_group.clone();
+    let log_group_for_consumer = log_group.clone();
 
     let consumer_handle = tokio::spawn(async move {
         let mut sent = 0usize;
         while let Some(raw) = raw_rx.recv().await {
-            if let Some(enriched) = enrich_event(raw, log_group.as_ref()) {
+            if let Some(enriched) = enrich_event(raw, log_group_for_consumer.as_ref()) {
                 if sink_tx.send(enriched).await.is_err() {
                     break;
                 }
@@ -229,7 +246,7 @@ pub async fn execute_backfill_day(
         }
         tracing::debug!(
             "backfill {} day {} drained {} events",
-            log_group,
+            log_group_for_consumer,
             day_offset,
             sent
         );
@@ -244,7 +261,7 @@ pub async fn execute_backfill_day(
     if let Err(ref err) = fetch_result {
         tracing::warn!(
             "backfill {} day {} fetch error: {err:?}",
-            cfg.log_group,
+            log_group,
             day_offset
         );
     }

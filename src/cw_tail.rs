@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aws_sdk_cloudwatchlogs::Client as CwClient;
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
@@ -100,16 +101,13 @@ impl CloudWatchTailer {
         loop {
             let resp = send_with_backoff(
                 || {
-                    let mut req = self
-                        .client
-                        .filter_log_events()
-                        .log_group_name(&*self.cfg.log_group)
-                        .start_time(start_time)
-                        .limit(10_000);
-                    if let Some(token) = &next_token {
-                        req = req.next_token(token);
-                    }
-                    req
+                    build_filter_log_events_req(
+                        &self.client,
+                        &self.cfg.log_group,
+                        start_time,
+                        None,
+                        &next_token,
+                    )
                 },
                 &self.stress_tracker,
             )
@@ -154,6 +152,10 @@ impl CloudWatchTailer {
         end_ms: i64,
         tx: &mpsc::Sender<LogEvent>,
     ) -> Result<usize> {
+        if end_ms <= start_ms {
+            return Ok(0);
+        }
+
         let range_ms = end_ms.saturating_sub(start_ms);
         let chunk_ms = (range_ms / 16).max(1);
         let mut chunks = Vec::new();
@@ -179,53 +181,21 @@ impl CloudWatchTailer {
                 let permit_guard = sem.acquire().await.unwrap();
                 let mut next_token: Option<String> = None;
                 let mut sent: usize = 0;
+                let end_inclusive = ce.saturating_sub(1);
                 loop {
-                    let resp = {
-                        let mut attempt = 0u32;
-                        loop {
-                            attempt += 1;
-                            let mut req = client
-                                .filter_log_events()
-                                .log_group_name(&*log_group)
-                                .start_time(cs)
-                                .end_time(ce)
-                                .limit(10_000);
-                            if let Some(t) = &next_token {
-                                req = req.next_token(t);
-                            }
-                            match req.send().await {
-                                Ok(r) => {
-                                    tracker.record_success();
-                                    break Ok(r);
-                                }
-                                Err(err) => {
-                                    let msg = format!("{err:?}");
-                                    let is_throttle = msg.contains("ThrottlingException");
-                                    let is_retryable = is_throttle
-                                        || msg.contains("ServiceUnavailable")
-                                        || msg.contains("dispatch failure")
-                                        || msg.contains("SendRequest");
-
-                                    if is_throttle {
-                                        tracker.record_failure();
-                                    }
-
-                                    if is_retryable && attempt < 20 {
-                                        let backoff = if is_throttle {
-                                            tracker.backoff_duration()
-                                        } else {
-                                            std::time::Duration::from_millis(
-                                                500 * (attempt as u64).min(10),
-                                            )
-                                        };
-                                        tokio::time::sleep(backoff).await;
-                                        continue;
-                                    }
-                                    break Err(anyhow::anyhow!("CW fetch failed: {err:?}"));
-                                }
-                            }
-                        }
-                    };
+                    let resp = send_with_backoff(
+                        || {
+                            build_filter_log_events_req(
+                                &client,
+                                &log_group,
+                                cs,
+                                Some(end_inclusive),
+                                &next_token,
+                            )
+                        },
+                        tracker.as_ref(),
+                    )
+                    .await;
                     match resp {
                         Ok(r) => {
                             if let Some(events) = r.events {
@@ -281,22 +251,22 @@ impl CloudWatchTailer {
         end_ms: i64,
         limit: usize,
     ) -> Result<(Vec<String>, Vec<String>)> {
+        if end_ms <= start_ms {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let end_inclusive = end_ms.saturating_sub(1);
         let mut first = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
             let resp = send_with_backoff(
                 || {
-                    let mut req = self
-                        .client
-                        .filter_log_events()
-                        .log_group_name(&*self.cfg.log_group)
-                        .start_time(start_ms)
-                        .end_time(end_ms)
-                        .limit(10_000);
-                    if let Some(t) = &next_token {
-                        req = req.next_token(t);
-                    }
-                    req
+                    build_filter_log_events_req(
+                        &self.client,
+                        &self.cfg.log_group,
+                        start_ms,
+                        Some(end_inclusive),
+                        &next_token,
+                    )
                 },
                 &self.stress_tracker,
             )
@@ -306,7 +276,7 @@ impl CloudWatchTailer {
                 for e in events {
                     if let (Some(id), Some(_ts)) = (e.event_id, e.timestamp) {
                         if first.len() < limit {
-                            first.push(id.clone());
+                            first.push(id);
                         }
                     }
                     if first.len() >= limit {
@@ -323,22 +293,18 @@ impl CloudWatchTailer {
             }
         }
 
-        let mut last = Vec::new();
+        let mut last: VecDeque<String> = VecDeque::new();
         let mut next_tail: Option<String> = None;
         loop {
             let resp = send_with_backoff(
                 || {
-                    let mut req = self
-                        .client
-                        .filter_log_events()
-                        .log_group_name(&*self.cfg.log_group)
-                        .start_time(start_ms)
-                        .end_time(end_ms)
-                        .limit(10_000);
-                    if let Some(t) = &next_tail {
-                        req = req.next_token(t);
-                    }
-                    req
+                    build_filter_log_events_req(
+                        &self.client,
+                        &self.cfg.log_group,
+                        start_ms,
+                        Some(end_inclusive),
+                        &next_tail,
+                    )
                 },
                 &self.stress_tracker,
             )
@@ -347,9 +313,9 @@ impl CloudWatchTailer {
             if let Some(events) = resp.events {
                 for e in events {
                     if let (Some(id), Some(_ts)) = (e.event_id, e.timestamp) {
-                        last.push(id.clone());
-                        if last.len() > limit {
-                            last.remove(0);
+                        last.push_back(id);
+                        while last.len() > limit {
+                            let _ = last.pop_front();
                         }
                     }
                 }
@@ -359,7 +325,7 @@ impl CloudWatchTailer {
                 break;
             }
         }
-        Ok((first, last))
+        Ok((first, last.into_iter().collect()))
     }
 
     pub async fn sample_ids_window(
@@ -368,22 +334,22 @@ impl CloudWatchTailer {
         end_ms: i64,
         limit: usize,
     ) -> Result<Vec<String>> {
+        if end_ms <= start_ms {
+            return Ok(Vec::new());
+        }
+        let end_inclusive = end_ms.saturating_sub(1);
         let mut ids = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
             let resp = send_with_backoff(
                 || {
-                    let mut req = self
-                        .client
-                        .filter_log_events()
-                        .log_group_name(&*self.cfg.log_group)
-                        .start_time(start_ms)
-                        .end_time(end_ms)
-                        .limit(10_000);
-                    if let Some(t) = &next_token {
-                        req = req.next_token(t);
-                    }
-                    req
+                    build_filter_log_events_req(
+                        &self.client,
+                        &self.cfg.log_group,
+                        start_ms,
+                        Some(end_inclusive),
+                        &next_token,
+                    )
                 },
                 &self.stress_tracker,
             )
@@ -461,4 +427,25 @@ where
             }
         }
     }
+}
+
+fn build_filter_log_events_req(
+    client: &CwClient,
+    log_group: &str,
+    start_ms: i64,
+    end_inclusive_ms: Option<i64>,
+    next_token: &Option<String>,
+) -> aws_sdk_cloudwatchlogs::operation::filter_log_events::builders::FilterLogEventsFluentBuilder {
+    let mut req = client
+        .filter_log_events()
+        .log_group_name(log_group)
+        .start_time(start_ms)
+        .limit(10_000);
+    if let Some(end_ms) = end_inclusive_ms {
+        req = req.end_time(end_ms);
+    }
+    if let Some(token) = next_token {
+        req = req.next_token(token.clone());
+    }
+    req
 }

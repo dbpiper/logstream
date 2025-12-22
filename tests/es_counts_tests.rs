@@ -10,6 +10,7 @@ async fn get_ids_in_range_sorts_by_id_and_paginates_with_search_after() {
 
     let start_ms = 1_700_000_000_000_i64;
     let end_ms = 1_700_000_100_000_i64;
+    let end_inclusive_ms = end_ms - 1;
 
     let first_body = serde_json::json!({
         "size": 5000,
@@ -22,7 +23,7 @@ async fn get_ids_in_range_sorts_by_id_and_paginates_with_search_after() {
             "range": {
                 "@timestamp": {
                     "gte": start_ms,
-                    "lte": end_ms,
+                    "lte": end_inclusive_ms,
                     "format": "epoch_millis"
                 }
             }
@@ -57,7 +58,7 @@ async fn get_ids_in_range_sorts_by_id_and_paginates_with_search_after() {
             "range": {
                 "@timestamp": {
                     "gte": start_ms,
-                    "lte": end_ms,
+                    "lte": end_inclusive_ms,
                     "format": "epoch_millis"
                 }
             }

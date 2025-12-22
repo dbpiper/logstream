@@ -2,19 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::Method;
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::es_http::EsHttp;
 use crate::es_repair::{next_versioned_stream, EsRepairClient};
 use crate::es_window::EsWindowClient;
 
 #[derive(Clone)]
 pub struct SchemaHealer {
-    client: Client,
-    base_url: Arc<str>,
-    user: Arc<str>,
-    pass: Arc<str>,
+    http: EsHttp,
     timeout: Duration,
 }
 
@@ -25,26 +23,22 @@ impl SchemaHealer {
         pass: impl Into<Arc<str>>,
         timeout: Duration,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            user: user.into(),
-            pass: pass.into(),
+            http: EsHttp::new(base_url, user, pass, timeout, true)?,
             timeout,
         })
     }
 
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.http.base_url()
     }
 
     pub fn user(&self) -> &str {
-        &self.user
+        self.http.user()
     }
 
     pub fn pass(&self) -> &str {
-        &self.pass
+        self.http.pass()
     }
 
     pub fn timeout(&self) -> Duration {
@@ -58,11 +52,9 @@ impl SchemaHealer {
         let wait_secs = 2u64;
 
         for attempt in 1..=max_attempts {
-            let url = format!("{}/_cluster/health", self.base_url.trim_end_matches('/'));
             match self
-                .client
-                .get(&url)
-                .basic_auth(&self.user, Some(&self.pass))
+                .http
+                .request(Method::GET, "_cluster/health")
                 .send()
                 .await
             {
@@ -85,6 +77,8 @@ impl SchemaHealer {
     /// Run schema healing: detect and fix mapping conflicts across ALL indices.
     /// Samples actual data and compares to ES mappings to find type mismatches.
     pub async fn heal(&self) -> Result<usize> {
+        use std::collections::BTreeSet;
+
         self.wait_for_ready().await?;
         let indices = self.list_all_user_indices().await?;
         if indices.is_empty() {
@@ -96,7 +90,7 @@ impl SchemaHealer {
             indices.len()
         );
 
-        let mut problematic = Vec::new();
+        let mut problematic = BTreeSet::<String>::new();
 
         let cross_index_conflicts = self.detect_cross_index_conflicts(&indices).await?;
         if !cross_index_conflicts.is_empty() {
@@ -113,11 +107,7 @@ impl SchemaHealer {
                 "schema_heal: found {} indices with data-mapping type mismatches",
                 within_index_conflicts.len()
             );
-            for idx in within_index_conflicts {
-                if !problematic.contains(&idx) {
-                    problematic.push(idx);
-                }
-            }
+            problematic.extend(within_index_conflicts);
         }
 
         if problematic.is_empty() {
@@ -134,7 +124,7 @@ impl SchemaHealer {
         );
 
         let mut fixed = 0;
-        for idx in &problematic {
+        for idx in problematic.iter() {
             info!("schema_heal: deleting index {} to fix conflicts", idx);
             if let Err(err) = self.delete_index(idx).await {
                 warn!("schema_heal: failed to delete {}: {err:?}", idx);
@@ -152,13 +142,10 @@ impl SchemaHealer {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<bool> {
+        use std::collections::BTreeSet;
+
         self.wait_for_ready().await?;
-        let repair = EsRepairClient::new(
-            self.base_url.clone(),
-            self.user.clone(),
-            self.pass.clone(),
-            self.timeout,
-        )?;
+        let repair = EsRepairClient::from_http(self.http.clone());
         let Some(source_stream) = repair.resolve_alias_single_target(stable_alias).await? else {
             return Ok(false);
         };
@@ -168,12 +155,7 @@ impl SchemaHealer {
             return Ok(false);
         };
 
-        let window = EsWindowClient::new(
-            self.base_url.clone(),
-            self.user.clone(),
-            self.pass.clone(),
-            self.timeout,
-        )?;
+        let window = EsWindowClient::from_http(self.http.clone());
         let indices = window
             .indices_overlapping_window(&source_stream, start_ms, end_inclusive_ms)
             .await?;
@@ -183,17 +165,9 @@ impl SchemaHealer {
 
         let cross = self.detect_cross_index_conflicts(&indices).await?;
         let within = self.detect_problematic_indices(&indices).await?;
-        let mut problematic: Vec<String> = Vec::new();
-        for idx in cross {
-            if !problematic.contains(&idx) {
-                problematic.push(idx);
-            }
-        }
-        for idx in within {
-            if !problematic.contains(&idx) {
-                problematic.push(idx);
-            }
-        }
+        let mut problematic = BTreeSet::<String>::new();
+        problematic.extend(cross);
+        problematic.extend(within);
 
         if problematic.is_empty() {
             return Ok(false);
@@ -210,22 +184,22 @@ impl SchemaHealer {
     async fn detect_cross_index_conflicts(&self, indices: &[String]) -> Result<Vec<String>> {
         use std::collections::{HashMap, HashSet};
 
-        let mut pattern_groups: HashMap<String, Vec<String>> = HashMap::new();
+        let mut pattern_groups: HashMap<String, Vec<&str>> = HashMap::new();
         for idx in indices {
             let prefix = extract_index_prefix(idx);
-            pattern_groups.entry(prefix).or_default().push(idx.clone());
+            pattern_groups.entry(prefix).or_default().push(idx.as_str());
         }
 
-        let mut conflicted_indices = HashSet::new();
+        let mut conflicted_indices: HashSet<&str> = HashSet::new();
 
         for (pattern, group_indices) in pattern_groups {
             if group_indices.len() < 2 {
                 continue;
             }
 
-            let mut field_types: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+            let mut field_types: HashMap<String, HashMap<String, Vec<&str>>> = HashMap::new();
 
-            for idx in &group_indices {
+            for &idx in &group_indices {
                 match self.fetch_index_mapping(idx).await {
                     Ok(mapping) => {
                         let fields = extract_all_field_types(&mapping);
@@ -235,7 +209,7 @@ impl SchemaHealer {
                                 .or_default()
                                 .entry(field_type)
                                 .or_default()
-                                .push(idx.clone());
+                                .push(idx);
                         }
                     }
                     Err(e) => {
@@ -258,21 +232,21 @@ impl SchemaHealer {
                         type_summary.join(", ")
                     );
 
-                    let minority_indices = find_minority_type_indices(&type_map);
-                    for idx in minority_indices {
-                        conflicted_indices.insert(idx);
-                    }
+                    conflicted_indices.extend(find_minority_type_indices(&type_map));
                 }
             }
         }
 
-        Ok(conflicted_indices.into_iter().collect())
+        Ok(conflicted_indices
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect())
     }
 
     /// Detect indices with type mismatches by sampling actual data and comparing to mappings.
     /// Uses consensus-based type detection - compares what the data actually is vs what ES thinks it is.
     async fn detect_problematic_indices(&self, indices: &[String]) -> Result<Vec<String>> {
-        let mut problematic = Vec::new();
+        let mut problematic: Vec<&str> = Vec::new();
 
         for idx in indices {
             match self.find_type_mismatches(idx).await {
@@ -283,7 +257,7 @@ impl SchemaHealer {
                         mismatches.len(),
                         &mismatches[..mismatches.len().min(3)]
                     );
-                    problematic.push(idx.clone());
+                    problematic.push(idx.as_str());
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -300,7 +274,7 @@ impl SchemaHealer {
             );
         }
 
-        Ok(problematic)
+        Ok(problematic.into_iter().map(|s| s.to_string()).collect())
     }
 
     /// Find all type mismatches in an index by sampling data and comparing to ES mapping.
@@ -345,8 +319,6 @@ impl SchemaHealer {
 
     /// Sample documents from an index for type analysis.
     async fn sample_documents(&self, index: &str, count: usize) -> Result<Vec<Value>> {
-        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
-
         let body = serde_json::json!({
             "size": count,
             "query": { "match_all": {} },
@@ -354,9 +326,8 @@ impl SchemaHealer {
         });
 
         let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&self.user, Some(&self.pass))
+            .http
+            .request(Method::POST, &format!("{}/_search", index))
             .json(&body)
             .send()
             .await?;
@@ -408,14 +379,9 @@ impl SchemaHealer {
     /// List indices matching pattern, sorted by name (date order).
     /// List all user indices (excluding system indices like .kibana, .security, etc.)
     async fn list_all_user_indices(&self) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/_cat/indices?format=json&s=index",
-            self.base_url.trim_end_matches('/')
-        );
         let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&self.user, Some(&self.pass))
+            .http
+            .request(Method::GET, "_cat/indices?format=json&s=index")
             .send()
             .await
             .context("list indices")?;
@@ -436,12 +402,9 @@ impl SchemaHealer {
 
     /// Fetch actual mapping for an index.
     async fn fetch_index_mapping(&self, index: &str) -> Result<Value> {
-        let url = format!("{}/{}/_mapping", self.base_url.trim_end_matches('/'), index);
-
         let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&self.user, Some(&self.pass))
+            .http
+            .request(Method::GET, &format!("{}/_mapping", index))
             .send()
             .await
             .context("fetch mapping")?;
@@ -460,18 +423,7 @@ impl SchemaHealer {
     }
 
     async fn delete_index(&self, index: &str) -> Result<()> {
-        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), index);
-        let resp = self
-            .client
-            .delete(&url)
-            .basic_auth(&self.user, Some(&self.pass))
-            .send()
-            .await
-            .context("delete index")?;
-
-        if !resp.status().is_success() && resp.status().as_u16() != 404 {
-            anyhow::bail!("failed to delete {}", index);
-        }
+        self.http.delete_allow_404(index, "delete index").await?;
         Ok(())
     }
 
@@ -542,17 +494,12 @@ impl SchemaHealer {
 
     /// Get the ES mapping type for a specific field path
     async fn get_field_type(&self, index: &str, field_path: &str) -> Option<FieldType> {
-        let url = format!(
-            "{}/{}/_mapping/field/{}",
-            self.base_url.trim_end_matches('/'),
-            index,
-            field_path
-        );
-
         let resp = self
-            .client
-            .get(&url)
-            .basic_auth(&self.user, Some(&self.pass))
+            .http
+            .request(
+                Method::GET,
+                &format!("{}/_mapping/field/{}", index, field_path),
+            )
             .send()
             .await
             .ok()?;
@@ -820,9 +767,9 @@ fn extract_field_types_recursive(obj: &Value, prefix: &str, result: &mut Vec<(St
     }
 }
 
-pub fn find_minority_type_indices(
-    type_map: &std::collections::HashMap<String, Vec<String>>,
-) -> Vec<String> {
+pub fn find_minority_type_indices<'s>(
+    type_map: &std::collections::HashMap<String, Vec<&'s str>>,
+) -> Vec<&'s str> {
     if type_map.len() <= 1 {
         return vec![];
     }
@@ -832,7 +779,7 @@ pub fn find_minority_type_indices(
     let mut minority = Vec::new();
     for indices in type_map.values() {
         if indices.len() < max_count {
-            minority.extend(indices.clone());
+            minority.extend(indices.iter().copied());
         }
     }
 

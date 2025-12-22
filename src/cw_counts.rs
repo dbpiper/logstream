@@ -17,8 +17,11 @@ impl CwCounter {
 
     pub async fn count_range(&self, start_ms: i64, end_ms: i64) -> Result<u64> {
         let query = "stats count(*)";
+        if end_ms <= start_ms {
+            return Ok(0);
+        }
         let start = start_ms / 1000;
-        let end = end_ms / 1000;
+        let end = end_ms.saturating_sub(1) / 1000;
 
         let start_resp = self
             .client

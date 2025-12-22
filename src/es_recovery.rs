@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::NaiveDate;
-use reqwest::Client;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::es_http::EsHttp;
 use crate::stress::{StressConfig, StressTracker};
 
 pub use crate::stress::StressLevel;
@@ -59,16 +59,10 @@ struct BreakerInfo {
     tripped: u64,
 }
 
-pub async fn check_and_recover_tracked(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    tracker: &StressTracker,
-) -> bool {
+pub async fn check_and_recover_tracked(http: &EsHttp, tracker: &StressTracker) -> bool {
     let mut stress_detected = false;
 
-    if let Ok(stats) = get_node_stats(client, base_url, user, pass).await {
+    if let Ok(stats) = get_node_stats(http).await {
         for (_node_id, node) in stats.nodes.iter() {
             if let Some(breakers) = &node.breakers {
                 let total_trips: u64 = breakers.values().map(|b| b.tripped).sum();
@@ -117,7 +111,7 @@ pub async fn check_and_recover_tracked(
         }
     }
 
-    if let Ok(health) = get_cluster_health(client, base_url, user, pass).await {
+    if let Ok(health) = get_cluster_health(http).await {
         if health.status == "red" {
             tracker.record_failure();
             stress_detected = true;
@@ -138,7 +132,7 @@ pub async fn check_and_recover_tracked(
         }
     }
 
-    let _ = clear_readonly_blocks(client, base_url, user, pass).await;
+    let _ = clear_readonly_blocks(http).await;
 
     if !stress_detected {
         tracker.record_success();
@@ -152,18 +146,11 @@ pub async fn check_and_recover_tracked(
     stress_detected
 }
 
-async fn clear_readonly_blocks(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-) -> Result<bool> {
-    let url = format!("{}/_all/_settings", base_url.trim_end_matches('/'));
+async fn clear_readonly_blocks(http: &EsHttp) -> Result<bool> {
     let body = r#"{"index.blocks.read_only_allow_delete": null}"#;
 
-    let resp = client
-        .put(&url)
-        .basic_auth(user, Some(pass))
+    let resp = http
+        .request(reqwest::Method::PUT, "_all/_settings")
         .header("Content-Type", "application/json")
         .body(body)
         .send()
@@ -180,39 +167,17 @@ async fn clear_readonly_blocks(
     Ok(false)
 }
 
-async fn get_cluster_health(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-) -> Result<ClusterHealth> {
-    let url = format!("{}/_cluster/health", base_url.trim_end_matches('/'));
-    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("failed to get cluster health: {}", resp.status());
-    }
-
-    Ok(resp.json().await?)
+async fn get_cluster_health(http: &EsHttp) -> Result<ClusterHealth> {
+    http.get_json("_cluster/health", "recovery cluster health")
+        .await
 }
 
-async fn get_node_stats(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    pass: &str,
-) -> Result<NodeStats> {
-    let url = format!(
-        "{}/_nodes/stats/fs,jvm,thread_pool,breaker",
-        base_url.trim_end_matches('/')
-    );
-    let resp = client.get(&url).basic_auth(user, Some(pass)).send().await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("failed to get node stats: {}", resp.status());
-    }
-
-    Ok(resp.json().await?)
+async fn get_node_stats(http: &EsHttp) -> Result<NodeStats> {
+    http.get_json(
+        "_nodes/stats/fs,jvm,thread_pool,breaker",
+        "recovery node stats",
+    )
+    .await
 }
 
 pub fn parse_index_date(index_name: &str, prefix: &str) -> Option<NaiveDate> {
@@ -221,14 +186,9 @@ pub fn parse_index_date(index_name: &str, prefix: &str) -> Option<NaiveDate> {
 }
 
 /// Proactive startup check.
-pub async fn check_on_startup(
-    base_url: &str,
-    user: &str,
-    pass: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let client = Client::builder().timeout(timeout).build()?;
+pub async fn check_on_startup(http: &EsHttp, timeout: Duration) -> Result<()> {
+    let _ = timeout;
     let tracker = StressTracker::with_config(StressConfig::ES);
-    let _ = check_and_recover_tracked(&client, base_url, user, pass, &tracker).await;
+    let _ = check_and_recover_tracked(http, &tracker).await;
     Ok(())
 }

@@ -21,13 +21,18 @@ use logstream::es_bootstrap::start_es_bootstrap;
 use logstream::es_bulk_sink::{EsBulkConfig, EsBulkSink};
 use logstream::es_conflicts::EsConflictResolver;
 use logstream::es_counts::EsCounter;
+use logstream::es_disk_guard::{start_es_disk_guard, EsDiskGuardConfig};
+use logstream::es_http::EsHttp;
 use logstream::es_index::{cleanup_problematic_indices, drop_index_if_exists};
 use logstream::es_recovery;
 use logstream::es_refresh_tuner::{start_refresh_tuner, RefreshTunerConfig};
 use logstream::es_schema_heal::SchemaHealer;
 use logstream::event_router::{build_event_router, EventRouter, EventSenderFactory};
+use logstream::naming;
 use logstream::process::GroupScheduler;
 use logstream::process::Priority;
+use logstream::prune_state::PruneState;
+use logstream::runner::HealRunContext;
 use logstream::runner::{
     create_group_resources, execute_conflict_daemon, execute_full_history_daemon,
     execute_reconcile_daemon, execute_tail_daemon, run_heal_days, GroupEnvConfig,
@@ -36,6 +41,7 @@ use logstream::runner::{
 use logstream::seasonal_stats::SeasonalStats;
 use logstream::state::CheckpointState;
 use logstream::stress::{StressConfig, StressTracker};
+use logstream::time_windows;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -120,6 +126,9 @@ async fn main() -> Result<()> {
     sink.start_adaptive(event_router, adaptive_controller.clone());
     sink.start_heap_monitor(adaptive_controller.clone());
 
+    let prune_state_path = cfg.checkpoint_path.with_file_name("prune_watermarks.json");
+    let prune_state = std::sync::Arc::new(PruneState::load_or_new(prune_state_path)?);
+
     start_refresh_tuner(
         cfg.clone(),
         es_cfg.url.clone(),
@@ -132,6 +141,20 @@ async fn main() -> Result<()> {
             cold_age_days: es_cfg.refresh_cold_age_days,
             interval_secs: es_cfg.refresh_tune_interval_secs,
         },
+    );
+    start_es_disk_guard(
+        cfg.clone(),
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+        cfg.http_timeout(),
+        EsDiskGuardConfig {
+            enabled: es_cfg.disk_guard_enabled,
+            interval_secs: es_cfg.disk_guard_interval_secs,
+            free_buffer_gb: es_cfg.disk_guard_free_buffer_gb,
+            min_keep_days: es_cfg.disk_guard_min_keep_days,
+        },
+        prune_state.clone(),
     );
     run_index_hygiene(&es_cfg, &index_prefix).await;
     run_schema_healing(&es_cfg, &cfg).await;
@@ -147,17 +170,19 @@ async fn main() -> Result<()> {
         let es_stress = es_stress_tracker.clone();
         let cw_stress = cw_stress_tracker.clone();
         let stats = seasonal_stats.clone();
+        let prune_state_for_group = prune_state.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(err) = run_group(
-                group_cfg,
+            if let Err(err) = run_group(RunGroupContext {
+                cfg: group_cfg,
                 aws_cfg,
                 sender_factory,
                 buffer_caps,
-                es_stress,
-                cw_stress,
-                stats,
-            )
+                es_stress_tracker: es_stress,
+                cw_stress_tracker: cw_stress,
+                seasonal_stats: stats,
+                prune_state: prune_state_for_group,
+            })
             .await
             {
                 tracing::error!("group {} failed: {err:?}", group);
@@ -183,6 +208,10 @@ struct EsConfig {
     refresh_cold: Arc<str>,
     refresh_cold_age_days: u64,
     refresh_tune_interval_secs: u64,
+    disk_guard_enabled: bool,
+    disk_guard_interval_secs: u64,
+    disk_guard_free_buffer_gb: u64,
+    disk_guard_min_keep_days: u64,
 }
 
 impl EsConfig {
@@ -211,6 +240,22 @@ impl EsConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(3600),
+            disk_guard_enabled: std::env::var("ES_DISK_GUARD_ENABLED")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
+            disk_guard_interval_secs: std::env::var("ES_DISK_GUARD_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60),
+            disk_guard_free_buffer_gb: std::env::var("ES_DISK_GUARD_FREE_BUFFER_GB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2),
+            disk_guard_min_keep_days: std::env::var("ES_DISK_GUARD_MIN_KEEP_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(7),
         }
     }
 }
@@ -299,29 +344,40 @@ async fn run_index_hygiene(es_cfg: &EsConfig, index_prefix: &str) {
     }
 
     let default_index = format!("{}-default", index_prefix);
-    if let Err(err) =
-        drop_index_if_exists(&es_cfg.url, &es_cfg.user, &es_cfg.pass, &default_index).await
-    {
+    let http = match EsHttp::new(
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+        Duration::from_secs(30),
+        true,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!("failed to create es http client for hygiene: {err:?}");
+            return;
+        }
+    };
+    if let Err(err) = drop_index_if_exists(&http, &default_index).await {
         tracing::warn!("failed to drop {} before replay: {err:?}", default_index);
     } else {
         info!("dropped {} to ensure clean reindex", default_index);
     }
 
-    if let Err(err) =
-        cleanup_problematic_indices(&es_cfg.url, &es_cfg.user, &es_cfg.pass, index_prefix).await
-    {
+    if let Err(err) = cleanup_problematic_indices(&http, index_prefix).await {
         tracing::warn!("failed to cleanup problematic indices: {err:?}");
     }
 }
 
 async fn wait_for_es_ready(es_cfg: &EsConfig) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let url = format!("{}/_cluster/health", es_cfg.url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .basic_auth(&*es_cfg.user, Some(&*es_cfg.pass))
+    let http = EsHttp::new(
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+        Duration::from_secs(5),
+        true,
+    )?;
+    let resp = http
+        .request(reqwest::Method::GET, "_cluster/health")
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -344,22 +400,10 @@ async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config) {
         }
     };
 
-    let (start_ms, end_ms) = {
-        let now = chrono::Utc::now();
-        let today = now.date_naive();
-        let start_naive = (today - chrono::Duration::days(1))
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        let end_naive = today.and_hms_opt(0, 0, 0).unwrap();
-        let start =
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_naive, chrono::Utc);
-        let end =
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_naive, chrono::Utc);
-        (start.timestamp_millis(), end.timestamp_millis())
-    };
+    let (start_ms, end_ms) = time_windows::utc_prev_day_bounds_ms();
 
     for group in cfg.effective_log_groups() {
-        let stable = format!("{}-{}", cfg.index_prefix, sanitize_log_group_name(&group));
+        let stable = naming::stable_alias(&cfg.index_prefix, &group);
         match schema_healer.heal_window(&stable, start_ms, end_ms).await {
             Ok(true) => info!(
                 "schema_heal: repaired window alias={} start={} end={}",
@@ -372,15 +416,26 @@ async fn run_schema_healing(es_cfg: &EsConfig, cfg: &Config) {
 }
 
 async fn run_recovery_checks(es_cfg: &EsConfig, cfg: &Config) {
-    match es_recovery::check_on_startup(&es_cfg.url, &es_cfg.user, &es_cfg.pass, cfg.http_timeout())
-        .await
-    {
+    let http = match EsHttp::new(
+        es_cfg.url.clone(),
+        es_cfg.user.clone(),
+        es_cfg.pass.clone(),
+        cfg.http_timeout(),
+        true,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!("es_recovery: failed to create http client: {err:?}");
+            return;
+        }
+    };
+    match es_recovery::check_on_startup(&http, cfg.http_timeout()).await {
         Ok(()) => info!("es_recovery: startup checks passed"),
         Err(err) => tracing::warn!("es_recovery: startup check failed: {err:?}"),
     }
 }
 
-async fn run_group(
+struct RunGroupContext {
     cfg: Config,
     aws_cfg: aws_config::SdkConfig,
     sender_factory: EventSenderFactory,
@@ -388,53 +443,58 @@ async fn run_group(
     es_stress_tracker: std::sync::Arc<StressTracker>,
     cw_stress_tracker: std::sync::Arc<StressTracker>,
     seasonal_stats: std::sync::Arc<SeasonalStats>,
-) -> Result<()> {
-    let resources = create_group_resources(&buffer_caps);
+    prune_state: std::sync::Arc<PruneState>,
+}
+
+async fn run_group(ctx: RunGroupContext) -> Result<()> {
+    let sender_factory = ctx.sender_factory.clone();
+    let buffer_caps = ctx.buffer_caps;
+    let resources = create_group_resources(&ctx.buffer_caps);
     let group_scheduler =
-        GroupScheduler::new(cfg.log_group.clone(), resources, BACKFILL_CONCURRENCY);
+        GroupScheduler::new(ctx.cfg.log_group.clone(), resources, BACKFILL_CONCURRENCY);
 
-    let cw_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
-    let cwi_client = aws_sdk_cloudwatchlogs::Client::new(&aws_cfg);
-    let checkpoint = CheckpointState::load(&cfg.checkpoint_path)?;
+    let cw_client = aws_sdk_cloudwatchlogs::Client::new(&ctx.aws_cfg);
+    let cwi_client = aws_sdk_cloudwatchlogs::Client::new(&ctx.aws_cfg);
+    let checkpoint = CheckpointState::load(&ctx.cfg.checkpoint_path)?;
 
-    let env_cfg = GroupEnvConfig::from_env(cfg.backfill_days);
+    let env_cfg = GroupEnvConfig::from_env(ctx.cfg.backfill_days);
 
     let tailer = CloudWatchTailer::with_stress_tracker(
         TailConfig {
-            log_group: cfg.log_group.clone(),
-            poll_interval: Duration::from_secs(cfg.poll_interval_secs),
-            backoff_base: Duration::from_millis(cfg.backoff_base_ms),
-            backoff_max: Duration::from_millis(cfg.backoff_max_ms),
+            log_group: ctx.cfg.log_group.clone(),
+            poll_interval: Duration::from_secs(ctx.cfg.poll_interval_secs),
+            backoff_base: Duration::from_millis(ctx.cfg.backoff_base_ms),
+            backoff_max: Duration::from_millis(ctx.cfg.backoff_max_ms),
         },
         cw_client,
         checkpoint,
-        cfg.checkpoint_path.clone(),
-        cw_stress_tracker.clone(),
+        ctx.cfg.checkpoint_path.clone(),
+        ctx.cw_stress_tracker.clone(),
     );
 
-    let group_slug = sanitize_log_group_name(&cfg.log_group);
-    let es_target = format!("{}-{}", cfg.index_prefix, group_slug);
+    let group_slug = sanitize_log_group_name(&ctx.cfg.log_group);
+    let es_target = format!("{}-{}", ctx.cfg.index_prefix, group_slug);
     let es_counter = EsCounter::new(
         env_cfg.es_url.clone(),
         env_cfg.es_user.clone(),
         env_cfg.es_pass.clone(),
-        cfg.http_timeout(),
+        ctx.cfg.http_timeout(),
         es_target,
     )?;
-    let cw_counter = CwCounter::new(cwi_client, cfg.log_group.clone());
+    let cw_counter = CwCounter::new(cwi_client, ctx.cfg.log_group.clone());
     let es_conflicts = EsConflictResolver::new(
         env_cfg.es_url.clone(),
         env_cfg.es_user.clone(),
         env_cfg.es_pass.clone(),
-        cfg.http_timeout(),
-        cfg.index_prefix.clone(),
+        ctx.cfg.http_timeout(),
+        ctx.cfg.index_prefix.clone(),
     )?;
 
     info!(
-        log_group = %cfg.log_group,
+        log_group = %ctx.cfg.log_group,
         disable_reconcile = %env_cfg.disable_reconcile,
         disable_conflict_reindex = %env_cfg.disable_conflict_reindex,
-        backfill_days = cfg.backfill_days,
+        backfill_days = ctx.cfg.backfill_days,
         heal_days = env_cfg.heal_days,
         "run_group: process scheduler initialized"
     );
@@ -458,9 +518,9 @@ async fn run_group(
 
     let counts = group_scheduler.process_counts();
     info!(
-        log_group = %cfg.log_group,
+        log_group = %ctx.cfg.log_group,
         daemons = 1 + reconcile_pid.is_some() as usize + full_history_pid.is_some() as usize + conflict_pid.is_some() as usize,
-        backfill_days = cfg.backfill_days,
+        backfill_days = ctx.cfg.backfill_days,
         heal_days = env_cfg.heal_days,
         ready = counts.ready,
         "run_group: daemons spawned, batch work will be demand-driven"
@@ -479,25 +539,26 @@ async fn run_group(
         tail_pid,
         tailer,
         tail_sink,
-        buffer_caps.tail_raw,
-        cfg.log_group.clone(),
+        ctx.buffer_caps.tail_raw,
+        ctx.cfg.log_group.clone(),
         group_scheduler.scheduler().clone(),
     );
 
     let reconcile_handle = if let Some(pid) = reconcile_pid {
         let ctx = ReconcileExecContext {
-            cfg: &cfg,
-            aws_cfg: &aws_cfg,
+            cfg: &ctx.cfg,
+            aws_cfg: &ctx.aws_cfg,
             sender_factory: &sender_factory,
             es_counter: &es_counter,
             cw_counter: &cw_counter,
-            buffer_caps: &buffer_caps,
-            cw_stress: cw_stress_tracker.clone(),
-            seasonal_stats: seasonal_stats.clone(),
+            buffer_caps: &ctx.buffer_caps,
+            cw_stress: ctx.cw_stress_tracker.clone(),
+            seasonal_stats: ctx.seasonal_stats.clone(),
             es_url: &env_cfg.es_url,
             es_user: &env_cfg.es_user,
             es_pass: &env_cfg.es_pass,
-            index_prefix: &cfg.index_prefix,
+            index_prefix: &ctx.cfg.index_prefix,
+            prune_state: ctx.prune_state.clone(),
         };
         Some(execute_reconcile_daemon(pid, ctx, group_scheduler.scheduler().clone()).await?)
     } else {
@@ -505,25 +566,27 @@ async fn run_group(
     };
 
     let reconcile_full_handle = if let Some(pid) = full_history_pid {
-        let ctx = ReconcileExecContext {
-            cfg: &cfg,
-            aws_cfg: &aws_cfg,
+        let backfill_days = ctx.cfg.backfill_days;
+        let exec_ctx = ReconcileExecContext {
+            cfg: &ctx.cfg,
+            aws_cfg: &ctx.aws_cfg,
             sender_factory: &sender_factory,
             es_counter: &es_counter,
             cw_counter: &cw_counter,
-            buffer_caps: &buffer_caps,
-            cw_stress: cw_stress_tracker.clone(),
-            seasonal_stats: seasonal_stats.clone(),
+            buffer_caps: &ctx.buffer_caps,
+            cw_stress: ctx.cw_stress_tracker.clone(),
+            seasonal_stats: ctx.seasonal_stats.clone(),
             es_url: &env_cfg.es_url,
             es_user: &env_cfg.es_user,
             es_pass: &env_cfg.es_pass,
-            index_prefix: &cfg.index_prefix,
+            index_prefix: &ctx.cfg.index_prefix,
+            prune_state: ctx.prune_state.clone(),
         };
         Some(
             execute_full_history_daemon(
                 pid,
-                ctx,
-                cfg.backfill_days,
+                exec_ctx,
+                backfill_days,
                 group_scheduler.scheduler().clone(),
             )
             .await?,
@@ -533,18 +596,28 @@ async fn run_group(
     };
 
     let heal_handle = if env_cfg.heal_days > 0 {
-        let cfg_for_heal = cfg.clone();
-        let aws_cfg_for_heal = aws_cfg.clone();
+        let cfg_for_heal = ctx.cfg.clone();
+        let aws_cfg_for_heal = ctx.aws_cfg.clone();
         let sender_factory_for_heal = sender_factory.clone();
-        let es_stress_for_heal = es_stress_tracker.clone();
-        let cw_stress_for_heal = cw_stress_tracker.clone();
+        let es_stress_for_heal = ctx.es_stress_tracker.clone();
+        let cw_stress_for_heal = ctx.cw_stress_tracker.clone();
+        let prune_state_for_heal = ctx.prune_state.clone();
+        let stable_alias_for_heal = std::sync::Arc::<str>::from(format!(
+            "{}-{}",
+            cfg_for_heal.index_prefix,
+            sanitize_log_group_name(&cfg_for_heal.log_group)
+        ));
         Some(tokio::spawn(async move {
             run_heal_days(
-                cfg_for_heal,
-                aws_cfg_for_heal,
-                sender_factory_for_heal,
+                HealRunContext {
+                    cfg: cfg_for_heal,
+                    aws_cfg: aws_cfg_for_heal,
+                    sender_factory: sender_factory_for_heal,
+                    buffer_caps,
+                    prune_state: prune_state_for_heal,
+                    stable_alias: stable_alias_for_heal,
+                },
                 env_cfg.heal_days,
-                buffer_caps,
                 Some(es_stress_for_heal),
                 Some(cw_stress_for_heal),
             )
@@ -554,13 +627,14 @@ async fn run_group(
         None
     };
 
-    let log_group_for_backfill = cfg.log_group.clone();
-    let log_group_for_exit = cfg.log_group.clone();
-    let backfill_handle = if cfg.backfill_days > 0 {
-        let cfg_for_backfill = cfg.clone();
-        let aws_cfg_for_backfill = aws_cfg.clone();
-        let es_stress_for_backfill = es_stress_tracker.clone();
-        let cw_stress_for_backfill = cw_stress_tracker.clone();
+    let log_group_for_backfill = ctx.cfg.log_group.clone();
+    let log_group_for_exit = ctx.cfg.log_group.clone();
+    let backfill_handle = if ctx.cfg.backfill_days > 0 {
+        let cfg_for_backfill = ctx.cfg.clone();
+        let aws_cfg_for_backfill = ctx.aws_cfg.clone();
+        let es_stress_for_backfill = ctx.es_stress_tracker.clone();
+        let cw_stress_for_backfill = ctx.cw_stress_tracker.clone();
+        let prune_state_for_backfill = ctx.prune_state.clone();
         Some(tokio::spawn(async move {
             match run_backfill_days(
                 cfg_for_backfill,
@@ -569,6 +643,7 @@ async fn run_group(
                 buffer_caps,
                 Some(es_stress_for_backfill),
                 Some(cw_stress_for_backfill),
+                prune_state_for_backfill,
             )
             .await
             {
