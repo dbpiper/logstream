@@ -44,3 +44,8 @@ wiremock = "0.6"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
