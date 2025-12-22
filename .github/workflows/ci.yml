@@ -36,8 +36,8 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
-      SCCACHE_GHA_CACHE_TO: ${{ runner.os }}-sccache-${{ github.event.pull_request.number || github.ref_name }}-${{ hashFiles('**/Cargo.lock') }}
-      SCCACHE_GHA_CACHE_FROM: ${{ runner.os }}-sccache-${{ github.event.pull_request.number || github.ref_name }}-${{ hashFiles('**/Cargo.lock') }},${{ runner.os }}-sccache-main-${{ hashFiles('**/Cargo.lock') }}
+      SCCACHE_GHA_CACHE_TO: sccache-${{ github.event.pull_request.number || github.ref_name }}
+      SCCACHE_GHA_CACHE_FROM: sccache-${{ github.event.pull_request.number || github.ref_name }},sccache-main
     steps:
       - uses: actions/checkout@v4
 
@@ -105,8 +105,8 @@ jobs:
     env:
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
-      SCCACHE_GHA_CACHE_TO: ${{ runner.os }}-sccache-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-      SCCACHE_GHA_CACHE_FROM: ${{ runner.os }}-sccache-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }},${{ runner.os }}-sccache-main-${{ hashFiles('**/Cargo.lock') }}
+      SCCACHE_GHA_CACHE_TO: sccache-build-${{ matrix.target }}
+      SCCACHE_GHA_CACHE_FROM: sccache-build-${{ matrix.target }},sccache-main
     strategy:
       matrix:
         include:
