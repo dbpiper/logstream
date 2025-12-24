@@ -42,7 +42,7 @@ struct RawConfig {
     ilm_rollover_max_age: String,
     #[serde(default = "default_rollover_max_primary_shard_size")]
     ilm_rollover_max_primary_shard_size: String,
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     ilm_enable_delete_phase: bool,
     #[serde(default = "default_delete_min_age")]
     ilm_delete_min_age: String,
@@ -240,10 +240,6 @@ fn validate_required(cfg: &Config) -> Result<()> {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_false() -> bool {
-    false
 }
 
 fn default_es_target_replicas() -> usize {

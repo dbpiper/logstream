@@ -24,7 +24,11 @@ impl EsHttp {
         timeout: Duration,
         gzip: bool,
     ) -> Result<Self> {
-        let client = Client::builder().timeout(timeout).gzip(gzip).build()?;
+        let client = Client::builder()
+            .timeout(timeout)
+            .gzip(gzip)
+            .no_proxy()
+            .build()?;
         Ok(Self {
             client,
             base_url: es_url::normalize_base_url(base_url),

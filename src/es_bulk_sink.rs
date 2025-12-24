@@ -40,6 +40,7 @@ impl EsBulkSink {
             .timeout(cfg.timeout)
             .pool_max_idle_per_host(64)
             .gzip(cfg.gzip)
+            .no_proxy()
             .build()?;
         Ok(Self {
             cfg: Arc::new(cfg),

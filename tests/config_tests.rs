@@ -38,6 +38,8 @@ fn test_load_from_file() {
     assert_eq!(cfg.max_in_flight, 4);
     assert_eq!(cfg.poll_interval_secs, 10);
     assert_eq!(cfg.backfill_days, 30);
+    assert!(cfg.ilm_enable_delete_phase);
+    assert_eq!(&*cfg.ilm_delete_min_age, "30d");
 }
 
 #[test]
