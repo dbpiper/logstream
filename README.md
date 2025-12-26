@@ -439,6 +439,7 @@ MIT
 
 Contributions welcome! Please ensure:
 
-- Tests pass: `cargo test`
+- Tests pass: `make tools && make test` (uses project-local `headlamp`)
+- Fast local loop: `make tools && make test-dev`
 - No clippy warnings: `cargo clippy -- -D warnings`
 - Code is formatted: `cargo fmt`
