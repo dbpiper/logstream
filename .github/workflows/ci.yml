@@ -40,6 +40,10 @@ jobs:
       SCCACHE_GHA_CACHE_FROM: sccache-${{ github.event.pull_request.number || github.ref_name }},sccache-main
     steps:
       - uses: actions/checkout@v4
+        with:
+          # headlamp --changed=lastCommit needs HEAD^ available; depth=1 breaks with
+          # "parent 0 does not exist" from libgit2.
+          fetch-depth: 2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
