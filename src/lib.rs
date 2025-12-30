@@ -13,6 +13,7 @@ pub mod es_bulk_sink;
 pub mod es_conflicts;
 pub mod es_counts;
 pub mod es_disk_guard;
+pub mod es_disk_guard_logic;
 pub mod es_http;
 pub mod es_index;
 pub mod es_query;

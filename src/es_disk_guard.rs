@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use chrono::{NaiveDate, NaiveTime};
-
 use crate::config::Config;
+use crate::es_disk_guard_logic::compute_delete_candidates_with_store_bytes;
+use crate::es_disk_guard_logic::DeleteCandidate;
 use crate::es_http::EsHttp;
 use crate::es_window::EsWindowClient;
 use crate::naming;
@@ -51,28 +51,25 @@ pub fn start_es_disk_guard(
         let mut interval = tokio::time::interval(Duration::from_secs(guard_cfg.interval_secs));
         loop {
             interval.tick().await;
-            let ctx = EsDiskGuardCtx {
-                http: &http,
-                window: &window,
-                cfg: &cfg,
-                prune_state: &prune_state,
-            };
-            if let Err(err) = guard_once(ctx, &guard_cfg).await {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Err(err) =
+                run_disk_guard_once(&http, &window, &cfg, &prune_state, &guard_cfg, now_ms).await
+            {
                 warn!("disk_guard: guard failed: {err:?}");
             }
         }
     });
 }
 
-struct EsDiskGuardCtx<'a> {
-    http: &'a EsHttp,
-    window: &'a EsWindowClient,
-    cfg: &'a Config,
-    prune_state: &'a PruneState,
-}
-
-async fn guard_once(ctx: EsDiskGuardCtx<'_>, guard_cfg: &EsDiskGuardConfig) -> Result<()> {
-    let fs = fetch_fs_stats(ctx.http).await?;
+pub async fn run_disk_guard_once(
+    http: &EsHttp,
+    window: &EsWindowClient,
+    cfg: &Config,
+    prune_state: &PruneState,
+    guard_cfg: &EsDiskGuardConfig,
+    now_ms: i64,
+) -> Result<()> {
+    let fs = fetch_fs_stats(http).await?;
     let buffer_bytes = guard_cfg.free_buffer_gb.saturating_mul(1024 * 1024 * 1024);
     let Some((available_min_bytes, needed_max_bytes, high_watermark_max_bytes)) =
         compute_disk_pressure(&fs, buffer_bytes)
@@ -89,10 +86,9 @@ async fn guard_once(ctx: EsDiskGuardCtx<'_>, guard_cfg: &EsDiskGuardConfig) -> R
         available_min_bytes, needed_max_bytes, high_watermark_max_bytes, guard_cfg.free_buffer_gb
     );
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
     let keep_cutoff_ms = now_ms.saturating_sub((guard_cfg.min_keep_days as i64) * 86_400_000);
 
-    let mut candidates = build_delete_candidates(ctx.window, ctx.cfg, keep_cutoff_ms).await?;
+    let mut candidates = build_delete_candidates(window, http, cfg, keep_cutoff_ms).await?;
     if candidates.is_empty() {
         warn!("disk_guard: no eligible backing indices to delete");
         return Ok(());
@@ -100,7 +96,7 @@ async fn guard_once(ctx: EsDiskGuardCtx<'_>, guard_cfg: &EsDiskGuardConfig) -> R
 
     // Delete oldest first until disk is back under the watermark requirement.
     for cand in candidates.drain(..) {
-        let fs_now = fetch_fs_stats(ctx.http).await?;
+        let fs_now = fetch_fs_stats(http).await?;
         let Some((avail_now, needed_now, _high_now)) = compute_disk_pressure(&fs_now, buffer_bytes)
         else {
             break;
@@ -113,9 +109,8 @@ async fn guard_once(ctx: EsDiskGuardCtx<'_>, guard_cfg: &EsDiskGuardConfig) -> R
             "disk_guard: deleting backing index={} sort_key_ms={} (avail_now={} needed_now={})",
             cand.index, cand.sort_key_ms, avail_now, needed_now
         );
-        let _ = delete_index_if_exists(ctx.http, &cand.index).await?;
-        let _ = ctx
-            .prune_state
+        let _ = delete_index_if_exists(http, &cand.index).await?;
+        let _ = prune_state
             .update_monotonic(cand.stable_alias.as_ref(), cand.watermark_ms, now_ms)
             .await?;
     }
@@ -123,19 +118,13 @@ async fn guard_once(ctx: EsDiskGuardCtx<'_>, guard_cfg: &EsDiskGuardConfig) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct DeleteCandidate {
-    index: String,
-    sort_key_ms: i64,
-    watermark_ms: i64,
-    stable_alias: Arc<str>,
-}
-
 async fn build_delete_candidates(
     window: &EsWindowClient,
+    http: &EsHttp,
     cfg: &Config,
     keep_cutoff_ms: i64,
 ) -> Result<Vec<DeleteCandidate>> {
+    const MAX_INDEX_BOUNDS_LOOKUPS_PER_STREAM: usize = 256;
     let mut out = Vec::new();
 
     for group in cfg.effective_log_groups() {
@@ -143,57 +132,132 @@ async fn build_delete_candidates(
         let [v1, v2] = naming::versioned_streams(&stable);
 
         for stream in [&v1, &v2] {
-            let mut indices = match window.data_stream_backing_indices(stream.as_ref()).await {
+            let indices = match window.data_stream_backing_indices(stream.as_ref()).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             if indices.len() <= 1 {
                 continue;
             }
-            let Some(write_index) = indices.pop() else {
+
+            let read_indices = indices
+                .iter()
+                .take(indices.len().saturating_sub(1))
+                .take(MAX_INDEX_BOUNDS_LOOKUPS_PER_STREAM)
+                .cloned()
+                .collect::<Vec<String>>();
+
+            let max_ts_map = fetch_max_ts_map(window, &read_indices).await;
+            let store_bytes_map = fetch_store_bytes_map(http, &read_indices).await;
+
+            let normal_candidates = compute_delete_candidates_with_store_bytes(
+                stable.clone(),
+                &indices,
+                keep_cutoff_ms,
+                |index| max_ts_map.get(index).copied(),
+                |index| store_bytes_map.get(index).copied(),
+                false,
+            );
+            if !normal_candidates.is_empty() {
+                out.extend(normal_candidates);
                 continue;
-            };
-            let max_by_index = window
-                .backing_index_max_timestamp_ms(stream.as_ref())
-                .await
-                .unwrap_or_default();
-
-            for idx in indices {
-                let max_ts_ms = max_by_index.get(&idx).copied().filter(|v| *v > 0);
-                let date_start_ms = parse_backing_index_date_start_ms(&idx);
-
-                // Only delete if we can prove this backing index is older than the keep cutoff:
-                // - preferred: max(@timestamp) for the index
-                // - fallback: date encoded in backing index name (.ds-...-YYYY.MM.DD-000001)
-                let eligible = match max_ts_ms {
-                    Some(ts) => ts < keep_cutoff_ms,
-                    None => date_start_ms.is_some_and(|d| d < keep_cutoff_ms),
-                };
-                if !eligible {
-                    continue;
-                }
-
-                let sort_key_ms = max_ts_ms.unwrap_or_else(|| date_start_ms.unwrap_or(i64::MAX));
-                let watermark_ms = max_ts_ms.unwrap_or_else(|| {
-                    date_start_ms
-                        .unwrap_or(keep_cutoff_ms)
-                        .saturating_add(86_400_000)
-                        .saturating_sub(1)
-                });
-                out.push(DeleteCandidate {
-                    index: idx,
-                    sort_key_ms,
-                    watermark_ms,
-                    stable_alias: stable.clone(),
-                });
             }
 
-            let _ = write_index;
+            let emergency_candidates = compute_delete_candidates_with_store_bytes(
+                stable.clone(),
+                &indices,
+                keep_cutoff_ms,
+                |index| max_ts_map.get(index).copied(),
+                |index| store_bytes_map.get(index).copied(),
+                true,
+            );
+            out.extend(emergency_candidates);
         }
     }
 
-    out.sort_by_key(|c| c.sort_key_ms);
+    out.sort_by(compare_candidates);
     Ok(out)
+}
+
+async fn fetch_max_ts_map(
+    window: &EsWindowClient,
+    indices: &[String],
+) -> std::collections::BTreeMap<String, i64> {
+    use std::collections::BTreeMap;
+
+    let mut out = BTreeMap::<String, i64>::new();
+    for index in indices {
+        let max_ts = window
+            .index_time_bounds_ms(index)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| b.max_ms)
+            .filter(|v| *v > 0);
+        if let Some(ts) = max_ts {
+            out.insert(index.clone(), ts);
+        }
+    }
+    out
+}
+
+fn compare_candidates(a: &DeleteCandidate, b: &DeleteCandidate) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let by_age = a.sort_key_ms.cmp(&b.sort_key_ms);
+    if by_age != Ordering::Equal {
+        return by_age;
+    }
+    match (a.store_bytes, b.store_bytes) {
+        (Some(sa), Some(sb)) => sb.cmp(&sa),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+async fn fetch_store_bytes_map(
+    http: &EsHttp,
+    indices: &[String],
+) -> std::collections::BTreeMap<String, u64> {
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Deserialize)]
+    struct CatIndexRow {
+        #[serde(default)]
+        index: String,
+        #[serde(rename = "pri.store.size", default)]
+        pri_store_size: Option<String>,
+    }
+
+    let Some(path) = build_cat_indices_path(indices) else {
+        return BTreeMap::new();
+    };
+    let rows = http
+        .get_json::<Vec<CatIndexRow>>(
+            &format!("{path}?format=json&bytes=b&h=index,pri.store.size"),
+            "cat indices sizes",
+        )
+        .await;
+    let Ok(rows) = rows else {
+        return BTreeMap::new();
+    };
+    rows.into_iter()
+        .filter_map(|row| {
+            let bytes = row.pri_store_size?.parse::<u64>().ok()?;
+            (!row.index.is_empty()).then_some((row.index, bytes))
+        })
+        .collect()
+}
+
+fn build_cat_indices_path(indices: &[String]) -> Option<String> {
+    let joined = indices
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    (!joined.is_empty()).then_some(format!("_cat/indices/{joined}"))
 }
 
 fn compute_disk_pressure(fs: &NodesFsStats, buffer_bytes: u64) -> Option<(u64, u64, u64)> {
@@ -215,20 +279,6 @@ fn compute_disk_pressure(fs: &NodesFsStats, buffer_bytes: u64) -> Option<(u64, u
         (Some(a), Some(n), Some(h)) => Some((a, n, h)),
         _ => None,
     }
-}
-
-fn parse_backing_index_date_start_ms(index: &str) -> Option<i64> {
-    // Backing indices look like:
-    //   .ds-<stream>-YYYY.MM.DD-000001
-    // We'll parse the YYYY.MM.DD piece from the right.
-    let mut parts = index.rsplitn(3, '-');
-    let _seq = parts.next()?;
-    let date_str = parts.next()?;
-    let _prefix = parts.next()?;
-
-    let date = NaiveDate::parse_from_str(date_str, "%Y.%m.%d").ok()?;
-    let start = date.and_time(NaiveTime::from_hms_opt(0, 0, 0)?).and_utc();
-    Some(start.timestamp_millis())
 }
 
 async fn delete_index_if_exists(http: &EsHttp, index: &str) -> Result<bool> {
