@@ -1,6 +1,7 @@
 IMAGE ?= ghcr.io/dbpiper/logstream:latest
 CARGO ?= cargo
 HEADLAMP_VERSION ?= 0.1.36
+HEADLAMP_FORCE ?= 0
 TOOLS_DIR ?= .cargo-bin
 HEADLAMP_BIN ?= $(TOOLS_DIR)/bin/headlamp
 HEADLAMP_STAMP ?= $(TOOLS_DIR)/.headlamp-$(HEADLAMP_VERSION).installed
@@ -13,12 +14,14 @@ build:
 tools: $(HEADLAMP_STAMP)
 
 $(HEADLAMP_STAMP):
-	$(CARGO) install headlamp --version $(HEADLAMP_VERSION) --locked --root $(TOOLS_DIR) --force
+	@FORCE_FLAG=""; \
+	if [ "$(HEADLAMP_FORCE)" = "1" ]; then FORCE_FLAG="--force"; fi; \
+	$(CARGO) install headlamp --version $(HEADLAMP_VERSION) --locked --root $(TOOLS_DIR) $$FORCE_FLAG
 	@touch "$(HEADLAMP_STAMP)"
 
 headlamp-update:
 	@[ -n "$(VERSION)" ] || (echo "usage: make headlamp-update VERSION=x.y.z" && exit 2)
-	@$(MAKE) tools HEADLAMP_VERSION="$(VERSION)"
+	@$(MAKE) tools HEADLAMP_VERSION="$(VERSION)" HEADLAMP_FORCE=1
 
 test:
 	@([ -x "$(HEADLAMP_BIN)" ] || command -v headlamp >/dev/null 2>&1) || ( \
@@ -48,7 +51,7 @@ test-ci:
 	)
 	@HEADLAMP_ACTUAL_BIN="$(HEADLAMP_BIN)"; \
 	if [ ! -x "$$HEADLAMP_ACTUAL_BIN" ]; then HEADLAMP_ACTUAL_BIN="$$(command -v headlamp)"; fi; \
-	"$$HEADLAMP_ACTUAL_BIN" --runner=cargo-nextest --changed=lastCommit --ci --release --features testing
+	"$$HEADLAMP_ACTUAL_BIN" --runner=cargo-nextest --changed=lastCommit --ci --features testing --cargo-profile ci
 
 fmt:
 	$(CARGO) fmt --all

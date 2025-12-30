@@ -72,6 +72,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cache/sccache
+            .cargo-bin
           key: ${{ runner.os }}-cargo-checks-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy
